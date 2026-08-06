@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..2af3bc6 100644
+index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872950bf4bb 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,6 @@
@@ -9,7 +9,15 @@ index a0673f7..2af3bc6 100644
  from dataclasses import dataclass
  from functools import partial
  from typing import Any, List, Optional
-@@ -24,6 +25,123 @@ from mlx_lm.models.switch_layers import SwitchLinear
+@@ -17,32 +18,151 @@ from mlx_lm.models.base import (
+ )
+ from mlx_lm.models.cache import KVCache, RotatingKVCache
+ from mlx_lm.models.rope_utils import initialize_rope
+-from mlx_lm.models.switch_layers import SwitchLinear
++from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+ 
+ # SwiGLU clamp for the MoE experts only (the dense MapleMLP is unclamped);
+ # part of the trained forward pass, not an optional guard.
  MLP_CLAMP = 7.0
  
  
@@ -26,6 +34,12 @@ index a0673f7..2af3bc6 100644
 +_kernel_backend_cache = _UNSET
 +_cuda_capability_cache = _UNSET
 +_cuda_profile_cache = _UNSET
++
++# The fused router is numerically close but not array-exact: its normalized
++# scores can eventually change a greedy token.  It is therefore an explicit
++# semantic/experimental lane, never part of strict auto mode.
++_use_approximate_router = False
++_use_approximate_add_rms = False
 +
 +
 +def _kernel_backend():
@@ -133,7 +147,46 @@ index a0673f7..2af3bc6 100644
  @partial(mx.compile, shapeless=True)
  def clamped_swiglu(gate, x):
      # Python floats, not 0-d arrays, so bf16 activations stay bf16.
-@@ -123,24 +241,129 @@ def _make_add_rms_norm_kernel(eps):
+     return nn.silu(mx.minimum(gate, MLP_CLAMP)) * mx.clip(x, -MLP_CLAMP, MLP_CLAMP)
+ 
+ 
+-def _matches(fast, reference, tol=2e-2):
+-    """One-time self-check for a hand-written Metal kernel.
++def _matches(fast, reference):
++    """Fail closed unless a hand-written kernel is array-exact.
+ 
+-    Every fast path below has a portable equivalent, and each is used only
+-    after its outputs have been compared against that equivalent once, on the
+-    live weights. This file ships inside checkpoints and runs on whatever mlx
+-    and GPU the user has, so a kernel that fails to compile, silently mismatches
+-    the config it was templated for, or drifts from a future mlx must degrade to
+-    the portable path rather than corrupt the token stream.
+-
+-    Both callables return a tuple of arrays. The kernels stay in bounds for any
+-    config (loop counts are integer-divided from the templated dims), so a
+-    config they cannot handle shows up here as wrong values, not as a fault.
++    Every fast path below has a portable equivalent and is enabled only after
++    a one-time comparison on live weights.  A tolerance check is not a strict
++    correctness gate: tiny activation differences can eventually change a
++    greedy token on long or near-tied generations.  Shape, dtype, and every
++    value must therefore match before the fast path can latch on.  Unsupported
++    devices or future MLX changes fall back to the portable implementation.
+     """
+     try:
+         got, want = fast(), reference()
+@@ -51,9 +171,8 @@ def _matches(fast, reference, tol=2e-2):
+         return False
+     return len(got) == len(want) and all(
+         g.shape == w.shape
+-        and bool(
+-            mx.allclose(g.astype(mx.float32), w.astype(mx.float32), rtol=tol, atol=tol)
+-        )
++        and g.dtype == w.dtype
++        and bool(mx.array_equal(g, w))
+         for g, w in zip(got, want)
+     )
+ 
+@@ -123,24 +242,129 @@ def _make_add_rms_norm_kernel(eps):
      )
  
  
@@ -270,7 +323,7 @@ index a0673f7..2af3bc6 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -226,7 +449,7 @@ def _make_qk_norm_rope_kernel():
+@@ -226,7 +450,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -279,7 +332,7 @@ index a0673f7..2af3bc6 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +486,108 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +487,108 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -389,7 +442,7 @@ index a0673f7..2af3bc6 100644
  
  
  class MapleAttention(nn.Module):
-@@ -293,13 +617,19 @@ class MapleAttention(nn.Module):
+@@ -293,13 +618,19 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -409,7 +462,7 @@ index a0673f7..2af3bc6 100644
          if self.use_rope:
              rope_dim = int(self.head_dim * args.partial_rotary_factor)
              self.rope = initialize_rope(
-@@ -312,6 +642,8 @@ class MapleAttention(nn.Module):
+@@ -312,6 +643,8 @@ class MapleAttention(nn.Module):
  
      def _qk_fused(self, qk, offset):
          """Both norms and both rope applications in one dispatch."""
@@ -418,7 +471,7 @@ index a0673f7..2af3bc6 100644
          if self._qk_w is None:
              n_q = self.num_attention_heads
              n_kv = self.num_key_value_heads
-@@ -336,19 +668,26 @@ class MapleAttention(nn.Module):
+@@ -336,19 +669,26 @@ class MapleAttention(nn.Module):
  
          # cache.offset is a Python int for a plain cache but an mx.array for
          # the batched caches; coerce so the pos/eps pair is always uniform.
@@ -452,7 +505,7 @@ index a0673f7..2af3bc6 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -378,7 +717,7 @@ class MapleAttention(nn.Module):
+@@ -378,7 +718,7 @@ class MapleAttention(nn.Module):
              qk = qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, self.head_dim)
              if self._fused_qk is None:
                  # A nonzero position, so a broken rotation cannot pass.
@@ -461,7 +514,7 @@ index a0673f7..2af3bc6 100644
                      lambda: (self._qk_fused(qk, 7),),
                      lambda: (self._qk_reference(qk, 7),),
                  )
-@@ -618,7 +957,306 @@ def _make_fused_router_kernel():
+@@ -618,7 +958,312 @@ def _make_fused_router_kernel():
      )
  
  
@@ -517,7 +570,7 @@ index a0673f7..2af3bc6 100644
 +        __syncthreads();
 +        __shared__ int is_last;
 +        if (tid == 0) {
-+            unsigned int* counter = (unsigned int*)ctr_in;
++            unsigned int* counter = (unsigned int*)ctr_out;
 +            unsigned int previous = atomicAdd(counter, 1u);
 +            is_last = previous == static_cast<unsigned int>(NUM_BLOCKS - 1);
 +        }
@@ -600,19 +653,25 @@ index a0673f7..2af3bc6 100644
 +        }
 +        __syncthreads();
 +        if (tid < 8) {
-+            out_indices[tid] = selected_indices[tid];
-+            out_scores[tid] = selected_exp[tid] / selected_sum;
++            // MLX argpartition exposes the selected suffix in ascending
++            // score order.  Expert aggregation is not bitwise commutative,
++            // so preserve that order exactly.
++            int output_pick = 7 - tid;
++            out_indices[tid] = selected_indices[output_pick];
++            out_scores[tid] = selected_exp[output_pick] / selected_sum;
 +        }
 +        __syncthreads();
 +        if (tid == 0) {
-+            atomicExch((unsigned int*)ctr_in, 0u);
++            atomicExch((unsigned int*)ctr_out, 0u);
 +            __threadfence();
 +        }
 +    """
 +    return mx.fast.cuda_kernel(
-+        name=f"maple_fused_router_{profile.name}",
-+        input_names=["x", "w", "ctr_in"],
-+        output_names=["out_indices", "out_scores", "logits_scratch"],
++        name=f"maple_fused_router_{profile.name}_safe_counter",
++        input_names=["x", "w"],
++        output_names=[
++            "out_indices", "out_scores", "logits_scratch", "ctr_out"
++        ],
 +        source=source,
 +    )
 +
@@ -769,13 +828,27 @@ index a0673f7..2af3bc6 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1271,57 @@ class MapleGate(nn.Module):
+@@ -633,23 +1278,83 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
 +        self._fused_backend = None
  
      def _fused_call(self, x):
+-        if self._router_ctr is None:
+-            self._router_ctr = mx.zeros((8,), dtype=mx.uint32)
+-            mx.eval(self._router_ctr)
+-        inds, scores, _ = _fused_router_kernel(
+-            inputs=[x.reshape(-1), self.weight, self._router_ctr],
+-            template=[
+-                ("T_", self.weight.dtype),
+-                ("NEXP", self.num_experts),
+-                ("DIM", self.hidden_size),
+-            ],
+-            grid=((self.num_experts // 32) * 256, 1, 1),
+-            threadgroup=(256, 1, 1),
+-            output_shapes=[(8,), (8,), (self.num_experts,)],
+-            output_dtypes=[mx.int32, mx.float32, mx.float32],
 +        backend = _kernel_backend()
 +        profile = _cuda_profile() if backend == "cuda" else None
 +        threads = profile.router_threads if profile is not None else 256
@@ -793,7 +866,11 @@ index a0673f7..2af3bc6 100644
 +                grid=(threads, 1, 1),
 +                threadgroup=(threads, 1, 1),
 +                output_shapes=[(8,), (8,)],
-+                output_dtypes=[mx.int32, mx.float32],
++                output_dtypes=[(
++                    mx.uint32
++                    if backend == "cuda" and _cuda_router_indices_uint32
++                    else mx.int32
++                ), mx.float32],
 +            )
 +            self._fused_backend = backend
 +            shape = x.shape[:-1] + (self.top_k,)
@@ -801,59 +878,387 @@ index a0673f7..2af3bc6 100644
 +        block_rows = threads // 32 * rows_per_warp
 +        if self.top_k != 8 or self.num_experts % block_rows or self.hidden_size % 128:
 +            raise ValueError("unsupported fused router dimensions")
-         if self._router_ctr is None:
-             self._router_ctr = mx.zeros((8,), dtype=mx.uint32)
-             mx.eval(self._router_ctr)
--        inds, scores, _ = _fused_router_kernel(
 +        grid_size = (
 +            (self.num_experts // 32) * 256
 +            if backend == "metal"
 +            else _cuda_router_grid_size(self.num_experts, profile)
 +        )
-+        inds, scores, _ = _get_fused_router_kernel()(
-             inputs=[x.reshape(-1), self.weight, self._router_ctr],
-             template=[
-                 ("T_", self.weight.dtype),
-                 ("NEXP", self.num_experts),
-                 ("DIM", self.hidden_size),
-+                ("ROUTER_THREADS", threads),
-+                ("ROWS_PER_WARP", rows_per_warp),
-             ],
--            grid=((self.num_experts // 32) * 256, 1, 1),
--            threadgroup=(256, 1, 1),
-+            grid=(grid_size, 1, 1),
-+            threadgroup=(threads, 1, 1),
-             output_shapes=[(8,), (8,), (self.num_experts,)],
-             output_dtypes=[mx.int32, mx.float32, mx.float32],
++        template = [
++            ("T_", self.weight.dtype),
++            ("NEXP", self.num_experts),
++            ("DIM", self.hidden_size),
++            ("ROUTER_THREADS", threads),
++            ("ROWS_PER_WARP", rows_per_warp),
++        ]
++        index_dtype = (
++            mx.uint32
++            if backend == "cuda" and _cuda_router_indices_uint32
++            else mx.int32
          )
++        if backend == "cuda":
++            # The multi-block completion counter is a zero-initialized output,
++            # not hidden mutable input state.  This makes graph dependencies
++            # explicit and concurrent calls independent.
++            inds, scores, _, _ = _get_fused_router_kernel()(
++                inputs=[x.reshape(-1), self.weight],
++                template=template,
++                grid=(grid_size, 1, 1),
++                threadgroup=(threads, 1, 1),
++                output_shapes=[(8,), (8,), (self.num_experts,), (1,)],
++                output_dtypes=[
++                    index_dtype, mx.float32, mx.float32, mx.uint32
++                ],
++                init_value=0,
++            )
++        else:
++            if self._router_ctr is None:
++                self._router_ctr = mx.zeros((8,), dtype=mx.uint32)
++                mx.eval(self._router_ctr)
++            inds, scores, _ = _get_fused_router_kernel()(
++                inputs=[x.reshape(-1), self.weight, self._router_ctr],
++                template=template,
++                grid=(grid_size, 1, 1),
++                threadgroup=(threads, 1, 1),
++                output_shapes=[(8,), (8,), (self.num_experts,)],
++                output_dtypes=[index_dtype, mx.float32, mx.float32],
++            )
 +        self._fused_backend = backend
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -670,10 +1342,18 @@ class MapleGate(nn.Module):
+@@ -670,13 +1375,27 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
--        return (
--            inds.shape == ref_inds.shape
--            and bool(mx.all((inds >= 0) & (inds < self.num_experts)))
--            and bool(mx.allclose(mx.sort(scores), mx.sort(ref_scores), atol=1e-5))
 +        valid = inds.shape == ref_inds.shape and bool(
 +            mx.all((inds >= 0) & (inds < self.num_experts))
 +        )
-+        profile = _cuda_profile() if _kernel_backend() == "cuda" else None
-+        if profile is not None and profile.router_reference_gemv:
-+            return (
-+                valid
-+                and bool(mx.array_equal(inds, ref_inds))
-+                and bool(mx.allclose(scores, ref_scores, atol=1e-5))
-+            )
-+        return valid and bool(
-+            mx.allclose(mx.sort(scores), mx.sort(ref_scores), atol=1e-5)
++        # Expert order and routing weights both affect the ordered fp32 MoE
++        # reduction.  An allclose score is not sufficient for strict decode:
++        # the fixed common-slice regression found eventual greedy-token
++        # divergence from sub-ULP routing drift.  Keep this experimental
++        # router available for explicit studies, but auto mode must fall back
++        # unless it reproduces the portable selector exactly.
+         return (
+-            inds.shape == ref_inds.shape
+-            and bool(mx.all((inds >= 0) & (inds < self.num_experts)))
+-            and bool(mx.allclose(mx.sort(scores), mx.sort(ref_scores), atol=1e-5))
++            valid
++            and inds.dtype == ref_inds.dtype
++            and scores.dtype == ref_scores.dtype
++            and bool(mx.array_equal(inds, ref_inds))
++            and bool(mx.array_equal(scores, ref_scores))
          )
  
      def __call__(self, x):
-@@ -1039,8 +1719,8 @@ class Model(nn.Module):
++        if not _use_approximate_router:
++            self._fused = False
++            return self._reference(x)
+         if self._fused is not False and x.size == self.hidden_size:
+             if self._fused is None:
+                 self._fused = self._probe(x)
+@@ -695,6 +1414,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+     )
+ 
+ 
++
++# Maple Preview's checkpoint stores true ternary expert weights: codes 0/1/2,
++# one alpha per output row, and affine bias == -alpha.  This decode-only
++# specialization is deliberately Maple-owned; generic affine W2 layers still
++# use MLX GatherQMM.
++_TERNARY_UP_GATE_SOURCE = r"""
++    constexpr int WARP = 32;
++    constexpr int WARPS = THREADS / WARP;
++    constexpr int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
++    int tid = threadIdx.x;
++    int lane = tid & 31;
++    int warp = tid >> 5;
++    int slot = blockIdx.y;
++    unsigned int expert_u = static_cast<unsigned int>(rhs_indices[slot]);
++    int row0 = blockIdx.x * ROWS_PER_BLOCK + warp * ROWS_PER_WARP;
++
++    if (expert_u >= static_cast<unsigned int>(NUM_EXPERTS)) {
++        if (lane == 0) {
++            #pragma unroll
++            for (int r = 0; r < ROWS_PER_WARP; ++r) {
++                int row = row0 + r;
++                if (row < N) out[slot * N + row] = static_cast<T_>(0);
++            }
++        }
++        return;
++    }
++    int expert = static_cast<int>(expert_u);
++    if (row0 >= N) return;
++
++    float sums[ROWS_PER_WARP] = {0.0f};
++    float alpha[ROWS_PER_WARP] = {0.0f};
++    #pragma unroll
++    for (int r = 0; r < ROWS_PER_WARP; ++r) {
++        int row = row0 + r;
++        if (row < N) {
++            long long scale_off =
++                (static_cast<long long>(expert) * N + row) * GROUPS;
++            alpha[r] = static_cast<float>(scales[scale_off]);
++        }
++    }
++
++    for (int col = lane; col < K; col += WARP) {
++        float xv = static_cast<float>(x[col]);
++        int word = col >> 4;
++        int shift = (col & 15) << 1;
++        #pragma unroll
++        for (int r = 0; r < ROWS_PER_WARP; ++r) {
++            int row = row0 + r;
++            if (row < N) {
++                long long weight_off =
++                    (static_cast<long long>(expert) * N + row) * WORDS + word;
++                unsigned int code = (weights[weight_off] >> shift) & 3u;
++                float weight = (static_cast<int>(code) - 1) * alpha[r];
++                sums[r] = fmaf(xv, weight, sums[r]);
++            }
++        }
++    }
++
++    #pragma unroll
++    for (int r = 0; r < ROWS_PER_WARP; ++r) {
++        #pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            sums[r] += __shfl_down_sync(0xffffffff, sums[r], offset);
++        }
++        if (lane == 0 && row0 + r < N) {
++            out[slot * N + row0 + r] = static_cast<T_>(sums[r]);
++        }
++    }
++"""
++
++_cuda_ternary_up_gate_kernel = None
++_use_cuda_ternary_up_gate = False
++
++
++def _get_cuda_ternary_up_gate_kernel():
++    global _cuda_ternary_up_gate_kernel
++    if _cuda_ternary_up_gate_kernel is None:
++        _cuda_ternary_up_gate_kernel = mx.fast.cuda_kernel(
++            name="maple_ternary_up_gate_sm86",
++            input_names=["x", "weights", "scales", "rhs_indices"],
++            output_names=["out"],
++            source=_TERNARY_UP_GATE_SOURCE,
++        )
++    return _cuda_ternary_up_gate_kernel
++
++
++def _cuda_ternary_up_gate(x, layer, indices):
++    threads = 256
++    rows_per_warp = 2
++    k = layer.input_dims
++    n = layer.output_dims
++    rows_per_block = (threads // 32) * rows_per_warp
++    blocks_x = (n + rows_per_block - 1) // rows_per_block
++    return _get_cuda_ternary_up_gate_kernel()(
++        inputs=[
++            x.reshape(-1),
++            layer["weight"],
++            layer["scales"],
++            indices.reshape(-1),
++        ],
++        template=[
++            ("T_", x.dtype),
++            ("K", k),
++            ("N", n),
++            ("NUM_EXPERTS", layer.num_experts),
++            ("WORDS", k // 16),
++            ("GROUPS", k // layer.group_size),
++            ("ROWS_PER_WARP", rows_per_warp),
++            ("THREADS", threads),
++        ],
++        grid=(blocks_x * threads, indices.size, 1),
++        threadgroup=(threads, 1, 1),
++        output_shapes=[tuple(indices.shape) + (1, n)],
++        output_dtypes=[x.dtype],
++    )[0]
++
++
++_decode_lhs_cache = {}
++# Exact candidates retained for explicit experiments. Cached LHS showed no
++# independently significant marginal win in the within-process factorial;
++# uint32 indices only affect the approximate router. Keep both off by default.
++_use_cached_decode_lhs = False
++_cuda_router_indices_uint32 = False
++
++
++def _decode_lhs_indices(top_k):
++    indices = _decode_lhs_cache.get(top_k)
++    if indices is None:
++        indices = (
++            mx.zeros((top_k,), dtype=mx.uint32),
++            mx.arange(top_k, dtype=mx.uint32),
++        )
++        mx.eval(*indices)
++        _decode_lhs_cache[top_k] = indices
++    return indices
++
++
+ class MapleSwitchGLU(nn.Module):
+     """SwitchGLU with the up and gate projections fused into one gather
+     matmul; sanitize() concatenates the checkpoint's split tensors."""
+@@ -705,8 +1561,78 @@ class MapleSwitchGLU(nn.Module):
+             input_dims, 2 * hidden_dims, num_experts, bias=bias
+         )
+         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
++        self._ternary_row_alpha = False
++        self._ternary_up_gate = None  # None = unprobed, then True/False
++
++    def _ternary_up_gate_eligible(self, x, indices, single_token):
++        layer = self.up_gate_proj
++        profile = _cuda_profile()
++        return (
++            _use_cuda_ternary_up_gate
++            and single_token
++            and not self.training
++            and profile is not None
++            and profile.name == "sm86"
++            and self._ternary_row_alpha
++            and isinstance(layer, QuantizedSwitchLinear)
++            and x.dtype == mx.bfloat16
++            and x.shape[-1] == 2048
++            and indices.dtype == mx.uint32
++            and indices.size == 8
++            and indices.shape[-1] == 8
++            and layer.bits == 2
++            and layer.mode == "affine"
++            and layer.group_size == 128
++            and "bias" not in layer
++            and layer.weight.dtype == mx.uint32
++            and layer.scales.dtype == mx.bfloat16
++            and layer.biases is not None
++            and layer.biases.dtype == mx.bfloat16
++            and layer.weight.shape == (256, 1024, 128)
++            and layer.scales.shape == (256, 1024, 16)
++            and layer.biases.shape == (256, 1024, 16)
++        )
++
++    def _up_gate(self, x, indices, single_token, sorted_indices, lhs_indices):
++        def stock():
++            return self.up_gate_proj(
++                x,
++                indices,
++                sorted_indices=sorted_indices,
++                lhs_indices=lhs_indices,
++            )
++
++        if not self._ternary_up_gate_eligible(x, indices, single_token):
++            return stock()
++
++        try:
++            candidate = _cuda_ternary_up_gate(x, self.up_gate_proj, indices)
++            if self._ternary_up_gate is None:
++                reference = stock()
++                weight = self.up_gate_proj.weight
++                code3 = (weight & (weight >> 1)) & mx.array(
++                    0x55555555, dtype=mx.uint32
++                )
++                no_code3 = mx.all(code3 == 0)
++                indices_in_bounds = mx.all(indices < self.up_gate_proj.num_experts)
++                same = mx.array_equal(candidate, reference)
++                mx.eval(candidate, reference, no_code3, indices_in_bounds, same)
++                self._ternary_up_gate = (
++                    candidate.shape == reference.shape
++                    and candidate.dtype == reference.dtype
++                    and bool(no_code3)
++                    and bool(indices_in_bounds)
++                    and bool(same)
++                )
++                return candidate if self._ternary_up_gate else reference
++            if self._ternary_up_gate:
++                return candidate
++        except (AttributeError, RuntimeError, TypeError, ValueError):
++            self._ternary_up_gate = False
++        return stock()
+ 
+     def __call__(self, x, indices):
++        single_token = x.size == self.up_gate_proj.input_dims and indices.size == 8
+         x = mx.expand_dims(x, (-2, -3))
+ 
+         do_sort = indices.size >= 64
+@@ -715,17 +1641,26 @@ class MapleSwitchGLU(nn.Module):
+         if do_sort:
+             x, idx, inv_order = _gather_sort(x, indices)
+ 
++        up_lhs = down_lhs = None
++        if single_token and _use_cached_decode_lhs:
++            up_lhs, down_lhs = _decode_lhs_indices(indices.shape[-1])
+         x_up, x_gate = mx.split(
+-            self.up_gate_proj(x, idx, sorted_indices=do_sort), 2, axis=-1
++            self._up_gate(x, idx, single_token, do_sort, up_lhs),
++            2,
++            axis=-1,
++        )
++        x = self.down_proj(
++            clamped_swiglu(x_gate, x_up),
++            idx,
++            sorted_indices=do_sort,
++            lhs_indices=down_lhs,
+         )
+-        x = self.down_proj(clamped_swiglu(x_gate, x_up), idx, sorted_indices=do_sort)
+ 
+         if do_sort:
+             x = _scatter_unsort(x, inv_order, indices.shape)
+ 
+         return x.squeeze(-2)
+ 
+-
+ class MapleSparseMoeBlock(nn.Module):
+     def __init__(self, args: ModelArgs):
+         super().__init__()
+@@ -836,7 +1771,13 @@ class MapleModel(nn.Module):
+             )
+ 
+         if h.size == h.shape[-1]:
+-            if self._fused_add_norm is None:
++            if not _use_approximate_add_rms:
++                # The fused residual carrier passes local array-equality probes
++                # but diverged on a deterministic long-generation regression.
++                # Keep it in the explicit semantic lane until its full 49-norm
++                # chain is exact for every decode activation.
++                self._fused_add_norm = False
++            elif self._fused_add_norm is None:
+                 self._fused_add_norm = _add_rms_norm_ok(
+                     h.shape[-1], h.dtype, self.norm.weight, self.norm.eps
+                 )
+@@ -1021,6 +1962,32 @@ class Model(nn.Module):
+         # quantized kernels — sees the per-group layout. Checkpoints written
+         # with `--group-scales` have no row_alpha and pass straight through.
+         row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
++        row_alpha_prefixes = {
++            k[: -len(".row_alpha")] for k in row_alpha_keys
++        }
++        for layer_idx in range(self.args.num_hidden_layers):
++            prefix = f"model.layers.{layer_idx}.mlp"
++            switch_mlp = getattr(
++                getattr(self.model.layers[layer_idx], "mlp", None),
++                "switch_mlp",
++                None,
++            )
++            if switch_mlp is None:
++                continue
++            split = (
++                f"{prefix}.switch_mlp.up_proj" in row_alpha_prefixes
++                and f"{prefix}.switch_mlp.gate_proj" in row_alpha_prefixes
++            )
++            fused = (
++                f"{prefix}.switch_mlp.up_gate_proj" in row_alpha_prefixes
++            )
++            expert_split = all(
++                f"{prefix}.experts.{expert}.up_proj" in row_alpha_prefixes
++                and f"{prefix}.experts.{expert}.gate_proj" in row_alpha_prefixes
++                for expert in range(self.args.num_experts)
++            )
++            switch_mlp._ternary_row_alpha = split or fused or expert_split
++
+         if row_alpha_keys:
+             group_size = (self.args.quantization or {}).get("group_size", 128)
+             for key in row_alpha_keys:
+@@ -1039,8 +2006,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
@@ -864,14 +1269,55 @@ index a0673f7..2af3bc6 100644
              for m in ["gate_proj", "down_proj", "up_proj"]:
                  for k in ["weight", "scales", "biases", "bias"]:
                      if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+diff --git a/mlx_lm/models/switch_layers.py b/mlx_lm/models/switch_layers.py
+index 1fe5d917e6b194b1681bbb1c69589ad3dc759d65..d022e2addc874a291f3c7b1c8a2f4ea80fb4a116 100644
+--- a/mlx_lm/models/switch_layers.py
++++ b/mlx_lm/models/switch_layers.py
+@@ -1,7 +1,6 @@
+ # Copyright © 2023-2024 Apple Inc.
+ 
+ import math
+-from functools import partial
+ 
+ import mlx.core as mx
+ import mlx.nn as nn
+@@ -72,12 +71,13 @@ class QuantizedSwitchLinear(nn.Module):
+     def num_experts(self):
+         return self.weight.shape[0]
+ 
+-    def __call__(self, x, indices, sorted_indices=False):
++    def __call__(self, x, indices, sorted_indices=False, lhs_indices=None):
+         x = mx.gather_qmm(
+             x,
+             self["weight"],
+             self["scales"],
+             self.get("biases"),
++            lhs_indices=lhs_indices,
+             rhs_indices=indices,
+             transpose=True,
+             group_size=self.group_size,
+@@ -117,10 +117,11 @@ class SwitchLinear(nn.Module):
+     def num_experts(self):
+         return self.weight.shape[0]
+ 
+-    def __call__(self, x, indices, sorted_indices=False):
++    def __call__(self, x, indices, sorted_indices=False, lhs_indices=None):
+         x = mx.gather_mm(
+             x,
+             self["weight"].swapaxes(-1, -2),
++            lhs_indices=lhs_indices,
+             rhs_indices=indices,
+             sorted_indices=sorted_indices,
+         )
 diff --git a/tests/test_maple_kernels.py b/tests/test_maple_kernels.py
-index 6e232ba..2c7767c 100644
+index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae75251552f 100644
 --- a/tests/test_maple_kernels.py
 +++ b/tests/test_maple_kernels.py
-@@ -9,7 +9,13 @@ is off on this machine", not "the model is broken". A precision failure does
+@@ -9,7 +9,14 @@ is off on this machine", not "the model is broken". A precision failure does
  mean the model is wrong.
  """
  
++import inspect
 +import json
 +import subprocess
 +import sys
@@ -882,7 +1328,7 @@ index 6e232ba..2c7767c 100644
  
  import mlx.core as mx
  import numpy as np
-@@ -32,6 +38,146 @@ def _args(**kw):
+@@ -32,8 +39,167 @@ def _args(**kw):
  
  
  class TestMapleKernels(unittest.TestCase):
@@ -1005,6 +1451,25 @@ index 6e232ba..2c7767c 100644
 +                    block_rows = threads // 32 * rows_per_warp
 +                    self.assertEqual(grid // threads * block_rows, 256)
 +
++    def test_cuda_router_counter_is_an_explicit_initialized_output(self):
++        """CUDA graphs must see the multi-block counter write dependency."""
++        factory = inspect.getsource(maple._make_cuda_router_kernel)
++        call = inspect.getsource(maple.MapleGate._fused_call)
++        self.assertIn('"ctr_out"', factory)
++        self.assertNotIn('"ctr_in"', factory)
++        self.assertIn("init_value=0", call)
++        self.assertIn("output_pick = 7 - tid", factory)
++
++    def test_experimental_decode_paths_are_disabled_by_default(self):
++        self.assertFalse(maple._use_approximate_router)
++        self.assertFalse(maple._use_approximate_add_rms)
++        self.assertFalse(maple._use_cached_decode_lhs)
++        self.assertFalse(maple._cuda_router_indices_uint32)
++
++    def test_ternary_up_gate_stays_opt_in(self):
++        """The non-bit-exact ternary GEMV cannot enter strict mode by default."""
++        self.assertFalse(maple._use_cuda_ternary_up_gate)
++
 +    def test_scaled_rope_does_not_use_the_unscaled_cuda_kernel(self):
 +        """A scaling policy unsupported by the JIT kernel must stay portable."""
 +        args = _args(
@@ -1027,9 +1492,12 @@ index 6e232ba..2c7767c 100644
 +        subprocess.run([sys.executable, "-c", code], check=True)
 +
      def test_fused_router_matches_reference(self):
-         """Fused router (gemv+softmax+top8) vs the pure-MLX path."""
+-        """Fused router (gemv+softmax+top8) vs the pure-MLX path."""
++        """Candidate router stays close, while auto mode is array-exact."""
          args = _args()
-@@ -41,8 +187,11 @@ class TestMapleKernels(unittest.TestCase):
+         gate = maple.MapleGate(args)
+         gate.weight = (
+@@ -41,9 +207,44 @@ class TestMapleKernels(unittest.TestCase):
          ).astype(mx.bfloat16)
          mx.eval(gate.weight)
          x0 = (mx.random.normal((1, 1, args.hidden_size)) * 0.5).astype(mx.bfloat16)
@@ -1037,12 +1505,62 @@ index 6e232ba..2c7767c 100644
 +        backend = maple._kernel_backend()
 +        if backend is None or (backend == "cuda" and maple._cuda_profile() is None):
              self.skipTest("fused router disabled on this build")
-+        self.assertTrue(gate._probe(x0), f"{backend} router failed its live probe")
-+        self.assertEqual(gate._fused_backend, backend)
  
++        fi0, fs0 = gate._fused_call(x0)
++        ri0, rs0 = gate._reference(x0)
++        mx.eval(fi0, fs0, ri0, rs0)
++        candidate_is_exact = (
++            fi0.dtype == ri0.dtype
++            and fs0.dtype == rs0.dtype
++            and bool(mx.array_equal(fi0, ri0))
++            and bool(mx.array_equal(fs0, rs0))
++        )
++        self.assertEqual(gate._probe(x0), candidate_is_exact)
++        self.assertEqual(gate._fused_backend, backend)
++
++        # Strict auto never admits this numerically approximate router, even
++        # when one live input happens to compare exactly.
++        previous_approximate = maple._use_approximate_router
++        maple._use_approximate_router = False
++        gate._fused = None
++        ai0, as0 = gate(x0)
++        mx.eval(ai0, as0)
++        self.assertTrue(bool(mx.array_equal(ai0, ri0)))
++        self.assertTrue(bool(mx.array_equal(as0, rs0)))
++        self.assertFalse(gate._fused)
++
++        # Explicit experimental mode retains the live-probed candidate.
++        maple._use_approximate_router = True
++        gate._fused = None
++        ei0, es0 = gate(x0)
++        mx.eval(ei0, es0)
++        self.assertEqual(gate._fused, candidate_is_exact)
++        if candidate_is_exact:
++            self.assertTrue(bool(mx.array_equal(ei0, ri0)))
++            self.assertTrue(bool(mx.array_equal(es0, rs0)))
++        maple._use_approximate_router = previous_approximate
++
          set_matches = 0
          trials = 32
-@@ -69,6 +218,106 @@ class TestMapleKernels(unittest.TestCase):
+         for i in range(trials):
+@@ -57,6 +258,16 @@ class TestMapleKernels(unittest.TestCase):
+             )
+             mx.eval(fi, fs, ri, rs)
+ 
++            if backend == "cuda":
++                self.assertEqual(
++                    list(map(int, fi.reshape(-1))),
++                    list(map(int, ri.reshape(-1))),
++                    "CUDA must preserve argpartition order for expert aggregation",
++                )
++                self.assertTrue(bool(mx.allclose(fs, rs, rtol=1e-5, atol=1e-5)))
++                set_matches += 1
++                continue
++
+             fused = {int(a): float(b) for a, b in zip(fi.reshape(-1), fs.reshape(-1))}
+             ref = {int(a): float(b) for a, b in zip(ri.reshape(-1), rs.reshape(-1))}
+             if set(fused) == set(ref):
+@@ -69,6 +280,114 @@ class TestMapleKernels(unittest.TestCase):
          # expert; that is legitimate, but it must be rare.
          self.assertGreater(set_matches, trials * 0.75)
  
@@ -1068,12 +1586,20 @@ index 6e232ba..2c7767c 100644
 +            mx.eval(inds, scores, ref_inds, ref_scores)
 +            self.assertEqual(gate._fused_backend, backend)
 +            self.assertTrue(bool(mx.all((inds >= 0) & (inds < args.num_experts))))
++            if backend == "cuda":
++                self.assertTrue(
++                    bool(mx.array_equal(inds, ref_inds)),
++                    f"dispatch {dispatch} reordered experts",
++                )
++                scores_match = mx.allclose(
++                    scores, ref_scores, rtol=1e-5, atol=1e-5
++                )
++            else:
++                scores_match = mx.allclose(
++                    mx.sort(scores), mx.sort(ref_scores), rtol=1e-5, atol=1e-5
++                )
 +            self.assertTrue(
-+                bool(
-+                    mx.allclose(
-+                        mx.sort(scores), mx.sort(ref_scores), rtol=1e-5, atol=1e-5
-+                    )
-+                ),
++                bool(scores_match),
 +                f"dispatch {dispatch} produced stale or incomplete scores",
 +            )
 +
@@ -1149,7 +1675,7 @@ index 6e232ba..2c7767c 100644
      def test_router_logits_are_float32(self):
          """Routing must not round the expert logits to bf16.
  
-@@ -123,11 +372,17 @@ class TestMapleKernels(unittest.TestCase):
+@@ -123,11 +442,17 @@ class TestMapleKernels(unittest.TestCase):
          w = (mx.random.normal((dim,)) * 0.1 + 1.0).astype(mx.bfloat16)
          x = (mx.random.normal((1, 1, dim)) * 0.5).astype(mx.bfloat16)
          r = (mx.random.normal((1, 1, dim)) * 0.5).astype(mx.bfloat16)
@@ -1168,7 +1694,7 @@ index 6e232ba..2c7767c 100644
          # The residual stream must be rounded exactly once, like a bf16 add.
          self.assertTrue(mx.array_equal(h, x + r), "residual add is not bit-exact")
          ref = mx.fast.rms_norm(
-@@ -139,49 +394,86 @@ class TestMapleKernels(unittest.TestCase):
+@@ -139,49 +464,86 @@ class TestMapleKernels(unittest.TestCase):
          self.assertTrue(
              np.allclose(got, want, rtol=8e-3), f"max |d| {np.abs(got - want).max()}"
          )
@@ -1286,7 +1812,7 @@ index 6e232ba..2c7767c 100644
                  lambda: (attn._qk_reference(qk, 7),),
              )
          )
-@@ -215,7 +507,8 @@ class TestMapleKernels(unittest.TestCase):
+@@ -215,7 +577,8 @@ class TestMapleKernels(unittest.TestCase):
          fast = decode(None)
          if not model.model._fused_add_norm:
              self.skipTest("fused decode disabled on this build")

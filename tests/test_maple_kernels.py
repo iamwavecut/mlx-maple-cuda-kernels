@@ -9,6 +9,7 @@ is off on this machine", not "the model is broken". A precision failure does
 mean the model is wrong.
 """
 
+import inspect
 import json
 import subprocess
 import sys
@@ -157,6 +158,25 @@ class TestMapleKernels(unittest.TestCase):
                     block_rows = threads // 32 * rows_per_warp
                     self.assertEqual(grid // threads * block_rows, 256)
 
+    def test_cuda_router_counter_is_an_explicit_initialized_output(self):
+        """CUDA graphs must see the multi-block counter write dependency."""
+        factory = inspect.getsource(maple._make_cuda_router_kernel)
+        call = inspect.getsource(maple.MapleGate._fused_call)
+        self.assertIn('"ctr_out"', factory)
+        self.assertNotIn('"ctr_in"', factory)
+        self.assertIn("init_value=0", call)
+        self.assertIn("output_pick = 7 - tid", factory)
+
+    def test_experimental_decode_paths_are_disabled_by_default(self):
+        self.assertFalse(maple._use_approximate_router)
+        self.assertFalse(maple._use_approximate_add_rms)
+        self.assertFalse(maple._use_cached_decode_lhs)
+        self.assertFalse(maple._cuda_router_indices_uint32)
+
+    def test_ternary_up_gate_stays_opt_in(self):
+        """The non-bit-exact ternary GEMV cannot enter strict mode by default."""
+        self.assertFalse(maple._use_cuda_ternary_up_gate)
+
     def test_scaled_rope_does_not_use_the_unscaled_cuda_kernel(self):
         """A scaling policy unsupported by the JIT kernel must stay portable."""
         args = _args(
@@ -179,7 +199,7 @@ assert maple._router_select_kernel_cache == {}
         subprocess.run([sys.executable, "-c", code], check=True)
 
     def test_fused_router_matches_reference(self):
-        """Fused router (gemv+softmax+top8) vs the pure-MLX path."""
+        """Candidate router stays close, while auto mode is array-exact."""
         args = _args()
         gate = maple.MapleGate(args)
         gate.weight = (
@@ -190,8 +210,40 @@ assert maple._router_select_kernel_cache == {}
         backend = maple._kernel_backend()
         if backend is None or (backend == "cuda" and maple._cuda_profile() is None):
             self.skipTest("fused router disabled on this build")
-        self.assertTrue(gate._probe(x0), f"{backend} router failed its live probe")
+
+        fi0, fs0 = gate._fused_call(x0)
+        ri0, rs0 = gate._reference(x0)
+        mx.eval(fi0, fs0, ri0, rs0)
+        candidate_is_exact = (
+            fi0.dtype == ri0.dtype
+            and fs0.dtype == rs0.dtype
+            and bool(mx.array_equal(fi0, ri0))
+            and bool(mx.array_equal(fs0, rs0))
+        )
+        self.assertEqual(gate._probe(x0), candidate_is_exact)
         self.assertEqual(gate._fused_backend, backend)
+
+        # Strict auto never admits this numerically approximate router, even
+        # when one live input happens to compare exactly.
+        previous_approximate = maple._use_approximate_router
+        maple._use_approximate_router = False
+        gate._fused = None
+        ai0, as0 = gate(x0)
+        mx.eval(ai0, as0)
+        self.assertTrue(bool(mx.array_equal(ai0, ri0)))
+        self.assertTrue(bool(mx.array_equal(as0, rs0)))
+        self.assertFalse(gate._fused)
+
+        # Explicit experimental mode retains the live-probed candidate.
+        maple._use_approximate_router = True
+        gate._fused = None
+        ei0, es0 = gate(x0)
+        mx.eval(ei0, es0)
+        self.assertEqual(gate._fused, candidate_is_exact)
+        if candidate_is_exact:
+            self.assertTrue(bool(mx.array_equal(ei0, ri0)))
+            self.assertTrue(bool(mx.array_equal(es0, rs0)))
+        maple._use_approximate_router = previous_approximate
 
         set_matches = 0
         trials = 32
@@ -205,6 +257,16 @@ assert maple._router_select_kernel_cache == {}
                 args.num_experts_per_tok,
             )
             mx.eval(fi, fs, ri, rs)
+
+            if backend == "cuda":
+                self.assertEqual(
+                    list(map(int, fi.reshape(-1))),
+                    list(map(int, ri.reshape(-1))),
+                    "CUDA must preserve argpartition order for expert aggregation",
+                )
+                self.assertTrue(bool(mx.allclose(fs, rs, rtol=1e-5, atol=1e-5)))
+                set_matches += 1
+                continue
 
             fused = {int(a): float(b) for a, b in zip(fi.reshape(-1), fs.reshape(-1))}
             ref = {int(a): float(b) for a, b in zip(ri.reshape(-1), rs.reshape(-1))}
@@ -240,12 +302,20 @@ assert maple._router_select_kernel_cache == {}
             mx.eval(inds, scores, ref_inds, ref_scores)
             self.assertEqual(gate._fused_backend, backend)
             self.assertTrue(bool(mx.all((inds >= 0) & (inds < args.num_experts))))
+            if backend == "cuda":
+                self.assertTrue(
+                    bool(mx.array_equal(inds, ref_inds)),
+                    f"dispatch {dispatch} reordered experts",
+                )
+                scores_match = mx.allclose(
+                    scores, ref_scores, rtol=1e-5, atol=1e-5
+                )
+            else:
+                scores_match = mx.allclose(
+                    mx.sort(scores), mx.sort(ref_scores), rtol=1e-5, atol=1e-5
+                )
             self.assertTrue(
-                bool(
-                    mx.allclose(
-                        mx.sort(scores), mx.sort(ref_scores), rtol=1e-5, atol=1e-5
-                    )
-                ),
+                bool(scores_match),
                 f"dispatch {dispatch} produced stale or incomplete scores",
             )
 

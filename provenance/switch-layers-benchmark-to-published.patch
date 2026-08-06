@@ -1,0 +1,10 @@
+--- switch_layers-benchmarked-af207c5.py
++++ ../src/switch_layers.py
+@@ -1,7 +1,6 @@
+ # Copyright © 2023-2024 Apple Inc.
+ 
+ import math
+-from functools import partial
+ 
+ import mlx.core as mx
+ import mlx.nn as nn

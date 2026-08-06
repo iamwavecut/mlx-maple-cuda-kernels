@@ -9,14 +9,17 @@ from itertools import product
 from pathlib import Path
 
 import mlx.core as mx
-
-from mlx_lm import load
-
 from maple_kernel_benchmark import _apply_router_override
 from maple_model_benchmark import _environment, _run
 
+from mlx_lm import load
+from mlx_lm.models import maple
+
 
 def _set_paths(model, add_rms_norm, qk_norm, router):
+    # add-RMS and router=True are explicit semantic/experimental modes.
+    maple._use_approximate_add_rms = add_rms_norm
+    maple._use_approximate_router = router
     model.model._fused_add_norm = add_rms_norm
     for layer in model.model.layers:
         layer.self_attn._fused_qk = qk_norm

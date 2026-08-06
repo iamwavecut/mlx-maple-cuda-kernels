@@ -1532,11 +1532,8 @@ def _cuda_ternary_up_gate(x, layer, indices):
 
 
 _decode_lhs_cache = {}
-# Exact candidates retained for explicit experiments. Cached LHS showed no
-# independently significant marginal win in the within-process factorial;
-# uint32 indices only affect the approximate router. Keep both off by default.
-_use_cached_decode_lhs = False
-_cuda_router_indices_uint32 = False
+_use_cached_decode_lhs = True
+_cuda_router_indices_uint32 = True
 
 
 def _decode_lhs_indices(top_k):

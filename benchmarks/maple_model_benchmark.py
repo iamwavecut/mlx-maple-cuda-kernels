@@ -61,7 +61,21 @@ def _environment(model_path, config):
     }
 
 
-def _set_fast_paths(model, enabled):
+def _set_fast_paths(model, enabled, state=None):
+    strict_auto = enabled is not False
+    maple._use_cached_decode_lhs = strict_auto
+    maple._cuda_router_indices_uint32 = False
+    maple._use_cuda_ternary_up_gate = False
+    maple._use_approximate_router = False
+    maple._use_approximate_add_rms = False
+    if strict_auto and state is not None:
+        model.model._fused_add_norm = state["add_rms_norm"]
+        for layer, qk, router in zip(
+            model.model.layers, state["qk_norm"], state["router"]
+        ):
+            layer.self_attn._fused_qk = qk
+            layer.mlp.gate._fused = router
+        return
     model.model._fused_add_norm = enabled
     for layer in model.model.layers:
         layer.self_attn._fused_qk = enabled
@@ -123,6 +137,7 @@ def main():
     model, tokenizer, config = load(
         str(args.model),
         return_config=True,
+        model_config={"model_file": None, "use_flash_head": False},
         tokenizer_config={"trust_remote_code": True},
         trust_remote_code=True,
     )
@@ -135,8 +150,9 @@ def main():
     _set_fast_paths(model, None)
     auto_equivalence = _run(model, tokenizer, prompt, args.equivalence_tokens)
     fast_state = _fast_path_state(model)
-    all_enabled = bool(fast_state["add_rms_norm"]) and all(
-        fast_state["qk_norm"] + fast_state["router"]
+    all_resolved = fast_state["add_rms_norm"] is not None and all(
+        value is not None
+        for value in fast_state["qk_norm"] + fast_state["router"]
     )
     tokens_equal = reference_equivalence["tokens"] == auto_equivalence["tokens"]
     mismatch = None
@@ -168,13 +184,13 @@ def main():
     args.output.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
     )
-    if not all_enabled:
+    if not all_resolved:
         raise RuntimeError(f"a live fast-path probe failed: {fast_state}")
     if not tokens_equal:
         raise RuntimeError(f"reference and auto tokens diverged at index {mismatch}")
     for generation_tokens in args.generation_tokens:
         for mode, enabled in (("reference", False), ("auto", True)):
-            _set_fast_paths(model, enabled)
+            _set_fast_paths(model, enabled, fast_state if enabled else None)
             _run(model, tokenizer, prompt, generation_tokens)
 
         for trial in range(args.trials):
@@ -182,7 +198,7 @@ def main():
             if trial % 2:
                 order = tuple(reversed(order))
             for mode, enabled in order:
-                _set_fast_paths(model, enabled)
+                _set_fast_paths(model, enabled, fast_state if enabled else None)
                 result = _run(model, tokenizer, prompt, generation_tokens)
                 records.append(
                     {

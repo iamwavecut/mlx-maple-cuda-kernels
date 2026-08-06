@@ -1,8 +1,3 @@
-device,compute_capability,prompt_tokens,generation_tokens,portable_mlx_tps,cuda_fast_paths_tps,gain_percent,exact_tokens_equal,condition
-NVIDIA GeForce RTX 3090,sm86,128,256,136.859500,189.300433,38.317349,true,shared_host_embedder_active
-NVIDIA GeForce RTX 4090,sm89,128,256,120.561728,167.792310,39.175435,true,dedicated_cloud_pod
-NVIDIA H100 NVL,sm90,128,256,216.248203,283.424999,31.064672,true,dedicated_cloud_pod
-NVIDIA B200,sm100,128,256,149.164085,167.978531,12.613255,true,dedicated_cloud_pod
-NVIDIA GeForce RTX 5090,sm120,128,256,228.757752,262.084406,14.568536,true,dedicated_cloud_pod
-Apple M2 Max,metal,128,256,,172.896339,,,interactive_non_quiescent
-Apple M2 Max,metal,128,1024,,170.414249,,,interactive_non_quiescent
+device,compute_capability,profile,prompt_tokens,generation_tokens,portable_mlx_tps,strict_tps,paired_geomean_gain_percent,ci95_low_percent,ci95_high_percent,exact_gate,condition
+NVIDIA GeForce RTX 3090,sm86,strict_qk_default,128,512,179.386182,195.267232,8.513318,0.897131,16.704410,qk_arrays_exact_factorial_tokens_512,shared_host_co_tenant_active
+NVIDIA GeForce RTX 3090,sm86,strict_qk_cached_lhs_opt_in,128,512,177.557590,209.575982,18.276986,5.184733,32.998820,qk_arrays_exact_random_tokens_1024_common_slice_artifacts_equal,shared_host_co_tenant_active

@@ -1,0 +1,6 @@
+{"backend":"cuda","checkpoint_artifact_hashes_recorded":false,"checkpoint_revision_asserted":"361db5da5e74ff6fcdd852d478e1f266ce11013a","compute_capability":"sm_86","condition":"shared_host_co_tenant_active","device_name":"NVIDIA GeForce RTX 3090","status":"experimental_only","test_date":"2026-08-06","type":"environment"}
+{"best_speedup":1.4724491540850493,"candidate_median_us":90.6415,"case":"up_gate","reference_median_us":133.465,"rows_per_warp":4,"single_input_array_equal":true,"stage_x":true,"threads":512,"type":"microbenchmark_summary"}
+{"bias_is_negative_scale":true,"layers":24,"no_packed_code_3":true,"row_alpha":true,"schema_failures":0,"type":"schema_summary"}
+{"array_equal_comparisons":56,"case":"up_gate","comparisons":144,"differing_values":248,"max_abs_difference":0.25,"total_elements":1179648,"type":"validation_summary"}
+{"array_equal_comparisons":68,"case":"down","comparisons":144,"differing_values":141,"max_abs_difference":0.0625,"total_elements":2359296,"type":"validation_summary"}
+{"default_enabled":false,"reason":"full-layer BF16 arrays differ despite the exact single-input microbenchmark probe","strict_eligible":false,"type":"decision"}
