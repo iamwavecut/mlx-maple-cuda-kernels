@@ -1,0 +1,18 @@
+{
+  "device": {
+    "architecture": "sm_100",
+    "compute_capability_major": 10,
+    "compute_capability_minor": 0,
+    "device_name": "NVIDIA B200",
+    "total_memory": 192265846784
+  },
+  "gpu": {
+    "compute_capability": "10.0",
+    "driver_version": "580.126.20",
+    "max_memory_clock_mhz": "3996",
+    "max_sm_clock_mhz": "1965",
+    "memory_total_mib": "183359",
+    "name": "NVIDIA B200",
+    "power_limit_w": "1000.00"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "device": {
+    "architecture": "sm_90",
+    "compute_capability_major": 9,
+    "compute_capability_minor": 0,
+    "device_name": "NVIDIA H100 80GB HBM3",
+    "total_memory": 85520809984
+  },
+  "gpu": {
+    "compute_capability": "9.0",
+    "driver_version": "580.126.09",
+    "max_memory_clock_mhz": "2619",
+    "max_sm_clock_mhz": "1980",
+    "memory_total_mib": "81559",
+    "name": "NVIDIA H100 80GB HBM3",
+    "power_limit_w": "700.00"
+  }
+}

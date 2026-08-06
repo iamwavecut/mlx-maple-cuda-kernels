@@ -1,0 +1,407 @@
+{
+  "acceleration_eligible": true,
+  "acceleration_state": "active",
+  "campaign_manifest_sha256": "28e1c6484113aa5c326d13b4a39c2d4a275f4f04c5495edac5869fa0a4ecd307",
+  "correctness": {
+    "common": {
+      "1024": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      },
+      "512": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      }
+    },
+    "factor_token_hash_count": 1,
+    "multi_seed": {
+      "all_cases_exact": true,
+      "cases": 3,
+      "type": "summary"
+    },
+    "random_1024": true,
+    "w2_stock_projections": 144
+  },
+  "correctness_pass": true,
+  "device": {
+    "architecture": "sm_100",
+    "compute_capability_major": 10,
+    "compute_capability_minor": 0,
+    "device_name": "NVIDIA B200",
+    "total_memory": 192265846784
+  },
+  "failures": [],
+  "hardware": {
+    "compute_capability": "10.0",
+    "driver_version": "580.126.20",
+    "max_memory_clock_mhz": "3996",
+    "max_sm_clock_mhz": "1965",
+    "memory_total_mib": "183359",
+    "name": "NVIDIA B200",
+    "power_limit_w": "1000.00"
+  },
+  "mlx": "0.32.0",
+  "mlx_cuda": "0.32.0",
+  "model_manifest_sha256": "f376857c2abbeac99140012656f28e8e91dadf9f4f322d287c1408745fd36c3e",
+  "pass": true,
+  "performance": {
+    "direct_qk_lhs": {
+      "ci95": [
+        1.212886397410873,
+        1.2414470721792068
+      ],
+      "geometric_mean": 1.2270836430136758,
+      "p_value": 1.0004340472658265e-07,
+      "pairs": 6,
+      "percent": 22.708364301367578,
+      "ratios": [
+        1.2470848606431393,
+        1.2214092757367212,
+        1.2353531773536999,
+        1.2091419847588867,
+        1.218032813904668,
+        1.231857167980501
+      ],
+      "reference_mean_tps": 257.635521441054,
+      "strict_profile_mean_tps": 316.12761821261387,
+      "wins": 6
+    },
+    "factor_effects": {
+      "lhs_main": {
+        "ci95": [
+          1.0568202572558143,
+          1.07733433834323
+        ],
+        "geometric_mean": 1.0670279999130363,
+        "p_value": 9.205115039889934e-07,
+        "pairs": 8,
+        "percent": 6.702799991303632,
+        "ratios": [
+          1.0924462576554745,
+          1.060069181450729,
+          1.058163381415677,
+          1.0784895049796175,
+          1.0622934618124151,
+          1.0642780676032237,
+          1.05560806692944,
+          1.0653719650812743
+        ],
+        "wins": 8
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.2082235095829446,
+          1.300181182835893
+        ],
+        "geometric_mean": 1.2533592748369027,
+        "p_value": 1.721035673300815e-06,
+        "pairs": 8,
+        "percent": 25.33592748369027,
+        "ratios": [
+          1.3935874383727482,
+          1.2423233294336702,
+          1.2263451544374409,
+          1.2534093648243652,
+          1.2170372262392855,
+          1.2391745759872999,
+          1.2242379283018616,
+          1.239446905265588
+        ],
+        "wins": 8
+      },
+      "qk_main": {
+        "ci95": [
+          1.1417663516442018,
+          1.208432192924231
+        ],
+        "geometric_mean": 1.1746264155570916,
+        "p_value": 3.002041512925301e-06,
+        "pairs": 8,
+        "percent": 17.46264155570916,
+        "ratios": [
+          1.2756576615160549,
+          1.1719266545731686,
+          1.1589374344033336,
+          1.1621896727201377,
+          1.145669506581408,
+          1.1643334704603532,
+          1.1597466584950729,
+          1.163393580730308
+        ],
+        "wins": 8
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.1428205903436255,
+          1.2281349961772305
+        ],
+        "geometric_mean": 1.1847100748085706,
+        "p_value": 1.0496114788726971e-05,
+        "pairs": 8,
+        "percent": 18.47100748085706,
+        "ratios": [
+          1.3148855205506964,
+          1.1865965840562822,
+          1.165007671680141,
+          1.15736736418071,
+          1.151768503752754,
+          1.169491453129598,
+          1.1668560825412582,
+          1.1736160906115256
+        ],
+        "wins": 8
+      }
+    },
+    "factor_means_tps": {
+      "L": 264.5763226881407,
+      "Q": 291.1614689590742,
+      "QL": 308.03645277833687,
+      "R": 245.98747458399805
+    },
+    "fresh_process": {
+      "mean_tps": {
+        "Q": 280.6975811318394,
+        "QL": 297.4736221559697,
+        "R": 241.5107840749491
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.1954609571606134,
+          1.273121679027001
+        ],
+        "geometric_mean": 1.2336803722972762,
+        "p_value": 1.4222754143975283e-08,
+        "pairs": 12,
+        "percent": 23.368037229727623,
+        "ratios": [
+          1.4125377430865411,
+          1.2566848483382815,
+          1.2104011121557021,
+          1.2245092688186194,
+          1.210897780142061,
+          1.2284252974419105,
+          1.2800409600170886,
+          1.2209995802733784,
+          1.179640885089144,
+          1.2378922305217313,
+          1.1841776601365814,
+          1.1750839612533126
+        ],
+        "wins": 12
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.142254607564089,
+          1.183700960239302
+        ],
+        "geometric_mean": 1.162793135433547,
+        "p_value": 1.144112506396966e-09,
+        "pairs": 12,
+        "percent": 16.2793135433547,
+        "ratios": [
+          1.1365534178133256,
+          1.1714578953608394,
+          1.1633780758182861,
+          1.1570385606718188,
+          1.1594166655548068,
+          1.1774401166962614,
+          1.2433406144911627,
+          1.1430227122457115,
+          1.1592346466965302,
+          1.1959545680222265,
+          1.1376521757670615,
+          1.1141030999743278
+        ],
+        "wins": 12
+      },
+      "statistical_unit": "fresh model process on one device instance"
+    },
+    "strict_acceleration_claim_eligible": true
+  },
+  "profile": "sm100",
+  "run_manifest_sha256": "ff7fee2eee9efef65466475ed1735dd0fccf51775bf0c98a7119597fe5eb0559",
+  "schema": 2,
+  "source_sha256": "b34cd9777cf5a8775ed4e814fe7e14c987a9021627224168595c92ddf21edae4",
+  "strict_path_state": {
+    "add_rms_norm": false,
+    "approximate_add_rms": false,
+    "approximate_router": false,
+    "cached_decode_lhs": false,
+    "qk_norm": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "router": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "router_indices_uint32": false,
+    "ternary_up_gate": false,
+    "type": "strict_path_state"
+  },
+  "type": "maple_architecture_summary"
+}

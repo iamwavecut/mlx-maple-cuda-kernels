@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import statistics
@@ -42,6 +43,7 @@ def run(model, tokenizer, prompt, max_tokens):
         "token_sha256": hashlib.sha256(
             ",".join(map(str, tokens)).encode()
         ).hexdigest(),
+        "generated_tokens": len(tokens),
         "generation_tps": response.generation_tps,
         "prompt_tps": response.prompt_tps,
         "elapsed": elapsed,
@@ -63,8 +65,12 @@ def main():
     model, tokenizer, config = load(
         str(args.model), return_config=True,
         model_config={"model_file": None, "use_flash_head": False},
-        tokenizer_config={"trust_remote_code": True}, trust_remote_code=True,
+        tokenizer_config={"trust_remote_code": False}, trust_remote_code=False,
     )
+    source = Path(inspect.getfile(type(model))).resolve()
+    module_source = Path(maple.__file__).resolve()
+    if source != module_source:
+        raise RuntimeError(f"loaded model source {source} differs from {module_source}")
     tokenizer._eos_token_ids = {}
     vocab = config.get("vocab_size") or config["text_config"]["vocab_size"]
     prompt = mx.random.randint(0, vocab, (args.prompt_tokens,)).tolist()
@@ -73,6 +79,9 @@ def main():
         "type": "environment",
         "device": dict(mx.device_info(mx.gpu)),
         "mlx": mx.__version__,
+        "model_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "config_model_file": config.get("model_file"),
+        "profile": maple._cuda_profile().name if maple._cuda_profile() is not None else None,
         "env": {k: os.environ.get(k) for k in [
             "MLX_USE_CUDA_GRAPHS", "MLX_CUDA_GRAPH_CACHE_SIZE",
             "MLX_MAX_OPS_PER_BUFFER", "MLX_MAX_MB_PER_BUFFER",
@@ -82,19 +91,27 @@ def main():
             ",".join(map(str, prompt)).encode()
         ).hexdigest(),
     }]
+    expected = None
     for _ in range(args.warmups):
-        run(model, tokenizer, prompt, args.generation_tokens)
+        result = run(model, tokenizer, prompt, args.generation_tokens)
+        expected = result["token_sha256"] if expected is None else expected
+        if result["token_sha256"] != expected:
+            raise RuntimeError("nondeterministic warmup token stream")
     fast_state = {
         "add_rms_norm": model.model._fused_add_norm,
         "qk_norm": [layer.self_attn._fused_qk for layer in model.model.layers],
         "router": [layer.mlp.gate._fused for layer in model.model.layers],
+        "cached_decode_lhs": maple._use_cached_decode_lhs,
+        "router_indices_uint32": maple._cuda_router_indices_uint32,
+        "ternary_up_gate": maple._use_cuda_ternary_up_gate,
+        "approximate_router": maple._use_approximate_router,
+        "approximate_add_rms": maple._use_approximate_add_rms,
     }
     if fast_state["add_rms_norm"] is None or any(
         value is None for value in fast_state["qk_norm"] + fast_state["router"]
     ):
         raise RuntimeError(f"an auto live probe did not resolve: {fast_state}")
     records.append({"type": "fast_path_state", **fast_state})
-    expected = None
     for trial in range(args.trials):
         result = run(model, tokenizer, prompt, args.generation_tokens)
         if expected is None:

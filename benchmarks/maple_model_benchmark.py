@@ -5,6 +5,7 @@
 import argparse
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import os
 import platform
@@ -13,12 +14,9 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
-
+from maple_kernel_benchmark import _apply_router_override, _git_sha
 from mlx_lm import load, stream_generate
 from mlx_lm.models import maple
-
-from maple_kernel_benchmark import _apply_router_override, _git_sha
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,6 +85,11 @@ def _fast_path_state(model):
         "add_rms_norm": model.model._fused_add_norm,
         "qk_norm": [layer.self_attn._fused_qk for layer in model.model.layers],
         "router": [layer.mlp.gate._fused for layer in model.model.layers],
+        "cached_decode_lhs": maple._use_cached_decode_lhs,
+        "router_indices_uint32": maple._cuda_router_indices_uint32,
+        "ternary_up_gate": maple._use_cuda_ternary_up_gate,
+        "approximate_router": maple._use_approximate_router,
+        "approximate_add_rms": maple._use_approximate_add_rms,
     }
 
 
@@ -109,6 +112,7 @@ def _run(model, tokenizer, prompt, generation_tokens):
     return {
         "tokens": tokens,
         "token_sha256": hashlib.sha256(",".join(map(str, tokens)).encode()).hexdigest(),
+        "generated_tokens": len(tokens),
         "prompt_tps": response.prompt_tps,
         "generation_tps": response.generation_tps,
         "peak_memory": response.peak_memory,
@@ -138,9 +142,13 @@ def main():
         str(args.model),
         return_config=True,
         model_config={"model_file": None, "use_flash_head": False},
-        tokenizer_config={"trust_remote_code": True},
-        trust_remote_code=True,
+        tokenizer_config={"trust_remote_code": False},
+        trust_remote_code=False,
     )
+    source = Path(inspect.getfile(type(model))).resolve()
+    module_source = Path(maple.__file__).resolve()
+    if source != module_source:
+        raise RuntimeError(f"loaded model source {source} differs from {module_source}")
     tokenizer._eos_token_ids = {}
     vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
     prompt = mx.random.randint(0, vocab_size, (args.prompt_tokens,)).tolist()
@@ -158,14 +166,20 @@ def main():
     mismatch = None
     if not tokens_equal:
         mismatch = next(
-            index
-            for index, (reference, auto) in enumerate(
-                zip(
-                    reference_equivalence["tokens"],
-                    auto_equivalence["tokens"],
+            (
+                index
+                for index, (reference, auto) in enumerate(
+                    zip(
+                        reference_equivalence["tokens"],
+                        auto_equivalence["tokens"],
+                    )
                 )
-            )
-            if reference != auto
+                if reference != auto
+            ),
+            min(
+                len(reference_equivalence["tokens"]),
+                len(auto_equivalence["tokens"]),
+            ),
         )
 
     records = [
@@ -189,9 +203,13 @@ def main():
     if not tokens_equal:
         raise RuntimeError(f"reference and auto tokens diverged at index {mismatch}")
     for generation_tokens in args.generation_tokens:
+        warmup_hash = None
         for mode, enabled in (("reference", False), ("auto", True)):
             _set_fast_paths(model, enabled, fast_state if enabled else None)
-            _run(model, tokenizer, prompt, generation_tokens)
+            result = _run(model, tokenizer, prompt, generation_tokens)
+            warmup_hash = result["token_sha256"] if warmup_hash is None else warmup_hash
+            if result["token_sha256"] != warmup_hash:
+                raise RuntimeError(f"warmup token mismatch for {generation_tokens} {mode}")
 
         for trial in range(args.trials):
             order = (("reference", False), ("auto", True))
@@ -200,6 +218,10 @@ def main():
             for mode, enabled in order:
                 _set_fast_paths(model, enabled, fast_state if enabled else None)
                 result = _run(model, tokenizer, prompt, generation_tokens)
+                if result["token_sha256"] != warmup_hash:
+                    raise RuntimeError(
+                        f"timed token mismatch for {generation_tokens} trial {trial + 1} {mode}"
+                    )
                 records.append(
                     {
                         "type": "trial",

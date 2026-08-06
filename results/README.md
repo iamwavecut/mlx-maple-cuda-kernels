@@ -2,45 +2,72 @@
 
 ## Current strict evidence
 
-`summary.csv` contains the two current `sm86` rows:
+`summary.csv` contains historical `sm86` rows and two fresh rows for each of
+`sm89`, `sm90`, `sm100`, and `sm120`:
 
-- `strict_qk_default`: conservative source default, measured in the balanced
-  component factorial;
-- `strict_qk_cached_lhs_opt_in`: exact speed profile used for the direct paired
-  result and long common-slice gates.
+- `strict_qk_default_fresh_process`: conservative exact-probed Q/K source default;
+- `strict_qk_cached_lhs_opt_in_fresh_process`: exact Q/K plus the lifecycle-limited cached
+  decode LHS option.
 
-Throughput columns are arithmetic means. `paired_geomean_gain_percent` and its
-confidence interval are computed from within-block/pair log ratios, not from
-the ratio of displayed means.
+For the fresh matrix, throughput columns are arithmetic means across 12 fresh
+model processes on one device instance. Gains and confidence intervals are
+geometric statistics from paired within-process ratios. Do not compare
+absolute rates across hosts as a GPU ranking or pool the historical `sm86`
+design with the fresh matrix.
 
-Current sanitized records:
+[`PUBLIC-INDEX.json`](PUBLIC-INDEX.json) binds every canonical baseline, graph, W2, Blackwell, campaign, source, analysis, sanitized-bundle, and private raw-manifest commitment used by the release.
 
-- `cuda/sm86-strict-profile.jsonl`: six direct timing pairs and 1024-token gate;
-- `cuda/sm86-component-factorial.jsonl`: eight balanced R/Q/L/QL blocks;
-- `cuda/sm86-common-slice.jsonl`: 512/1024 fixed-slice artifact hashes and
-  grading, without generated answer text;
-- `cuda/sm86-graph-tuning.jsonl`: ops/MB/cache attribution with cache and MB
-  provenance per block/pair;
-- `cuda/sm86-ternary-validation-summary.jsonl`: semantic prototype evidence and
-  strict rejection decision.
+## Allowlisted per-SKU bundles
 
-The benchmarked model/switch sources, executed harness variants, and complete
-default-only diffs to the published source are retained under `../provenance/`.
-The checkpoint revision is an asserted pinned setup input; the original run did
-not record hashes for every weight/config/tokenizer artifact. Published JSONL
-is sanitized: no GPU UUID, PCI bus ID, local/model path, raw service log, or
-generated answer text.
+Each directory under `cuda/multiarch/` contains a 15-file sanitized baseline
+bundle plus its leaf `SHA256SUMS`:
 
-`exact_gate` is deliberately narrow. Q/K live arrays were exact, and the listed
-token/text/selected-logprob/top-1 artifacts matched in the stated runs. It does
-not mean every full-logit tensor was compared.
+- `sm89`: RTX 4090, driver 580.159.04;
+- `sm90`: H100 80GB HBM3, driver 580.126.09;
+- `sm100`: B200, driver 580.126.20;
+- `sm120`: RTX 5090, driver 580.126.20.
 
-## Legacy evidence
+`summary.json` is the canonical baseline analysis. Other files retain
+allowlisted strict-path, fresh-process, component, common-slice, package,
+model, harness, and source provenance. Every bundle excludes UUID, PCI ID,
+IP/port, local/model paths, raw service logs, generated text, and profiler data.
 
-`legacy-initial-port/` preserves the original multi-architecture and M2 data.
-Those records are historical/context-only and are not current strict claims.
-The initial CUDA campaign used a short oracle and tolerant probes that admitted
-router/add-RMS paths now classified as semantic. Mac/Metal and `sm89`-`sm120`
-must be revalidated with the current source and deterministic contract.
+Compact cross-architecture evidence:
 
-`SHA256SUMS` covers every published result data file except itself.
+- `cuda/multiarch-strict-summary.jsonl`: correctness and primary Q/Q+LHS
+  fresh-process results;
+- `cuda/multiarch-graph-summary.jsonl`: five-block graph screen;
+- `cuda/multiarch-w2-summary.jsonl`: W2 screen/follow-up and custom-wheel
+  provenance; only the `sm120` tile was accepted;
+- `cuda/blackwell-qk-rounding.jsonl`: B200/RTX 5090 isolation and fixed/original
+  gates;
+- `cuda/release-source-equivalence.json`: generated Q/K kernel hash bridge from
+  executed source files to the release source.
+
+The root `SHA256SUMS` covers every published file under `results/` except
+itself, including leaf manifests. The compact files are derived from the bound
+canonical analyses; raw campaign artifacts remain private because their schemas
+contain sensitive provider/device/path fields.
+
+## Exactness envelope
+
+Every fresh target had 24/24 Q/K layers active, an exact random 1024-token gate,
+three exact multi-seed cases, 20/20 exact cases at both 512 and 1024 tokens, and
+144 deterministic stock W2 projection fingerprints. W2 candidates separately
+had to match all 144 reference arrays before timing. Common-slice equality
+covers token IDs, decoded text, selected-token-logprob hash, and top-1 hash. It is finite
+regression evidence, not exhaustive full-logit equality or a quality score.
+
+Executed Maple source hashes differ by campaign stage: `7785da2a…` on
+`sm89/sm90`, `b34cd977…` on `sm100`, and release `28ceabac…` on `sm120`.
+Generated release Q/K source matches the executed profile-specific source for
+the earlier three targets; this narrow bridge is disclosed rather than calling
+the whole files identical.
+
+## Historical evidence
+
+The top-level `cuda/sm86-*.jsonl` files are the revised historical RTX 3090
+campaign. `legacy-initial-port/` preserves the original short-oracle data only
+for transparency; tolerant probes admitted paths now classified as semantic,
+so those records are not current strict claims. Mac/Metal remains unvalidated
+with the current source.

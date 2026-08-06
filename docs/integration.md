@@ -1,16 +1,17 @@
 # Integration
 
-## Requirements
+## Validated scope
 
-- Linux with an NVIDIA GPU. Current strict evidence is for RTX 3090 / `sm86`.
-- Python 3.12.
-- MLX and MLX CUDA 0.32.0.
-- The pinned Maple preview checkpoint.
-- A trusted DeepGrove checkout at the base revision below.
+- Linux, Python 3.12.3, MLX/MLX-CUDA 0.32.0, CUDA 12.9.
+- Fresh strict evidence on one RTX 4090 (`sm89`), H100 80GB HBM3 (`sm90`),
+  B200 (`sm100`), and RTX 5090 (`sm120`) instance.
+- Checkpoint `deepgrove/maple-preview-2bit-mlx` revision
+  `361db5da5e74ff6fcdd852d478e1f266ce11013a`.
+- DeepGrove base `eba96c16158f032821b0bf374ea1421cfddef0a9`.
 
-Other CUDA profiles are fail-closed in source but have not passed the revised
-long-decode campaign. Do not treat profile presence as current `sm89`-`sm120`
-validation.
+Other SKUs, drivers, MLX versions, CUDA 13, future architectures, and execution
+policies require fresh validation. Profile presence alone is not a support
+claim.
 
 ## Apply the patch
 
@@ -24,13 +25,12 @@ git apply /path/to/mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.pa
 cp -R /path/to/mlx-maple-cuda-kernels/benchmarks/. benchmarks/
 
 uv venv --python 3.12
-uv pip install -e '.[cuda12]' rich pytest
 source .venv/bin/activate
-
-# Fetch and verify the separately licensed fixed-slice questions.
-python benchmarks/prepare_maple_common_slice.py
+uv pip install -e '.[cuda12]' 'mlx==0.32.0' 'mlx-cuda-12==0.32.0' rich pytest huggingface_hub
 ```
 
+For the published version claim, verify `mlx==0.32.0` and
+`mlx-cuda-12==0.32.0`; do not substitute a CUDA 13 wheel and inherit the claim.
 Download the frozen checkpoint:
 
 ```bash
@@ -39,49 +39,57 @@ hf download deepgrove/maple-preview-2bit-mlx \
   --local-dir maple-preview-2bit-mlx
 ```
 
-The checkpoint config may name its bundled `maple.py`. Every strict harness
-must override that and disable FlashHead at load time:
+## Force package implementation
+
+The checkpoint config may name bundled Python. Strict loading overrides it,
+disables FlashHead, rejects remote code, and verifies the actual class source:
 
 ```python
+import inspect
+from pathlib import Path
 from mlx_lm import load
+from mlx_lm.models import maple
 
 model, tokenizer = load(
     "maple-preview-2bit-mlx",
     model_config={"model_file": None, "use_flash_head": False},
-    tokenizer_config={"trust_remote_code": True},
-    trust_remote_code=True,
+    tokenizer_config={"trust_remote_code": False},
+    trust_remote_code=False,
 )
+assert Path(inspect.getfile(type(model))).resolve() == Path(maple.__file__).resolve()
 ```
 
-Do not rely on importing `mlx_lm.models.maple` alone. Assert
-`inspect.getfile(type(model))` against the intended worktree module when
-collecting evidence.
+Importing `mlx_lm.models.maple` alone is not a provenance check.
 
-## Set the deterministic environment
+## Deterministic process environment
 
-These values must be set in a fresh process before any CUDA use:
+Set all values in a fresh process before any CUDA use:
 
 ```bash
 export MLX_CUDA_USE_CUDNN_SDPA=0
+export MLX_ENABLE_TF32=0
 export MLX_USE_CUDA_GRAPHS=1
 export MLX_CUDA_GRAPH_CACHE_SIZE=400
 export MLX_MAX_OPS_PER_BUFFER=100
 export MLX_MAX_MB_PER_BUFFER=100
+export TOKENIZERS_PARALLELISM=false
 ```
 
-The cuDNN setting is required for a stable portable reference oracle on the
-tested stack. The graph settings are the supported `sm86` throughput profile.
+cuDNN SDPA is disabled to stabilize the portable oracle, not to claim a Maple
+speedup. Graph settings are the reproducible campaign profile, not a universal
+per-SKU optimum. Runtime tile alternation must instead use
+`MLX_USE_CUDA_GRAPHS=0` to prevent graph/JIT identity contamination.
 
 ## Verify before serving
 
-Run the focused suite through the project environment:
+Run the focused tests through the project environment:
 
 ```bash
 PYTHONPATH="$PWD" python -m pytest tests/test_maple_kernels.py -q
 ```
 
-Then run correctness and timing separately. The model harness performs a
-1024-token exact gate before six paired 512-token timing trials:
+Then separate correctness from timing. The model harness performs an exact
+1024-token gate before paired 512-token timing:
 
 ```bash
 PYTHONPATH="$PWD" python benchmarks/maple_model_benchmark.py \
@@ -93,56 +101,39 @@ PYTHONPATH="$PWD" python benchmarks/maple_model_benchmark.py \
   --trials 6
 ```
 
-Run the fixed regression slice in separate processes for each length:
+Generate the separately licensed, pinned fixed-slice manifest, then run the two
+lengths in separate processes:
 
 ```bash
-PYTHONPATH="$PWD" python benchmarks/maple_common_slice_benchmark.py \
-  --model maple-preview-2bit-mlx \
-  --manifest benchmarks/data/maple_common_slice_20.json \
-  --output results/common-512.jsonl \
-  --max-tokens 512
+PYTHONPATH="$PWD" python benchmarks/prepare_maple_common_slice.py
 
 PYTHONPATH="$PWD" python benchmarks/maple_common_slice_benchmark.py \
   --model maple-preview-2bit-mlx \
   --manifest benchmarks/data/maple_common_slice_20.json \
-  --output results/common-1024.jsonl \
-  --max-tokens 1024
+  --output results/common-512.jsonl --max-tokens 512
+
+PYTHONPATH="$PWD" python benchmarks/maple_common_slice_benchmark.py \
+  --model maple-preview-2bit-mlx \
+  --manifest benchmarks/data/maple_common_slice_20.json \
+  --output results/common-1024.jsonl --max-tokens 1024
 ```
 
-Both scripts record source provenance; the common-slice harness also refuses a
-loaded-class/worktree-module mismatch. They abort on approximate-path
-activation or reference/strict token divergence and record live-path
-acceptance/fallbacks;
-a strict run may legitimately contain portable fallbacks.
+A strict run may legitimately report portable fallback. Acceleration is claimed
+only when all 24 Q/K layers are active and all other path-state/correctness gates
+pass. Token/text/selected-logprob/top-1 equality is finite evidence, not
+exhaustive full-logit equality or a quality benchmark.
 
 ## Runtime modes
 
-The source default is conservative:
-
-- exact-probed Q/K can enable itself;
-- cached decode LHS is off;
-- approximate router and add/RMS are off;
-- ternary up/gate is off;
-- FlashHead is off through model configuration.
-
-The published 209.58 tok/s speed profile explicitly enables cached LHS. To
-reproduce it, use `maple_model_benchmark.py`, which sets and records all state.
-For an application-specific opt-in after its own equality gate:
+The source default enables only exact-probed Q/K. Cached decode LHS is off;
+approximate router, add/RMS, ternary up/gate, FlashHead, and KV quantization are
+off. For the constrained warm single-model/single-device top-k=8 workload:
 
 ```python
 from mlx_lm.models import maple
 maple._use_cached_decode_lhs = True
 ```
 
-Set the global on the actual module used by the loaded class. Do not enable
-`_use_approximate_router`, `_use_approximate_add_rms`, or
-`_use_cuda_ternary_up_gate` in a strict deployment.
-
-## Interpreting results
-
-Token and decoded-text equality are the release gate. Selected-logprob and
-top-1 hashes are additional diagnostics, not full-logit equality. Throughput
-must come from the timing pass without per-token correctness instrumentation.
-
-The 20-case slice is intentionally small and often length-limited. It detects
-regressions; it is not a model-quality leaderboard.
+Its process-global cache lacks model/device invalidation, so keep it off when a
+process changes model or device. The accepted RTX 5090 W2 tile requires a
+separate experimental MLX wheel and is not enabled by this repository patch.

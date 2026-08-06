@@ -1,0 +1,71 @@
+{
+  "method": "Captured kernel name and source arguments passed to mx.fast.cuda_kernel by _make_cuda_qk_norm_rope_kernel for each profile; SHA-256 over generated source UTF-8 bytes. This checks Q/K kernel code-generation and JIT-name isolation, not whole-module behavioral equivalence.",
+  "profiles": {
+    "sm100": {
+      "nope_name_equal": true,
+      "nope_source_equal": true,
+      "release_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "release_nope_kernel_name": "maple_qk_norm_nope_sm100",
+      "release_rope_generated_source_sha256": "d1a7bbb0367437d57a068461832e0858b876a152f1919ade025d8555f21fab50",
+      "release_rope_kernel_name": "maple_qk_norm_rope_sm100",
+      "release_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+      "rope_name_equal": true,
+      "rope_source_equal": true,
+      "validated_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "validated_nope_kernel_name": "maple_qk_norm_nope_sm100",
+      "validated_rope_generated_source_sha256": "d1a7bbb0367437d57a068461832e0858b876a152f1919ade025d8555f21fab50",
+      "validated_rope_kernel_name": "maple_qk_norm_rope_sm100",
+      "validated_source_sha256": "b34cd9777cf5a8775ed4e814fe7e14c987a9021627224168595c92ddf21edae4"
+    },
+    "sm120": {
+      "nope_name_equal": true,
+      "nope_source_equal": true,
+      "release_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "release_nope_kernel_name": "maple_qk_norm_nope_sm120",
+      "release_rope_generated_source_sha256": "d1a7bbb0367437d57a068461832e0858b876a152f1919ade025d8555f21fab50",
+      "release_rope_kernel_name": "maple_qk_norm_rope_sm120",
+      "release_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+      "rope_name_equal": true,
+      "rope_source_equal": true,
+      "validated_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "validated_nope_kernel_name": "maple_qk_norm_nope_sm120",
+      "validated_rope_generated_source_sha256": "d1a7bbb0367437d57a068461832e0858b876a152f1919ade025d8555f21fab50",
+      "validated_rope_kernel_name": "maple_qk_norm_rope_sm120",
+      "validated_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8"
+    },
+    "sm89": {
+      "nope_name_equal": true,
+      "nope_source_equal": true,
+      "release_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "release_nope_kernel_name": "maple_qk_norm_nope_sm89",
+      "release_rope_generated_source_sha256": "3a0f6321d88c2c943fc1be52a4f687ef831b235050a64e0bd4a6c2943cb50f01",
+      "release_rope_kernel_name": "maple_qk_norm_rope_sm89",
+      "release_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+      "rope_name_equal": true,
+      "rope_source_equal": true,
+      "validated_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "validated_nope_kernel_name": "maple_qk_norm_nope_sm89",
+      "validated_rope_generated_source_sha256": "3a0f6321d88c2c943fc1be52a4f687ef831b235050a64e0bd4a6c2943cb50f01",
+      "validated_rope_kernel_name": "maple_qk_norm_rope_sm89",
+      "validated_source_sha256": "7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae"
+    },
+    "sm90": {
+      "nope_name_equal": true,
+      "nope_source_equal": true,
+      "release_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "release_nope_kernel_name": "maple_qk_norm_nope_sm90",
+      "release_rope_generated_source_sha256": "3a0f6321d88c2c943fc1be52a4f687ef831b235050a64e0bd4a6c2943cb50f01",
+      "release_rope_kernel_name": "maple_qk_norm_rope_sm90",
+      "release_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+      "rope_name_equal": true,
+      "rope_source_equal": true,
+      "validated_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "validated_nope_kernel_name": "maple_qk_norm_nope_sm90",
+      "validated_rope_generated_source_sha256": "3a0f6321d88c2c943fc1be52a4f687ef831b235050a64e0bd4a6c2943cb50f01",
+      "validated_rope_kernel_name": "maple_qk_norm_rope_sm90",
+      "validated_source_sha256": "7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae"
+    }
+  },
+  "release_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+  "schema": "maple-release-source-equivalence-v1"
+}

@@ -1,0 +1,18 @@
+{
+  "device": {
+    "architecture": "sm_120",
+    "compute_capability_major": 12,
+    "compute_capability_minor": 0,
+    "device_name": "NVIDIA GeForce RTX 5090",
+    "total_memory": 34190917632
+  },
+  "gpu": {
+    "compute_capability": "12.0",
+    "driver_version": "580.126.20",
+    "max_memory_clock_mhz": "14001",
+    "max_sm_clock_mhz": "3090",
+    "memory_total_mib": "32607",
+    "name": "NVIDIA GeForce RTX 5090",
+    "power_limit_w": "575.00"
+  }
+}

@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872950bf4bb 100644
+index a0673f7..61c765f 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,6 @@
@@ -332,7 +332,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +487,108 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +487,117 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -340,6 +340,15 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
 +def _make_cuda_qk_norm_rope_kernel(profile, use_rope):
 +    """CUDA Q/K RMSNorm with separate RoPE and NoPE kernel bodies."""
 +    if use_rope:
++        # NVRTC on Blackwell otherwise contracts the sine product, while MLX's
++        # stock RoPE contracts the cosine product.  Pin that one rounding
++        # boundary explicitly so the fused kernel stays array-exact.
++        second_half = (
++            "__fmaf_rn(value, rope_cos[p], "
++            "__fmul_rn(paired, rope_sin[p]))"
++            if profile.name in ("sm100", "sm120")
++            else "paired * rope_sin[p] + value * rope_cos[p]"
++        )
 +        transform = """
 +        __shared__ float rope_sin[ROPE_DIM / 2];
 +        __shared__ float rope_cos[ROPE_DIM / 2];
@@ -369,11 +378,11 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
 +                float paired = static_cast<float>(paired_normalized);
 +                value = j < HALF
 +                    ? value * rope_cos[p] - paired * rope_sin[p]
-+                    : paired * rope_sin[p] + value * rope_cos[p];
++                    : MAPLE_SECOND_HALF;
 +            }
 +            oh[j] = static_cast<T_>(value);
 +        }
-+        """
++        """.replace("MAPLE_SECOND_HALF", second_half)
 +    else:
 +        transform = """
 +        #pragma unroll
@@ -442,7 +451,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
  
  
  class MapleAttention(nn.Module):
-@@ -293,13 +618,19 @@ class MapleAttention(nn.Module):
+@@ -293,13 +627,19 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -462,7 +471,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
          if self.use_rope:
              rope_dim = int(self.head_dim * args.partial_rotary_factor)
              self.rope = initialize_rope(
-@@ -312,6 +643,8 @@ class MapleAttention(nn.Module):
+@@ -312,6 +652,8 @@ class MapleAttention(nn.Module):
  
      def _qk_fused(self, qk, offset):
          """Both norms and both rope applications in one dispatch."""
@@ -471,7 +480,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
          if self._qk_w is None:
              n_q = self.num_attention_heads
              n_kv = self.num_key_value_heads
-@@ -336,19 +669,26 @@ class MapleAttention(nn.Module):
+@@ -336,19 +678,26 @@ class MapleAttention(nn.Module):
  
          # cache.offset is a Python int for a plain cache but an mx.array for
          # the batched caches; coerce so the pos/eps pair is always uniform.
@@ -505,7 +514,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -378,7 +718,7 @@ class MapleAttention(nn.Module):
+@@ -378,7 +727,7 @@ class MapleAttention(nn.Module):
              qk = qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, self.head_dim)
              if self._fused_qk is None:
                  # A nonzero position, so a broken rotation cannot pass.
@@ -514,7 +523,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
                      lambda: (self._qk_fused(qk, 7),),
                      lambda: (self._qk_reference(qk, 7),),
                  )
-@@ -618,7 +958,312 @@ def _make_fused_router_kernel():
+@@ -618,7 +967,312 @@ def _make_fused_router_kernel():
      )
  
  
@@ -828,7 +837,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1278,83 @@ class MapleGate(nn.Module):
+@@ -633,23 +1287,83 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -926,7 +935,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -670,13 +1375,27 @@ class MapleGate(nn.Module):
+@@ -670,13 +1384,27 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -957,7 +966,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1414,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,6 +1423,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -1101,7 +1110,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
  class MapleSwitchGLU(nn.Module):
      """SwitchGLU with the up and gate projections fused into one gather
      matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +1561,78 @@ class MapleSwitchGLU(nn.Module):
+@@ -705,8 +1570,78 @@ class MapleSwitchGLU(nn.Module):
              input_dims, 2 * hidden_dims, num_experts, bias=bias
          )
          self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
@@ -1180,7 +1189,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,17 +1641,26 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,17 +1650,26 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -1210,7 +1219,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
          super().__init__()
-@@ -836,7 +1771,13 @@ class MapleModel(nn.Module):
+@@ -836,7 +1780,13 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
@@ -1225,7 +1234,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
                  self._fused_add_norm = _add_rms_norm_ok(
                      h.shape[-1], h.dtype, self.norm.weight, self.norm.eps
                  )
-@@ -1021,6 +1962,32 @@ class Model(nn.Module):
+@@ -1021,6 +1971,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -1258,7 +1267,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +2006,8 @@ class Model(nn.Module):
+@@ -1039,8 +2015,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
@@ -1270,7 +1279,7 @@ index a0673f77c83929c66df71f0dbd0611e0c46482ab..5792b201ae74bd4db917b78f73e5f872
                  for k in ["weight", "scales", "biases", "bias"]:
                      if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
 diff --git a/mlx_lm/models/switch_layers.py b/mlx_lm/models/switch_layers.py
-index 1fe5d917e6b194b1681bbb1c69589ad3dc759d65..d022e2addc874a291f3c7b1c8a2f4ea80fb4a116 100644
+index 1fe5d91..d022e2a 100644
 --- a/mlx_lm/models/switch_layers.py
 +++ b/mlx_lm/models/switch_layers.py
 @@ -1,7 +1,6 @@
@@ -1309,8 +1318,147 @@ index 1fe5d917e6b194b1681bbb1c69589ad3dc759d65..d022e2addc874a291f3c7b1c8a2f4ea8
              rhs_indices=indices,
              sorted_indices=sorted_indices,
          )
+diff --git a/tests/data/sm100_qk_rope_boundary.npz b/tests/data/sm100_qk_rope_boundary.npz
+new file mode 100644
+index 0000000000000000000000000000000000000000..40b4c4a16237a2fff2ace188d86cdb55aa0e7fa5
+GIT binary patch
+literal 6917
+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
+ODSnT!-;wJdSNSh=?!{yP
+
+literal 0
+HcmV?d00001
+
 diff --git a/tests/test_maple_kernels.py b/tests/test_maple_kernels.py
-index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae75251552f 100644
+index 6e232ba..8de83d7 100644
 --- a/tests/test_maple_kernels.py
 +++ b/tests/test_maple_kernels.py
 @@ -9,7 +9,14 @@ is off on this machine", not "the model is broken". A precision failure does
@@ -1328,7 +1476,7 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
  
  import mlx.core as mx
  import numpy as np
-@@ -32,8 +39,167 @@ def _args(**kw):
+@@ -32,8 +39,186 @@ def _args(**kw):
  
  
  class TestMapleKernels(unittest.TestCase):
@@ -1437,6 +1585,25 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
 +                self.assertEqual(profile.router_reference_gemv, reference_gemv)
 +        self.assertIsNone(maple._cuda_profile_for_capability((8, 0)))
 +
++    def test_blackwell_qk_rope_pins_stock_second_half_rounding(self):
++        """sm100 and sm120 pin the FFMA association used by stock MLX RoPE."""
++        sources = {}
++        with mock.patch.object(mx.fast, "cuda_kernel", return_value=object()) as make:
++            for name in ("sm90", "sm100", "sm120"):
++                maple._make_cuda_qk_norm_rope_kernel(maple._CudaProfile(name), True)
++                sources[name] = make.call_args.kwargs["source"]
++
++        pinned = (
++            "__fmaf_rn(value, rope_cos[p], "
++            "__fmul_rn(paired, rope_sin[p]))"
++        )
++        for name in ("sm100", "sm120"):
++            self.assertIn(pinned, sources[name])
++        self.assertNotIn(pinned, sources["sm90"])
++        self.assertIn(
++            "paired * rope_sin[p] + value * rope_cos[p]", sources["sm90"]
++        )
++
 +    def test_cuda_router_launch_covers_every_expert(self):
 +        """Every tuned launch must produce exactly one row for every expert."""
 +        for threads in (64, 128, 256, 512):
@@ -1497,7 +1664,7 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
          args = _args()
          gate = maple.MapleGate(args)
          gate.weight = (
-@@ -41,9 +207,44 @@ class TestMapleKernels(unittest.TestCase):
+@@ -41,9 +226,44 @@ class TestMapleKernels(unittest.TestCase):
          ).astype(mx.bfloat16)
          mx.eval(gate.weight)
          x0 = (mx.random.normal((1, 1, args.hidden_size)) * 0.5).astype(mx.bfloat16)
@@ -1543,7 +1710,7 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
          set_matches = 0
          trials = 32
          for i in range(trials):
-@@ -57,6 +258,16 @@ class TestMapleKernels(unittest.TestCase):
+@@ -57,6 +277,16 @@ class TestMapleKernels(unittest.TestCase):
              )
              mx.eval(fi, fs, ri, rs)
  
@@ -1560,7 +1727,7 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
              fused = {int(a): float(b) for a, b in zip(fi.reshape(-1), fs.reshape(-1))}
              ref = {int(a): float(b) for a, b in zip(ri.reshape(-1), rs.reshape(-1))}
              if set(fused) == set(ref):
-@@ -69,6 +280,114 @@ class TestMapleKernels(unittest.TestCase):
+@@ -69,6 +299,114 @@ class TestMapleKernels(unittest.TestCase):
          # expert; that is legitimate, but it must be rare.
          self.assertGreater(set_matches, trials * 0.75)
  
@@ -1675,7 +1842,7 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
      def test_router_logits_are_float32(self):
          """Routing must not round the expert logits to bf16.
  
-@@ -123,11 +442,17 @@ class TestMapleKernels(unittest.TestCase):
+@@ -123,11 +461,17 @@ class TestMapleKernels(unittest.TestCase):
          w = (mx.random.normal((dim,)) * 0.1 + 1.0).astype(mx.bfloat16)
          x = (mx.random.normal((1, 1, dim)) * 0.5).astype(mx.bfloat16)
          r = (mx.random.normal((1, 1, dim)) * 0.5).astype(mx.bfloat16)
@@ -1694,7 +1861,7 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
          # The residual stream must be rounded exactly once, like a bf16 add.
          self.assertTrue(mx.array_equal(h, x + r), "residual add is not bit-exact")
          ref = mx.fast.rms_norm(
-@@ -139,49 +464,86 @@ class TestMapleKernels(unittest.TestCase):
+@@ -139,49 +483,114 @@ class TestMapleKernels(unittest.TestCase):
          self.assertTrue(
              np.allclose(got, want, rtol=8e-3), f"max |d| {np.abs(got - want).max()}"
          )
@@ -1720,6 +1887,34 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
 +        cached = set(maple._add_rms_kernel_cache)
 +        self.assertFalse(maple._add_rms_norm_ok(dim, mx.bfloat16, w, eps))
 +        self.assertEqual(set(maple._add_rms_kernel_cache), cached)
++
++    def test_blackwell_qk_frozen_rounding_boundary_matches_reference(self):
++        """Frozen upper-half RoPE midpoint must stay exact on Blackwell."""
++        profile = maple._cuda_profile()
++        if (
++            maple._kernel_backend() != "cuda"
++            or profile is None
++            or profile.name not in ("sm100", "sm120")
++        ):
++            self.skipTest("frozen Blackwell boundary requires sm100 or sm120")
++        fixture_path = Path(__file__).parent / "data" / "sm100_qk_rope_boundary.npz"
++        with np.load(fixture_path, allow_pickle=False) as fixture:
++            qk_values = fixture["qk_bfloat16_as_float32"]
++            q_weight = fixture["q_norm_weight_float32"]
++            k_weight = fixture["k_norm_weight_float32"]
++        args = _args(num_hidden_layers=1, layer_types=["sliding_attention"])
++        attn = maple.MapleAttention(args, 0)
++        attn.q_norm.weight = mx.array(q_weight)
++        attn.k_norm.weight = mx.array(k_weight)
++        qk = mx.array(qk_values).astype(mx.bfloat16)
++        got = attn._qk_fused(qk, 613)
++        want = attn._qk_reference(qk, 613)
++        mx.eval(got, want)
++        self.assertEqual(attn._fused_qk_backend, "cuda")
++        self.assertTrue(
++            mx.array_equal(got, want),
++            f"{profile.name} upper-half RoPE contraction changed at head=8, dim=45",
++        )
  
      def test_qk_norm_rope_matches_reference(self):
          """Fused per-head norm + partial RoPE vs q_norm/k_norm + mx.fast.rope,
@@ -1812,7 +2007,7 @@ index 6e232ba85f9ab089a8730e028c09a1d303f7dfbe..3e3403b0b99877e99d3b7aa3d5fb0ae7
                  lambda: (attn._qk_reference(qk, 7),),
              )
          )
-@@ -215,7 +577,8 @@ class TestMapleKernels(unittest.TestCase):
+@@ -215,7 +624,8 @@ class TestMapleKernels(unittest.TestCase):
          fast = decode(None)
          if not model.model._fused_add_norm:
              self.skipTest("fused decode disabled on this build")

@@ -2,31 +2,35 @@
 
 ## Frozen inputs
 
-- Checkpoint: `deepgrove/maple-preview-2bit-mlx`, revision
-  `361db5da5e74ff6fcdd852d478e1f266ce11013a`.
-- DeepGrove base: `eba96c16158f032821b0bf374ea1421cfddef0a9`.
-- Laboratory implementation: `b3d03fb19b522f307d0df7ba2ea347711a2ee337`.
-- Published `src/maple.py` SHA-256:
-  `7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae`.
-- MLX and MLX CUDA: 0.32.0; Python 3.12.3.
-- Current strict hardware evidence: RTX 3090, compute capability `sm86`.
+Fresh `sm89`–`sm120` campaign inputs:
 
-The setup pinned the checkpoint revision above, but the original run records did
-not hash every weight/config/tokenizer artifact. Published JSONL marks this as
-an asserted revision rather than a cryptographic binding. Driver, CUDA runtime,
-cuDNN version, power/clock state, and host co-tenant scheduling were also not
-frozen, so absolute-rate reproduction should expect system variance.
+- checkpoint: `deepgrove/maple-preview-2bit-mlx` revision
+  `361db5da5e74ff6fcdd852d478e1f266ce11013a`, with exact recursive model
+  manifest verified before every run;
+- DeepGrove base: `eba96c16158f032821b0bf374ea1421cfddef0a9`;
+- Python 3.12.3, `mlx==0.32.0`, `mlx-cuda-12==0.32.0`;
+- CUDA runtime 12.9.79, NVRTC 12.9.86; driver recorded per SKU;
+- exact LM head, `model_file=None`, `use_flash_head=False`, and
+  `trust_remote_code=False`;
+- actual loaded module/class source and SHA-256 recorded in every relevant lane.
 
-Benchmarks load with
-`model_config={"model_file": None, "use_flash_head": False}` and record the
-actual module/file/source hash. The common-slice harness additionally asserts
-that the loaded class file is the imported worktree module. Expected hashes are
-verified from the retained artifacts rather than by every CLI.
+Executed full-file Maple hashes were:
 
-The main performance/correctness campaign used source `6c9fc558…`. The final
-published source differs only by defaulting cached LHS and uint32 experimental
-router indices off; every benchmark lane explicitly set both values. The final
-CUDA focused suite was rerun on `7785da2…` and passed 20 tests with 2 skips.
+| Profile | Executed source SHA-256 |
+| --- | --- |
+| `sm89`, `sm90` | `7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae` |
+| `sm100` | `b34cd9777cf5a8775ed4e814fe7e14c987a9021627224168595c92ddf21edae4` |
+| `sm120` | `28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8` |
+
+The release source is `28ceabac…`. A local capture test hashes the exact CUDA
+source passed to `mx.fast.cuda_kernel`; release RoPE/NoPE generated source
+matches the validated profile source for `sm89`, `sm90`, and `sm100`. This is
+an architecture code-generation bridge, not a claim that the whole release
+file was freshly rerun on those three devices. The `sm120` run directly used
+the release file.
+
+Historical `sm86` evidence used an earlier campaign and has its own provenance
+under `../provenance/`; it is not pooled with the fresh matrix.
 
 ## Deterministic process environment
 
@@ -34,88 +38,92 @@ Set before the first CUDA operation:
 
 ```sh
 MLX_CUDA_USE_CUDNN_SDPA=0
+MLX_ENABLE_TF32=0
 MLX_USE_CUDA_GRAPHS=1
 MLX_CUDA_GRAPH_CACHE_SIZE=400
 MLX_MAX_OPS_PER_BUFFER=100
 MLX_MAX_MB_PER_BUFFER=100
+TOKENIZERS_PARALLELISM=false
 ```
 
-Repeated portable long generations could diverge while cuDNN SDPA was
-eligible, even with graphs disabled. The cuDNN setting is therefore a
-correctness-oracle requirement. It is not credited as a Maple speedup.
+Portable long generation could diverge while cuDNN SDPA was eligible. Its
+disablement is an oracle-stability requirement, not credited acceleration.
+TF32 is disabled to preserve the tested arithmetic contract.
 
 ## Correctness pass
 
-Correctness is run separately from timing. The gates include:
+Correctness and timing are separate. Every baseline required:
 
-1. shape, dtype, and `mx.array_equal` live probes for each strict candidate;
-2. 1024-token random-prompt reference/strict equality;
-3. the audited fixed 20-case slice at up to 512 and 1024 generated tokens;
-4. token, decoded-text, selected-token-logprob, and top-1 hashes;
-5. active/fallback state recording for every layer and path.
+1. focused array tests, including shape/dtype/value equality with
+   `mx.array_equal` and the frozen Blackwell boundary where applicable;
+2. three multi-seed cases (generation caps 1024, 2048, and 1024);
+3. 144 deterministic stock W2 projection fingerprints
+   (`24 layers × 2 projections × 3`); every tile candidate had to match the
+   corresponding 144 reference arrays before timing;
+4. direct random 1024-token reference/strict equality;
+5. 20 fixed cases at both 512 and 1024 tokens, comparing token IDs, decoded
+   text, selected-token-logprob hash, and top-1 hash;
+6. recorded strict path state, with all 24 Q/K layers active for acceleration.
 
-Selected-token logprob and top-1 hashes do not establish full-logit equality.
-They are deliberately not computed inside throughput trials. The 512-cap slice
-used cache 2000 / 100 ops / 1000 MB; the follow-up 1024-cap slice used the
-recommended cache 400 / 100 ops / 100 MB. JSONL records this per slice.
+Selected-logprob/top-1 equality is stronger than token equality alone but is
+not exhaustive full-logit equality. The fixed slice is pinned to antirez/ds4
+commit `b0309611041655f4e45671cfd9c9886aff161406`; it is a regression harness,
+not a representative quality benchmark.
 
-The 20-case manifest is pinned to antirez/ds4 commit
-`b0309611041655f4e45671cfd9c9886aff161406`, upstream file SHA-256
-`19545bf6…`; the local manifest SHA-256 is `d581a0a8…`. It is a regression
-slice, not a statistically representative quality benchmark. Official grading
-requires a final `Answer:` line; loose extraction is diagnostic only.
+## Fresh-process timing
 
-## Timing pass
+The primary statistical unit is one fresh model process on one physical device
+instance. Twelve position-balanced blocks compare:
 
-### Direct strict profile
+- `R`: portable reference;
+- `Q`: exact fused Q/K only;
+- `QL`: Q/K plus cached decode LHS.
 
-The measured path is warm, single-stream `B=1`, `L=1` BF16 decode. Prefill,
-batched decode, scaled-RoPE policies, JIT/live-probe cost, and cold-cache setup
-are not accelerated-rate claims.
+Each mode warms before timing `B=1`, `L=1`, 128 deterministic prompt tokens and
+512 generated tokens with EOS disabled. JIT/live-probe, cold cache, prefill,
+batched decode, and validation instrumentation are excluded. Displayed tok/s
+are arithmetic means; primary effects are geometric means of within-block
+ratios with two-sided 95% t-intervals on log ratios.
 
-- 128 deterministic pseudo-random prompt token IDs, seed `20260806`.
-- 512 generated tokens, EOS disabled.
-- Six alternating paired reference/strict trials.
-- Strict profile: exact Q/K + cached flat decode LHS; portable router,
-  add/RMS, W2, and exact LM head.
-- Graph profile: 100 ops, 100 MB, cache 400.
-- Reported throughput columns are arithmetic means.
-- The primary effect is the geometric mean of within-pair ratios with a
-  two-sided 95% t-interval on log ratios.
+The direct profile separately uses six alternating pairs. Component factorials
+cross `R/Q/L/QL` within a loaded model for attribution; they are supporting,
+not the primary fresh-process claim.
 
-These small-n intervals and p-values are exploratory. They follow substantial
-kernel/profile tuning, use no multiple-testing correction, and were collected
-with a host co-tenant active; they are paired evidence for this run, not a
-population-level hardware guarantee.
+## Graph and W2 screens
 
-### Component factorial
+Graph screening uses five blocks over cache/ops/MB configurations. It is
+screening-only and device-instance-specific. Runtime W2 tile alternation sets
+CUDA graphs off and uses distinct tile-bearing JIT names to prevent silent
+cubin reuse. A tile can advance only after projection exactness; final
+acceptance requires 144 comparisons, direct/multi-seed/common-slice equality,
+12 fresh paired processes, and the performance gate.
 
-Eight position-balanced blocks run `R`, `Q`, `L`, and `QL` in one loaded model:
-portable reference, exact Q/K, cached LHS, and both. Main effects and the
-multiplicative interaction are computed within block on log throughput. This
-separates Q/K's supported contribution from cached LHS's noisy marginal effect.
-Strict timing follows equivalence and warmup, so it excludes JIT/live-probe cost
-and cold cached-LHS construction; it is a warm steady-state decode result.
+The W2 wheel is a separately built experimental MLX backend. Build provenance
+pins the MLX commit, image digest, cuDNN 9.25.0.15-1, Python headers, build
+patch, wheel, and installed library hashes. It is not the stock QuickStart
+backend.
 
-### CUDA graph factorial
+## Blackwell fixed/original comparison
 
-Four A-D blocks cross ops `{20,100}` and MB `{100,1000}` at graph cache 2000.
-Four additional B/D blocks test 100 MB vs 1000 MB at cache 400. A separate
-four-pair comparison tests cache 400 vs 2000 at 100 ops / 1000 MB. Result
-records encode the cache
-used by each block rather than implying one global setting.
+B200 and RTX 5090 use a frozen FP32-weight boundary artifact derived from seed
+6, offset 613, head 8, dimension 45. Original and fixed variants run in 16
+balanced fresh-process blocks with distinct source/kernel identities. The
+acceptance rule requires exact fixed output and no statistically significant
+slowdown; confidence intervals are disclosed and are not interpreted as proof
+of zero cost.
+
+The full diagnostic artifact SHA-256 is `ecb4ff1…`. The checked-in regression
+fixture is an input-only compressed subset/repack with SHA-256 `837638a…`; the
+two hashes intentionally identify different files.
 
 ## Published and excluded data
 
-Published JSONL removes GPU UUIDs, PCI bus IDs, local paths, model paths, raw
-consoles, generated answer text, and profiler databases. Case indices, aggregate grades, prompt hashes, token/text hashes, per-trial
-throughput, and paired statistics are retained for auditability.
+Only allowlisted records are published. Sanitization removes GPU UUIDs, PCI
+IDs, IPs/ports, filesystem/model paths, generated answer text, raw service logs,
+and profiler databases. Each per-SKU bundle has its own `SHA256SUMS`; the root
+results manifest covers every published result file except itself.
 
-Initial multi-architecture results are preserved under
-`results/legacy-initial-port/` but are superseded as strict claims. Their
-short oracle and tolerant probes admitted paths now classified as semantic.
-Fresh `sm89`, `sm90`, `sm100`, and `sm120` validation is required.
-
-FlashHead, KV quantization, approximate router/add-RMS, ternary projection,
-failed/preempted cloud attempts, and cross-host performance rankings are
-excluded from the current strict table.
+Cloud failures, raw logs, provider identifiers, approximate paths, and dataset
+content are excluded. Intervals are finite single-instance evidence after
+substantial tuning, with no multiple-testing correction; they are not
+population-level hardware guarantees or cross-host performance rankings.

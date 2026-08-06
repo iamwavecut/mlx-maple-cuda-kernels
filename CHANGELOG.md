@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 — 2026-08-06
+
+- Completed fresh fail-closed strict campaigns on RTX 4090 (`sm89`), H100
+  80GB HBM3 (`sm90`), B200 (`sm100`), and RTX 5090 (`sm120`).
+- Added the independently gated `sm100`/`sm120` stock-RoPE rounding pin and a
+  frozen BF16-midpoint regression fixture.
+- Published 12-fresh-process Q/K and cached-LHS results, per-SKU sanitized
+  bundles, graph screens, W2 decisions, source mapping, and recursive checksums.
+- Accepted the experimental `16x32x128` W2 tile only on RTX 5090; demoted the
+  RTX 4090/B200 follow-ups and retained the H100 stock default.
+- Updated the NVIDIA QuickStart to disable TF32 and remote code and to scope all
+  claims to exact SKU/driver/MLX/CUDA/checkpoint/source provenance.
+
 ## 0.2.0 — 2026-08-06
 
 - Replaced tolerant strict probes with shape/dtype/`mx.array_equal` gates.

@@ -1,137 +1,103 @@
 # MLX Maple CUDA kernels
 
 Fail-closed CUDA research kernels for
-[DeepGrove's Maple preview](https://github.com/deepgrove-ai/mlx-lm-deepgrove),
-with a strict exact-output lane validated on `sm86`.
+[DeepGrove's Maple preview](https://github.com/deepgrove-ai/mlx-lm-deepgrove).
+The strict lane preserves the stock token stream and array boundaries; known
+approximate router, add/RMS, ternary, FlashHead, and KV-quantized paths remain
+off by default.
 
-The source contains CUDA implementations and experimental prototypes for
-residual add + RMSNorm, Q/K norm + RoPE/NoPE, router selection, and ternary
-expert projections. Custom arithmetic paths need array-exact live probes to
-enter the strict lane; non-arithmetic cleanup must preserve exact indices and
-ordering. Known approximate paths are opt-in and disabled by default.
+> **Status:** independent community research, not an MLX or DeepGrove release
+> and not a claim of official model-author support. Evidence is scoped to the
+> exact GPUs, drivers, MLX 0.32.0, CUDA 12.9, checkpoint revision, and source
+> hashes recorded below.
 
-> **Status:** experimental research code, not an upstream MLX or DeepGrove
-> release. The current strict evidence is for RTX 3090 / `sm86`; `sm89`,
-> `sm90`, `sm100`, and `sm120` must be revalidated before release claims are
-> extended to them.
+## Strict multi-architecture result
 
-## Current `sm86` results
+All four fresh NVIDIA targets passed the same deterministic strict methodology
+under architecture-bound sealed campaign revisions.
+Values are warm `B=1`, `L=1`, 128-token prompt / 512-token decode throughput.
+Ratios are paired geometric means over 12 fresh model processes on one device
+instance; displayed tok/s values are arithmetic means.
 
-MLX/MLX-CUDA 0.32.0, 128 prompt tokens, 512 generated tokens, deterministic
-SDPA, CUDA graph cache 400, 100 ops/buffer, 100 MB/buffer. This is warm,
-single-stream `B=1`, `L=1`, BF16 decode; JIT/live-probe and cold-cache costs
-are excluded, while prefill, batched decode, and scaled-RoPE policies use
-portable paths. Ratios are paired geometric means; displayed throughput values
-are arithmetic means.
+| GPU | CC | Portable | Exact Q/K default | Paired gain (95% CI) | Q/K + cached-LHS opt-in |
+| --- | --- | ---: | ---: | ---: | ---: |
+| RTX 4090 | `sm89` | 182.36 | **209.84** | **+15.31%** (+11.29%–+19.49%) | 214.66, **+18.01%** |
+| H100 80GB HBM3 | `sm90` | 202.62 | **233.67** | **+15.24%** (+12.86%–+17.66%) | 246.34, **+21.54%** |
+| B200 | `sm100` | 241.51 | **280.70** | **+16.28%** (+14.23%–+18.37%) | 297.47, **+23.37%** |
+| RTX 5090 | `sm120` | 398.49 | **429.72** | **+7.84%** (+6.88%–+8.81%) | 438.01, **+9.92%** |
 
-| Strict configuration | Portable MLX | Strict | Paired gain | 95% CI | Pairs |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Conservative default: exact Q/K norm + RoPE | 179.39 tok/s | **195.27 tok/s** | **+8.51%** | +0.90%–+16.70% | 8 |
-| Measured profile: Q/K + cached decode LHS | 177.56 tok/s | **209.58 tok/s** | **+18.28%** | +5.18%–+33.00% | 6 |
+The cached-LHS mode is exact in these runs but remains opt-in: its cache is
+process-global and keyed only by top-k. The conservative source default is the
+exact-probed fused Q/K path alone. Historical `sm86` results remain in
+[`results/summary.csv`](results/summary.csv).
 
-These small-n paired intervals are exploratory after extensive tuning, with a
-host co-tenant active and no multiple-testing correction; they are not a
-population-level hardware guarantee.
+### Exactness gate
 
-The old `+38.3%` strict claim is superseded: its oracle was too short, used
-tolerant probes, and admitted router/add-RMS kernels that later diverged under
-a deterministic long-decode oracle. Its 189.30 tok/s absolute observation is
-retained historically, but is not directly comparable to 209.58 tok/s because
-the generation length, baseline, graph configuration, oracle, and active paths
-all changed.
+For every target, the release gate required:
 
-Cached LHS is array-exact, but its isolated factorial main effect was only
-+2.10% with a CI crossing zero (`p=0.345`), so it remains off by default. The
-Q/K main effect was +10.00% (`p=0.044`). These are warm steady-state
-decode measurements after live probes/warmup; JIT and cold cache construction
-are excluded. See
-[`results/cuda/sm86-component-factorial.jsonl`](results/cuda/sm86-component-factorial.jsonl).
+- shape, dtype, and value equality through `mx.array_equal` for live fused
+  outputs, with all 24 Q/K layers active and no silent fallback;
+- 144 deterministic stock W2 projection fingerprints; any tile candidate had
+  to match all 144 arrays before timing;
+- exact direct/random 1024-token output and a three-case multi-seed matrix;
+- 20/20 fixed regression cases at both 512 and 1024 generated tokens, including
+  token IDs, decoded text, selected-token logprob hash, and top-1 hash;
+- timing in separate fresh processes without correctness instrumentation.
 
-### Graph settings
+The 20-case slice is a regression harness, not a quality leaderboard. Disabling
+cuDNN SDPA is required to make the stock oracle bit-stable and is not credited
+as a Maple speedup.
 
-The supported tuning result is:
+## Blackwell RoPE rounding fix
 
-```sh
-MLX_CUDA_USE_CUDNN_SDPA=0
-MLX_USE_CUDA_GRAPHS=1
-MLX_CUDA_GRAPH_CACHE_SIZE=400
-MLX_MAX_OPS_PER_BUFFER=100
-MLX_MAX_MB_PER_BUFFER=100
+On both B200 and RTX 5090, the original fused upper-half RoPE expression could
+contract the opposite product from stock MLX. One FP32 rounding bit could cross
+a BF16 midpoint. The `sm100` and `sm120` profiles now pin stock association:
+
+```cuda
+__fmaf_rn(value, rope_cos[p], __fmul_rn(paired, rope_sin[p]))
 ```
 
-Set these before the first CUDA use. Raising ops/buffer from 20 to 100 had a
-+11.85% factorial main effect in the four A-D blocks run at cache 2000. A
-separate cache-size factorial at 100 ops / 1000 MB found no supported benefit
-from 2000 over 400, and focused 100 MB vs 1000 MB pairs at cache 400 found no
-supported MB benefit.
-The recommended 100/100/cache-400 profile is the one used for the 209.58 tok/s
-result.
+The fix was accepted independently on each SKU. B200 passed 2,048 isolation
+comparisons with zero fixed mismatches (32 old-control mismatches); RTX 5090
+passed an expanded 4,608 comparisons with zero fixed mismatches (63 old-control
+mismatching elements). Balanced 16-process fixed/original tests found no
+statistically significant slowdown on either device. The frozen boundary
+fixture is [`tests/data/sm100_qk_rope_boundary.npz`](tests/data/sm100_qk_rope_boundary.npz).
+Re-run it after any MLX or CUDA upgrade.
 
-## Exactness evidence
+## Graph and W2 tuning
 
-With `MLX_CUDA_USE_CUDNN_SDPA=0` and the exact LM head:
+The reproducible campaign graph profile is cache 400, 100 ops/buffer, and
+100 MB/buffer; it is not asserted per-SKU optimal. In the five-block graph
+screen, that profile over the 20-op control was supported on RTX
+4090 (+25.07%, `p=0.0148`) and RTX 5090 (+16.31%, `p=1.20e-5`). The B200
+factorial ops effect was +10.90% (`p=6.82e-5`); H100 graph effects were
+inconclusive on its single tested instance.
 
-- the Q/K-only default matched the portable 512-token hash in every balanced
-  component-factorial block, in addition to its per-layer array-exact probes;
-- the Q/K + cached-LHS speed profile matched a random-prompt portable gate for
-  1024/1024 token IDs;
-- that same speed profile matched a fixed audited 20-case slice for every
-  emitted token, decoded text, selected-token logprob hash, and top-1 hash with
-  generation caps of 512 and 1024 tokens;
-- the final CUDA focused suite passed: **20 passed, 2 skipped**;
-- unsupported shapes, dtypes, devices, or numerical changes fail closed to
-  portable MLX.
+The experimental MLX `qmm_naive` tile screen is separate from this package.
+`16x32x128` passed the complete RTX 5090 follow-up and improved fresh-process
+throughput by +1.615% (95% CI +1.322%–+1.909%, 12/12 wins,
+`p=9.63e-8`). It is an accepted tuning result but is **not bundled as the stock
+MLX backend**. RTX 4090 and B200 candidates were array-exact but failed their
+performance gates; H100 retained its stock tile.
 
-This does not claim equality of every full-logit tensor or exhaustive quality
-coverage. The 20-case slice is a regression harness; most cases hit the token
-limit, so its 3/20 and 4/20 scores are not representative quality estimates.
-
-Repeated portable long decode was itself unstable while MLX could select the
-cuDNN SDPA path. Disabling cuDNN SDPA made the oracle deterministic, so that
-environment setting is part of the current strict contract rather than a Maple
-speedup.
-
-## Default and experimental paths
+## Strict defaults
 
 | Path | Default | Strict status |
 | --- | --- | --- |
-| Q/K norm + partial RoPE/NoPE | auto-probed | array-exact on validated `sm86` |
-| Cached flat decode LHS | off | array-exact, opt-in; marginal speed not established |
-| Router GEMV/softmax/top-8 | off | normalized scores are not array-exact; semantic only |
-| Residual add + RMSNorm | off | diverged at generated token 217; semantic only |
-| Ternary up/gate GEMV | off | faster projection, but BF16 values differed; experimental |
+| Q/K norm + partial RoPE/NoPE | auto-probed | array-exact on the listed SKUs/toolchains |
+| Cached flat decode LHS | off | exact in campaign; lifecycle-limited opt-in |
+| Router GEMV/softmax/top-8 | off | normalized scores not array-exact |
+| Residual add + RMSNorm | off | changed deterministic long decode |
+| Ternary up/gate GEMV | off | projection values not array-exact |
 | FlashHead / KV quantization | off | approximate; excluded |
 
-## Repository contents
+Unsupported shapes, policies, devices, compile failures, or failed live probes
+fall back to portable MLX. `False` in the reported Q/K path state means safe
+fallback, not accelerated success.
 
-- [`src/maple.py`](src/maple.py) and [`src/switch_layers.py`](src/switch_layers.py):
-  readable snapshots of the patched implementation.
-- [`patches/mlx-lm-deepgrove-maple-cuda.patch`](patches/mlx-lm-deepgrove-maple-cuda.patch):
-  patch against DeepGrove commit `eba96c16158f032821b0bf374ea1421cfddef0a9`.
-- [`tests/test_maple_kernels.py`](tests/test_maple_kernels.py): exact probes,
-  fallback tests, architecture profiles, dependency/race checks, and defaults.
-- [`benchmarks/`](benchmarks): correctness, common-slice, factorial, tuning,
-  router, and ternary harnesses, plus a pinned fixed-slice input generator.
-- [`examples/nvidia_generate.py`](examples/nvidia_generate.py): canonical
-  exact-head NVIDIA inference entry point with source and path-state checks.
-- [`results/`](results): sanitized trials, paired statistics, and superseded
-  initial-port results retained as historical evidence.
-
-The frozen laboratory implementation is commit
-`b3d03fb19b522f307d0df7ba2ea347711a2ee337`; published `src/maple.py` has
-SHA-256 `7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae`.
-
-## NVIDIA QuickStart (canonical strict inference)
-
-This path uses the patched package implementation, the exact LM head, no KV
-quantization, and only fail-closed strict-auto kernels. It is the recommended
-starting point for NVIDIA inference. Current exactness and performance evidence
-is limited to `sm86`; other CUDA architectures may fall back safely but need
-fresh validation before making strict/performance claims. Prerequisites are a
-host supported by an MLX CUDA wheel, an NVIDIA GPU with enough memory for the
-checkpoint, Git, and [uv](https://docs.astral.sh/uv/).
-
-### 1. Pin, patch, and install
+## NVIDIA QuickStart
 
 ```bash
 git clone https://github.com/iamwavecut/mlx-maple-cuda-kernels.git
@@ -143,25 +109,14 @@ git apply ../mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.patch
 
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install -e '.[cuda12]' rich huggingface_hub
+uv pip install -e '.[cuda12]' 'mlx==0.32.0' 'mlx-cuda-12==0.32.0' rich huggingface_hub
 
 hf download deepgrove/maple-preview-2bit-mlx \
   --revision 361db5da5e74ff6fcdd852d478e1f266ce11013a \
   --local-dir ./maple-preview-2bit-mlx
-```
 
-Use `.[cuda13]` instead of `.[cuda12]` only when that is the appropriate MLX
-wheel for the host. The published campaign used MLX/MLX-CUDA 0.32.0, but did not
-record enough runtime/driver telemetry to extend its validation claim across
-CUDA wheel variants.
-
-### 2. Generate
-
-From the patched `mlx-lm-deepgrove` checkout, apply the recommended process
-profile directly to the inference command:
-
-```bash
 MLX_CUDA_USE_CUDNN_SDPA=0 \
+MLX_ENABLE_TF32=0 \
 MLX_USE_CUDA_GRAPHS=1 \
 MLX_CUDA_GRAPH_CACHE_SIZE=400 \
 MLX_MAX_OPS_PER_BUFFER=100 \
@@ -172,50 +127,48 @@ python ../mlx-maple-cuda-kernels/examples/nvidia_generate.py \
   --max-tokens 256
 ```
 
-The example intentionally leaves GPU visibility and selection to the caller.
-The inline variables apply only to this process and are set before its first
-CUDA operation. `MLX_CUDA_USE_CUDNN_SDPA=0` is part of the deterministic
-exactness contract, not a credited kernel speedup.
+Pin `mlx==0.32.0` and the matching `mlx-cuda-12==0.32.0` wheel to reproduce the
+published version claim. The example passes
+`model_config={"model_file": None, "use_flash_head": False}`, uses
+`trust_remote_code=False`, verifies the loaded package source, uses the exact LM
+head, and prints strict path state. Add `--cached-lhs` only for the constrained
+single-model/single-device warm workload described above.
 
-The entry point deliberately passes
-`model_config={"model_file": None, "use_flash_head": False}`, asserts that the
-loaded class comes from the patched package rather than checkpoint-local Python,
-uses greedy exact-head generation, and prints `strict_path_state` after the
-run. On an unsupported policy or failed exact probe, Q/K reports a portable
-fallback rather than silently using a non-exact kernel. A decode-reaching run
-on the validated `sm86` profile should report 24 active Q/K layers; `False` is a
-safe fallback, while `None` means that layer did not reach a single-token probe.
+## Evidence and provenance
 
-For the opt-in warm, single-device `B=1`, `L=1`, top-8 workload only, add
-`--cached-lhs`. Its cache is process-global and keyed only by top-k, so do not
-use that option when switching devices or models in one process. It remains off
-by default because its isolated speed effect was inconclusive.
+- [`src/maple.py`](src/maple.py), SHA-256
+  `28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8`;
+- integration patch against DeepGrove `eba96c1`, SHA-256
+  `eb9c36eb5aec3c93e52ddcc35d735f816a18ab5330460a05b7a641ba0f5174f0`;
+- frozen fixture SHA-256
+  `837638a799bef1b8ea7e7a23c77791964ca88f2bfc698f50910655c5f9bddb64`;
+- [`results/PUBLIC-INDEX.json`](results/PUBLIC-INDEX.json), binding canonical
+  analyses, manifests, source maps, and private raw-manifest commitments;
+- detailed allowlisted artifacts under
+  [`results/cuda/multiarch/`](results/cuda/multiarch/), plus compact strict,
+  graph, W2, and Blackwell summaries in [`results/cuda/`](results/cuda/).
 
-See [`docs/integration.md`](docs/integration.md) for patch verification, tests,
-benchmark reproduction, and the fixed-slice input generator.
+The baseline full-file source hashes were `7785da2a…` for `sm89/sm90`,
+`b34cd977…` for `sm100`, and the release `28ceabac…` for `sm120`. The release
+changes are architecture-isolated; captured generated RoPE/NoPE kernel hashes
+match the validated source for every profile. See
+[`release-source-equivalence.json`](results/cuda/release-source-equivalence.json).
+This is deliberately narrower than claiming whole-module equivalence.
 
 ## Known limitations
 
-- Fresh current-source GPU validation is limited to `sm86`; Metal and
-  `sm89`-`sm120` are pending.
-- Five `tests/test_generate.py` fixture failures remain baseline-compatible on
-  the tested checkout and are not presented as resolved by this patch.
-- Cached LHS has process-global, top-k-only cache identity and is therefore
-  opt-in for single-device steady-state use.
-- The fixed 20-case slice is a regression harness, not a quality estimate.
-
-## Remaining bottleneck
-
-On the RTX 3090 exact-head legacy profile, MLX CUDA's generic affine 2-bit
-expert `qmm_naive` accounted
-for about 34.6% of profiled GPU kernel time. B=8 QMV and several native tile
-variants did not produce a repeatable strict win. The next major strict target
-is an affine W2 top-8 multi-row kernel that preserves FP32 accumulation order,
-BF16 projection boundaries, expert-slot order, and ordered aggregation.
+- Claims apply to the exact representative SKU, driver, MLX/CUDA version, model
+  revision, and source provenance in the artifacts—not every GPU sharing a
+  compute capability.
+- Fresh Mac/Metal validation remains outstanding.
+- Five `tests/test_generate.py` failures remain baseline-compatible on the
+  tested checkout and are not claimed as fixed.
+- Approximate router/add-RMS/ternary paths remain research-only.
+- The accepted RTX 5090 W2 tile requires the separately built experimental MLX
+  backend and is not enabled by this patch alone.
 
 ## License
 
 Project code is MIT. Original Apple and DeepGrove notices are preserved; see
-[`NOTICE.md`](NOTICE.md). The optional generated regression manifest obtains
-third-party question content under its source licenses; see
-[`DATASET-NOTICE.md`](DATASET-NOTICE.md).
+[`NOTICE.md`](NOTICE.md). The optional regression manifest obtains third-party
+question content under its source licenses; see [`DATASET-NOTICE.md`](DATASET-NOTICE.md).

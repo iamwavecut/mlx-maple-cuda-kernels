@@ -13,7 +13,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import mlx.core as mx
-
 from mlx_lm import load, stream_generate
 from mlx_lm.models import maple
 
@@ -48,6 +47,7 @@ def fast_state(model):
         "qk_norm": [layer.self_attn._fused_qk for layer in model.model.layers],
         "router": [layer.mlp.gate._fused for layer in model.model.layers],
         "cached_decode_lhs": maple._use_cached_decode_lhs,
+        "router_indices_uint32": maple._cuda_router_indices_uint32,
         "ternary_up_gate": maple._use_cuda_ternary_up_gate,
         "approximate_router": maple._use_approximate_router,
         "approximate_add_rms": maple._use_approximate_add_rms,
@@ -150,7 +150,7 @@ def main():
     model, tokenizer, config = load(
         str(args.model), return_config=True,
         model_config={"model_file": None, "use_flash_head": False},
-        tokenizer_config={"trust_remote_code": True}, trust_remote_code=True,
+        tokenizer_config={"trust_remote_code": False}, trust_remote_code=False,
     )
     source = Path(inspect.getfile(type(model)))
     module_source = Path(inspect.getfile(maple))

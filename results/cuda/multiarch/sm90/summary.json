@@ -1,0 +1,407 @@
+{
+  "acceleration_eligible": true,
+  "acceleration_state": "active",
+  "campaign_manifest_sha256": "a2a1fe64a76f7a0bfe4829796ac1ed4d8543742da6c0d98a33d5d397940be094",
+  "correctness": {
+    "common": {
+      "1024": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      },
+      "512": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      }
+    },
+    "factor_token_hash_count": 1,
+    "multi_seed": {
+      "all_cases_exact": true,
+      "cases": 3,
+      "type": "summary"
+    },
+    "random_1024": true,
+    "w2_stock_projections": 144
+  },
+  "correctness_pass": true,
+  "device": {
+    "architecture": "sm_90",
+    "compute_capability_major": 9,
+    "compute_capability_minor": 0,
+    "device_name": "NVIDIA H100 80GB HBM3",
+    "total_memory": 85520809984
+  },
+  "failures": [],
+  "hardware": {
+    "compute_capability": "9.0",
+    "driver_version": "580.126.09",
+    "max_memory_clock_mhz": "2619",
+    "max_sm_clock_mhz": "1980",
+    "memory_total_mib": "81559",
+    "name": "NVIDIA H100 80GB HBM3",
+    "power_limit_w": "700.00"
+  },
+  "mlx": "0.32.0",
+  "mlx_cuda": "0.32.0",
+  "model_manifest_sha256": "f376857c2abbeac99140012656f28e8e91dadf9f4f322d287c1408745fd36c3e",
+  "pass": true,
+  "performance": {
+    "direct_qk_lhs": {
+      "ci95": [
+        1.1888814602338222,
+        1.251421783239176
+      ],
+      "geometric_mean": 1.2197508585878534,
+      "p_value": 5.890375419814775e-06,
+      "pairs": 6,
+      "percent": 21.975085858785338,
+      "ratios": [
+        1.181677230688044,
+        1.2670255042699754,
+        1.2110236609756442,
+        1.2396317277133841,
+        1.219113588385595,
+        1.2018578014072565
+      ],
+      "reference_mean_tps": 216.9033026263347,
+      "strict_profile_mean_tps": 264.5668252702178,
+      "wins": 6
+    },
+    "factor_effects": {
+      "lhs_main": {
+        "ci95": [
+          1.047539888924268,
+          1.0860282352628206
+        ],
+        "geometric_mean": 1.0666104710417172,
+        "p_value": 6.406953150153025e-05,
+        "pairs": 8,
+        "percent": 6.6610471041717245,
+        "ratios": [
+          1.0630254829854466,
+          1.0571400477861408,
+          1.0825154615737436,
+          1.040302074822072,
+          1.0815995764548447,
+          1.056500840943527,
+          1.1097608008398507,
+          1.043785436473091
+        ],
+        "wins": 8
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.1820281339756171,
+          1.2875677259523104
+        ],
+        "geometric_mean": 1.2336698409520426,
+        "p_value": 7.924364437599933e-06,
+        "pairs": 8,
+        "percent": 23.36698409520426,
+        "ratios": [
+          1.2223252552504922,
+          1.2166658845065097,
+          1.2846984897615756,
+          1.1812033901675518,
+          1.3772098468343352,
+          1.20298157340397,
+          1.2021082239970577,
+          1.1937266953127992
+        ],
+        "wins": 8
+      },
+      "qk_main": {
+        "ci95": [
+          1.1127586652712873,
+          1.2022235334120088
+        ],
+        "geometric_mean": 1.1566264109025342,
+        "p_value": 4.5913546447357306e-05,
+        "pairs": 8,
+        "percent": 15.662641090253416,
+        "ratios": [
+          1.1498550832644776,
+          1.150903219544513,
+          1.1867714922924997,
+          1.135442693767172,
+          1.273308419136416,
+          1.1386470571378113,
+          1.0832138088562147,
+          1.1436514187689315
+        ],
+        "wins": 8
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.0989620498272947,
+          1.2188038122386569
+        ],
+        "geometric_mean": 1.1573327679777825,
+        "p_value": 0.0002835402298554577,
+        "pairs": 8,
+        "percent": 15.73327679777825,
+        "ratios": [
+          1.1658080824679875,
+          1.1392044457488681,
+          1.2022857724162617,
+          1.1380974808901174,
+          1.2854191783809674,
+          1.1447430460818944,
+          1.0301196723473114,
+          1.1684486303148232
+        ],
+        "wins": 8
+      }
+    },
+    "factor_means_tps": {
+      "L": 221.09839229622833,
+      "Q": 239.81307886707935,
+      "QL": 255.5001900761652,
+      "R": 207.23309658740007
+    },
+    "fresh_process": {
+      "mean_tps": {
+        "Q": 233.66778057943358,
+        "QL": 246.33992275523076,
+        "R": 202.61891970242675
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.1910432512069955,
+          1.2403116175113702
+        ],
+        "geometric_mean": 1.2154278182724592,
+        "p_value": 2.875500998590601e-10,
+        "pairs": 12,
+        "percent": 21.542781827245918,
+        "ratios": [
+          1.1949589082037244,
+          1.2547411911350423,
+          1.1940617191523855,
+          1.2101359153450282,
+          1.1996657396097472,
+          1.2347030470584006,
+          1.1243029823481832,
+          1.2117997399332987,
+          1.2784274821303883,
+          1.2236724097595497,
+          1.239395660117287,
+          1.2260093483785133
+        ],
+        "wins": 12
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.1286411821691653,
+          1.176628738189799
+        ],
+        "geometric_mean": 1.1523852003756159,
+        "p_value": 1.1441908644223117e-08,
+        "pairs": 12,
+        "percent": 15.238520037561587,
+        "ratios": [
+          1.1221384809087886,
+          1.167179569791465,
+          1.1548728405477844,
+          1.1626818666823462,
+          1.20923341976154,
+          1.1468510034061923,
+          1.059889684658161,
+          1.1440263552732675,
+          1.19406980030042,
+          1.1625134611871974,
+          1.1642626897003798,
+          1.1476259124555588
+        ],
+        "wins": 12
+      },
+      "statistical_unit": "fresh model process on one device instance"
+    },
+    "strict_acceleration_claim_eligible": true
+  },
+  "profile": "sm90",
+  "run_manifest_sha256": "4a88251f6533a0996ec6b0c53cac396f60d4404f7b1d2fb00953c17e6def9b74",
+  "schema": 2,
+  "source_sha256": "7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae",
+  "strict_path_state": {
+    "add_rms_norm": false,
+    "approximate_add_rms": false,
+    "approximate_router": false,
+    "cached_decode_lhs": false,
+    "qk_norm": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "router": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "router_indices_uint32": false,
+    "ternary_up_gate": false,
+    "type": "strict_path_state"
+  },
+  "type": "maple_architecture_summary"
+}

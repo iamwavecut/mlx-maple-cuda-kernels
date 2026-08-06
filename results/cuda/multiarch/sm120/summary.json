@@ -1,0 +1,407 @@
+{
+  "acceleration_eligible": true,
+  "acceleration_state": "active",
+  "campaign_manifest_sha256": "6a7ccef5084ff8c90bdfcd3f1fbd9b9c1b29ee7779c0036799f9892cd3510bde",
+  "correctness": {
+    "common": {
+      "1024": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      },
+      "512": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      }
+    },
+    "factor_token_hash_count": 1,
+    "multi_seed": {
+      "all_cases_exact": true,
+      "cases": 3,
+      "type": "summary"
+    },
+    "random_1024": true,
+    "w2_stock_projections": 144
+  },
+  "correctness_pass": true,
+  "device": {
+    "architecture": "sm_120",
+    "compute_capability_major": 12,
+    "compute_capability_minor": 0,
+    "device_name": "NVIDIA GeForce RTX 5090",
+    "total_memory": 34190917632
+  },
+  "failures": [],
+  "hardware": {
+    "compute_capability": "12.0",
+    "driver_version": "580.126.20",
+    "max_memory_clock_mhz": "14001",
+    "max_sm_clock_mhz": "3090",
+    "memory_total_mib": "32607",
+    "name": "NVIDIA GeForce RTX 5090",
+    "power_limit_w": "575.00"
+  },
+  "mlx": "0.32.0",
+  "mlx_cuda": "0.32.0",
+  "model_manifest_sha256": "f376857c2abbeac99140012656f28e8e91dadf9f4f322d287c1408745fd36c3e",
+  "pass": true,
+  "performance": {
+    "direct_qk_lhs": {
+      "ci95": [
+        1.0812026986870305,
+        1.1115202484826454
+      ],
+      "geometric_mean": 1.0962566726386274,
+      "p_value": 1.2572364101643894e-05,
+      "pairs": 6,
+      "percent": 9.625667263862736,
+      "ratios": [
+        1.08587389590791,
+        1.1090328278574577,
+        1.109192860467477,
+        1.075580110029874,
+        1.1080053859504717,
+        1.0903301083951555
+      ],
+      "reference_mean_tps": 397.16266458091013,
+      "strict_profile_mean_tps": 435.4224952022907,
+      "wins": 6
+    },
+    "factor_effects": {
+      "lhs_main": {
+        "ci95": [
+          1.0269975004174765,
+          1.0361198164487253
+        ],
+        "geometric_mean": 1.0315485745353223,
+        "p_value": 7.000804562933992e-07,
+        "pairs": 8,
+        "percent": 3.154857453532234,
+        "ratios": [
+          1.0265552816282457,
+          1.029294298899662,
+          1.0375112096360144,
+          1.0345480671224758,
+          1.0351341044557614,
+          1.0384049564313076,
+          1.026315961038106,
+          1.0247257103884433
+        ],
+        "wins": 8
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.097510275721249,
+          1.1132567024115994
+        ],
+        "geometric_mean": 1.1053554498043978,
+        "p_value": 5.759264510787672e-09,
+        "pairs": 8,
+        "percent": 10.53554498043978,
+        "ratios": [
+          1.0953083693232366,
+          1.090927394412084,
+          1.1174839863701296,
+          1.1091950031674764,
+          1.110609418284581,
+          1.1150720121692281,
+          1.1003227388238106,
+          1.10420531327289
+        ],
+        "wins": 8
+      },
+      "qk_main": {
+        "ci95": [
+          1.0667387225383496,
+          1.0763821494266406
+        ],
+        "geometric_mean": 1.071549587766454,
+        "p_value": 3.1188799275305153e-09,
+        "pairs": 8,
+        "percent": 7.154958776645404,
+        "ratios": [
+          1.066974559407984,
+          1.0598789826955313,
+          1.0770813616193808,
+          1.0721541496400704,
+          1.0729135611549596,
+          1.0738315579707967,
+          1.0721091560447404,
+          1.0775618315015425
+        ],
+        "wins": 8
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.07609606068419,
+          1.0942280861526574
+        ],
+        "geometric_mean": 1.0851242016464637,
+        "p_value": 7.178547056313841e-08,
+        "pairs": 8,
+        "percent": 8.512420164646372,
+        "ratios": [
+          1.0800084585711456,
+          1.0636940377895898,
+          1.1000829107569867,
+          1.0827326489370164,
+          1.091018732268323,
+          1.0928836309456251,
+          1.0873931515427266,
+          1.0835584491272963
+        ],
+        "wins": 8
+      }
+    },
+    "factor_means_tps": {
+      "L": 413.9935323839326,
+      "Q": 430.0435577052836,
+      "QL": 438.06023817566665,
+      "R": 396.32080605357595
+    },
+    "fresh_process": {
+      "mean_tps": {
+        "Q": 429.7164303462076,
+        "QL": 438.00853515678546,
+        "R": 398.4897043013844
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.0889259261504474,
+          1.1096318644531258
+        ],
+        "geometric_mean": 1.0992301422748867,
+        "p_value": 1.817800093228574e-10,
+        "pairs": 12,
+        "percent": 9.923014227488668,
+        "ratios": [
+          1.0857163378374386,
+          1.098322918206751,
+          1.091340447487517,
+          1.0872770037713537,
+          1.107306676224952,
+          1.0988730023415287,
+          1.0938161932440338,
+          1.1476756651199995,
+          1.089142263144774,
+          1.0922724139329771,
+          1.0961432860222646,
+          1.1042180050943338
+        ],
+        "wins": 12
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.068808047038941,
+          1.0881268067750711
+        ],
+        "geometric_mean": 1.0784241685348037,
+        "p_value": 1.194288497771465e-09,
+        "pairs": 12,
+        "percent": 7.842416853480372,
+        "ratios": [
+          1.0643314311072163,
+          1.0820438906171734,
+          1.0674667583027428,
+          1.0750052670284895,
+          1.0826414051959832,
+          1.0829489212372032,
+          1.0678253393945556,
+          1.1211652094019797,
+          1.0654752569973525,
+          1.0708367371726453,
+          1.0859061723474221,
+          1.0766319337571533
+        ],
+        "wins": 12
+      },
+      "statistical_unit": "fresh model process on one device instance"
+    },
+    "strict_acceleration_claim_eligible": true
+  },
+  "profile": "sm120",
+  "run_manifest_sha256": "4bb04008996ac481a9eeaaa8a2372d3fed19c86b7633cb3af02ccde621215e0d",
+  "schema": 2,
+  "source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+  "strict_path_state": {
+    "add_rms_norm": false,
+    "approximate_add_rms": false,
+    "approximate_router": false,
+    "cached_decode_lhs": false,
+    "qk_norm": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "router": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "router_indices_uint32": false,
+    "ternary_up_gate": false,
+    "type": "strict_path_state"
+  },
+  "type": "maple_architecture_summary"
+}

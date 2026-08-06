@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "architecture": "sm90",
+  "public_commit": "5558cbd5f735b8b923a75a6f64c097aa3de937de",
+  "deepgrove_base": "eba96c16158f032821b0bf374ea1421cfddef0a9",
+  "model_repo": "deepgrove/maple-preview-2bit-mlx",
+  "model_revision": "361db5da5e74ff6fcdd852d478e1f266ce11013a",
+  "mlx": "0.32.0",
+  "mlx_cuda_12": "0.32.0",
+  "require_xid_access": "0",
+  "environment": {
+    "MLX_CUDA_USE_CUDNN_SDPA": "0",
+    "MLX_ENABLE_TF32": "0",
+    "MLX_USE_CUDA_GRAPHS": "1",
+    "MLX_CUDA_GRAPH_CACHE_SIZE": "400",
+    "MLX_MAX_OPS_PER_BUFFER": "100",
+    "MLX_MAX_MB_PER_BUFFER": "100",
+    "TOKENIZERS_PARALLELISM": "false"
+  }
+}

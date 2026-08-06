@@ -1,0 +1,3 @@
+7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae  mlx_lm/models/maple.py
+3b51288a9350946c8615d2d2ebe231766bf54c6a676c5bfd492da1bd3b657020  mlx_lm/models/switch_layers.py
+ec2cc30bdfcb8596fc1ce8e12b4ed2e91e1c25ea3a3ea0321ee79a4cfd0d438b  tests/test_maple_kernels.py

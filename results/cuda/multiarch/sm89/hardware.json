@@ -1,0 +1,18 @@
+{
+  "device": {
+    "architecture": "sm_89",
+    "compute_capability_major": 8,
+    "compute_capability_minor": 9,
+    "device_name": "NVIDIA GeForce RTX 4090",
+    "total_memory": 25757220864
+  },
+  "gpu": {
+    "compute_capability": "8.9",
+    "driver_version": "580.159.04",
+    "max_memory_clock_mhz": "10501",
+    "max_sm_clock_mhz": "3105",
+    "memory_total_mib": "24564",
+    "name": "NVIDIA GeForce RTX 4090",
+    "power_limit_w": "450.00"
+  }
+}

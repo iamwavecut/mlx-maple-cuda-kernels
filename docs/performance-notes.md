@@ -1,78 +1,77 @@
 # Performance notes
 
-## Current `sm86` result
+## Fresh strict matrix
 
-The conservative strict default enables exact-probed Q/K norm + RoPE and keeps
-all known approximate kernels disabled. In the eight-block component
-factorial, Q/K alone averaged 195.27 tok/s versus 179.39 tok/s portable; its
-direct paired geometric ratio was +8.51% (95% CI +0.90% to +16.70%). The
-factorial Q/K main effect averaged across LHS states was +10.00% (`p=0.044`).
+The current multi-architecture table uses 12 fresh model processes per mode on
+one physical instance of each SKU. Within every process, warm `B=1`, `L=1`,
+128/512 BF16 decode is measured after correctness and warmup. Arithmetic means
+are displayed; effects are geometric means of paired ratios.
 
-An explicit exact speed profile additionally enabled cached flat decode LHS.
-Across six alternating pairs at graph settings 100 ops / 100 MB / cache 400:
+| GPU | Portable | Q/K default | Gain (95% CI) | Q/K + cached-LHS | Gain (95% CI) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTX 4090 / `sm89` | 182.36 | 209.84 | +15.31% (+11.29%–+19.49%) | 214.66 | +18.01% (+13.68%–+22.50%) |
+| H100 80GB HBM3 / `sm90` | 202.62 | 233.67 | +15.24% (+12.86%–+17.66%) | 246.34 | +21.54% (+19.10%–+24.03%) |
+| B200 / `sm100` | 241.51 | 280.70 | +16.28% (+14.23%–+18.37%) | 297.47 | +23.37% (+19.55%–+27.31%) |
+| RTX 5090 / `sm120` | 398.49 | 429.72 | +7.84% (+6.88%–+8.81%) | 438.01 | +9.92% (+8.89%–+10.96%) |
 
-- portable arithmetic mean: 177.56 tok/s;
-- strict-profile arithmetic mean: 209.58 tok/s;
-- paired geometric ratio: +18.28%;
-- 95% CI: +5.18% to +33.00%;
-- wins: 6/6, log-ratio t-test `p=0.0143`.
+All eight comparisons won 12/12 pairs. Cached LHS remains off by default due to
+its cache lifecycle. Absolute rates are not cross-GPU rankings: hosts, clocks,
+and GPUs differ, and each claim is a single-instance observation.
 
-Cached LHS's isolated main effect was +2.10%, with a CI from -2.73% to +7.17%
-and `p=0.345`; it is therefore opt-in rather than a default optimization.
+The historical RTX 3090 / `sm86` experiment used a different paired design and
+shared host. Its conservative Q/K estimate was +8.51%; Q/K plus cached LHS was
++18.28%. It remains auditable but should not be pooled with the fresh matrix.
 
-## Graph tuning
+## Graph screen
 
-At graph cache 2000, increasing the ops limit from 20 to 100 had a +11.85%
-factorial main effect (95% CI +7.19% to +16.71%, 4/4 wins). The MB main effect
-crossed zero. Focused 1000 MB / 100 MB comparison over eight blocks, combining
-the initial and follow-up blocks, was +1.79% with a wide CI crossing zero.
+Five-block screens used the same device instance as each strict baseline. The
+common campaign profile was cache 400 / 100 ops / 100 MB. It is reproducible,
+not asserted globally optimal.
 
-A separate four-pair cache comparison at 100 ops / 1000 MB estimated 2000 /
-400 at -4.71%, also with a wide CI crossing zero. Use cache 400, 100 ops, and
-100 MB. The larger MB
-limit increased peak MLX memory without an established marginal speed benefit.
+| Profile | 100 vs 20 ops factorial effect | Direct recommended B/A |
+| --- | ---: | ---: |
+| `sm89` | +19.73%, `p=0.00230` | +25.07%, `p=0.0148` |
+| `sm90` | +8.45%, CI crosses 1 | +6.58%, CI crosses 1 |
+| `sm100` | +10.90%, `p=6.82e-5` | +6.60%, CI crosses 1 |
+| `sm120` | +14.22%, `p=1.65e-5` | +16.31%, `p=1.20e-5` |
+
+Cache and MB effects were mostly inconclusive. On `sm120`, 1000 MB was slightly
+slower than 100 MB in this screen; cache 2000 had no supported benefit over 400.
+
+## Experimental W2 tile follow-up
+
+The W2 study used an architecture-specific MLX 0.32.0 wheel built from a sealed
+runtime tile-override patch. It is not part of the normal QuickStart.
+
+- `sm120`: `16x32x128` strict-accepted, +1.615% (95% CI +1.322%–+1.909%),
+  12/12 fresh-process wins, `p=9.63e-8`.
+- `sm89`: same tile array-exact but +0.066% (CI -1.259%–+1.409%); demoted.
+- `sm100`: same tile array-exact but +0.715% (CI -0.003%–+1.438%); demoted.
+- `sm90`: stock default ranked first end-to-end in screening; no candidate.
+
+Do not add the `sm120` tile percentage to the strict Q/K result: it is a
+separate candidate-vs-default comparison under a custom backend.
+
+## Blackwell fix performance gate
+
+The rounding fix was compared with the old arithmetic in 16 balanced fresh
+processes using distinct source/kernel identities. On B200, fixed/original was
++0.91% with a 95% CI of -4.35% to +6.46% (9/16 wins). On RTX 5090 it was +8.58%
+with a CI of -0.58% to +18.60% (11/16 wins). The predeclared statistical test
+did not detect a slowdown; the intervals do not prove zero cost or universal
+non-inferiority.
+
+## Scope and excluded work
+
+Throughput excludes prefill, batched decode, scaled-RoPE policies, JIT/live
+probe, cold cache setup, selected-logprob/top-1 instrumentation, FlashHead, KV
+quantization, and all approximate router/add-RMS/ternary paths. Intervals are
+small-n exploratory evidence after tuning, with no multiple-testing correction.
+The exact per-trial data and hashes are under [`../results/cuda/`](../results/cuda/).
 
 ## Superseded initial result
 
-The initial public table reported 136.86 -> 189.30 tok/s (+38.3%) on RTX 3090.
-Its absolute accelerated speed was real for that process, but it is no longer a
-strict-exact claim: the campaign used a 256-token oracle and tolerant live
-probes, and enabled router/add-RMS paths that later changed long generation.
-The raw data remains under `results/legacy-initial-port/` for historical
-transparency.
-
-The revised exact speed profile reaches 209.58 tok/s using deterministic SDPA
-and excluding those approximate paths. The historical artifact observed
-189.30 tok/s, but generation length, baseline, graph configuration, oracle, and
-active paths differ; the two absolute observations are not a controlled
-incremental-speed comparison.
-
-## Dominant remaining bottleneck
-
-An Nsight Systems audit of the exact-head legacy RTX 3090 workload attributed about 34.6% of GPU
-kernel time to MLX CUDA's generic affine 2-bit expert `qmm_naive`. Other notable
-shares were non-gather 2-bit QMV (10.4%), router work (9.6%), exact 4-bit
-LM-head QMV (7.9%), Q/K (6.4%), SDPA (4.8%), and add/RMS (3.9%). These shares
-are workload-specific.
-
-Native experiments included B=8 QMV, several tile shapes, rows-per-block,
-elements-per-thread, and a top-8 -> two-top-4 split. None produced a repeatable
-strict end-to-end win; the split preserved the short token hash but was 30.4%
-slower. They are not shipped as defaults.
-
-The highest-value next kernel is a generic affine W2 top-8 multi-row
-projection. It must preserve stock FP32 accumulation order, BF16 rounding after
-each projection, expert-slot order, and ordered FP32 aggregation. A mathematically
-equivalent but reordered reduction is not acceptable in the strict lane.
-
-## Experimental semantic work
-
-- Router microbenchmarks can be materially faster, but normalized FP32 scores
-  are not array-exact. An exact future hybrid should retain stock
-  matmul/softmax/renormalization and fuse only stable top-8 selection/copy.
-- The checkpoint's structured ternary up/gate weights enabled roughly 1.47x
-  projection speed in a prototype, but full-layer BF16 values differed.
-- Residual add/RMS passed local probes yet changed the deterministic long
-  token stream at generated token 217.
-
-All three remain opt-in experiments and are excluded from strict throughput.
+The original 136.86 → 189.30 tok/s (+38.3%) RTX 3090 table is historical only.
+Its 256-token oracle and tolerant probes admitted router/add-RMS paths that
+later diverged. Raw sanitized data remains under `results/legacy-initial-port/`
+for transparency, but it is not a current strict claim.

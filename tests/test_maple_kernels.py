@@ -144,6 +144,25 @@ class TestMapleKernels(unittest.TestCase):
                 self.assertEqual(profile.router_reference_gemv, reference_gemv)
         self.assertIsNone(maple._cuda_profile_for_capability((8, 0)))
 
+    def test_blackwell_qk_rope_pins_stock_second_half_rounding(self):
+        """sm100 and sm120 pin the FFMA association used by stock MLX RoPE."""
+        sources = {}
+        with mock.patch.object(mx.fast, "cuda_kernel", return_value=object()) as make:
+            for name in ("sm90", "sm100", "sm120"):
+                maple._make_cuda_qk_norm_rope_kernel(maple._CudaProfile(name), True)
+                sources[name] = make.call_args.kwargs["source"]
+
+        pinned = (
+            "__fmaf_rn(value, rope_cos[p], "
+            "__fmul_rn(paired, rope_sin[p]))"
+        )
+        for name in ("sm100", "sm120"):
+            self.assertIn(pinned, sources[name])
+        self.assertNotIn(pinned, sources["sm90"])
+        self.assertIn(
+            "paired * rope_sin[p] + value * rope_cos[p]", sources["sm90"]
+        )
+
     def test_cuda_router_launch_covers_every_expert(self):
         """Every tuned launch must produce exactly one row for every expert."""
         for threads in (64, 128, 256, 512):
@@ -486,6 +505,34 @@ assert maple._router_select_kernel_cache == {}
         cached = set(maple._add_rms_kernel_cache)
         self.assertFalse(maple._add_rms_norm_ok(dim, mx.bfloat16, w, eps))
         self.assertEqual(set(maple._add_rms_kernel_cache), cached)
+
+    def test_blackwell_qk_frozen_rounding_boundary_matches_reference(self):
+        """Frozen upper-half RoPE midpoint must stay exact on Blackwell."""
+        profile = maple._cuda_profile()
+        if (
+            maple._kernel_backend() != "cuda"
+            or profile is None
+            or profile.name not in ("sm100", "sm120")
+        ):
+            self.skipTest("frozen Blackwell boundary requires sm100 or sm120")
+        fixture_path = Path(__file__).parent / "data" / "sm100_qk_rope_boundary.npz"
+        with np.load(fixture_path, allow_pickle=False) as fixture:
+            qk_values = fixture["qk_bfloat16_as_float32"]
+            q_weight = fixture["q_norm_weight_float32"]
+            k_weight = fixture["k_norm_weight_float32"]
+        args = _args(num_hidden_layers=1, layer_types=["sliding_attention"])
+        attn = maple.MapleAttention(args, 0)
+        attn.q_norm.weight = mx.array(q_weight)
+        attn.k_norm.weight = mx.array(k_weight)
+        qk = mx.array(qk_values).astype(mx.bfloat16)
+        got = attn._qk_fused(qk, 613)
+        want = attn._qk_reference(qk, 613)
+        mx.eval(got, want)
+        self.assertEqual(attn._fused_qk_backend, "cuda")
+        self.assertTrue(
+            mx.array_equal(got, want),
+            f"{profile.name} upper-half RoPE contraction changed at head=8, dim=45",
+        )
 
     def test_qk_norm_rope_matches_reference(self):
         """Fused per-head norm + partial RoPE vs q_norm/k_norm + mx.fast.rope,

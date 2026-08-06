@@ -490,6 +490,15 @@ def _make_qk_norm_rope_kernel():
 def _make_cuda_qk_norm_rope_kernel(profile, use_rope):
     """CUDA Q/K RMSNorm with separate RoPE and NoPE kernel bodies."""
     if use_rope:
+        # NVRTC on Blackwell otherwise contracts the sine product, while MLX's
+        # stock RoPE contracts the cosine product.  Pin that one rounding
+        # boundary explicitly so the fused kernel stays array-exact.
+        second_half = (
+            "__fmaf_rn(value, rope_cos[p], "
+            "__fmul_rn(paired, rope_sin[p]))"
+            if profile.name in ("sm100", "sm120")
+            else "paired * rope_sin[p] + value * rope_cos[p]"
+        )
         transform = """
         __shared__ float rope_sin[ROPE_DIM / 2];
         __shared__ float rope_cos[ROPE_DIM / 2];
@@ -519,11 +528,11 @@ def _make_cuda_qk_norm_rope_kernel(profile, use_rope):
                 float paired = static_cast<float>(paired_normalized);
                 value = j < HALF
                     ? value * rope_cos[p] - paired * rope_sin[p]
-                    : paired * rope_sin[p] + value * rope_cos[p];
+                    : MAPLE_SECOND_HALF;
             }
             oh[j] = static_cast<T_>(value);
         }
-        """
+        """.replace("MAPLE_SECOND_HALF", second_half)
     else:
         transform = """
         #pragma unroll

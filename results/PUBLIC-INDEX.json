@@ -1,0 +1,145 @@
+{
+  "compact_evidence": {
+    "blackwell_rounding": "cuda/blackwell-qk-rounding.jsonl",
+    "graph_summary": "cuda/multiarch-graph-summary.jsonl",
+    "source_equivalence": "cuda/release-source-equivalence.json",
+    "strict_summary": "cuda/multiarch-strict-summary.jsonl",
+    "w2_summary": "cuda/multiarch-w2-summary.jsonl"
+  },
+  "profiles": {
+    "sm100": {
+      "blackwell": {
+        "candidate_evaluation_sha256": "00ebdffc85e3105489c3b8e47bff6cddbdfd186a130150792632583913ca2285",
+        "diagnostic_sha256": "17e7a108fb93e819f667ccc86cecb2a096f5dc5f6317d4f31c64a6946ba19ef4",
+        "fresh_process_ab_manifest_sha256": "28c10c09ba65a1081276f16bc5a67059689384cabb8042ba675ed0ff8ded083b"
+      },
+      "campaign_archive_normalized": true,
+      "campaign_archive_sha256_private_commitment": "d9d315ac8350e3fe1fb6ce9cf5c5308b00fd12669f7c3f4ae2f38db021a9f324",
+      "campaign_manifest_sha256": "28e1c6484113aa5c326d13b4a39c2d4a275f4f04c5495edac5869fa0a4ecd307",
+      "canonical_analysis_sha256": "be30a2c449a5cf32a91b9f03c29f533969b0452b4547510450bd614c319d3c00",
+      "canonical_raw_manifest_sha256_private_commitment": "ff7fee2eee9efef65466475ed1735dd0fccf51775bf0c98a7119597fe5eb0559",
+      "compute_capability": "10.0",
+      "device": "NVIDIA B200",
+      "driver": "580.126.20",
+      "executed_source_sha256": "b34cd9777cf5a8775ed4e814fe7e14c987a9021627224168595c92ddf21edae4",
+      "graph": {
+        "analysis_sha256": "bc974c5c6f1ae30448ba780c7c72d8777580e6a915d18ad02b610367a8281a5d",
+        "classification": "screening-only-device-instance",
+        "raw_manifest_sha256_private_commitment": "137b124a0a5b3fddaf8b6fc90d098268594865ad23c9b4a920c22f8fc37da1d7"
+      },
+      "release_generated_qk_source_equal": true,
+      "sanitized_bundle": "cuda/multiarch/sm100",
+      "sanitized_manifest_sha256": "7b6da0456a1e3b4d9d0735e8ae0ef82d1f108b9df699bc398206361109243fb7",
+      "w2": {
+        "classification": "exploratory-demoted",
+        "followup_analysis_sha256": "35b3d7043098bab52b2bf15d2336ed0ef1450397d2dfe8b150123fed60b6705e",
+        "followup_raw_manifest_sha256_private_commitment": "e766b8de71a210095a2521998007a601d101c6718aae3e172f7d9713b3432818",
+        "screen_analysis_sha256": "5389a85d094093f11ee658a8201432f51c7e1ad9e6b3045cc0654ce111a60c50",
+        "screen_raw_manifest_sha256_private_commitment": "8b65a0b012c230f4f04d9d1a3a182be76dde7b0560e50cde26d5001ae608fa84"
+      }
+    },
+    "sm120": {
+      "blackwell": {
+        "candidate_evaluation_sha256": "6e6a659cb043d3c1f376dd149c5ddb2cb8ca00d9c955089e5cf6b534d292e024",
+        "diagnostic_sha256": "19170b2a50a35b1b0a4d2ec7b6eaf9c69c18785442526a297e6fa9bc3b240b4c",
+        "fresh_process_ab_manifest_sha256": "c14e84d77c25609ce4da5aa3fa96d4c76ade3602b6f62a6191abe3664cb541cd"
+      },
+      "campaign_archive_normalized": true,
+      "campaign_archive_sha256_private_commitment": "a7defa6c4fb0c222bd670a0cdf405561371883ffcccc67c04a2f3c3c5ca39639",
+      "campaign_manifest_sha256": "6a7ccef5084ff8c90bdfcd3f1fbd9b9c1b29ee7779c0036799f9892cd3510bde",
+      "canonical_analysis_sha256": "02537ea3aca3b3fb23d05a9b726f86ac59466a22abde47f6ea26cd8035d1343a",
+      "canonical_raw_manifest_sha256_private_commitment": "4bb04008996ac481a9eeaaa8a2372d3fed19c86b7633cb3af02ccde621215e0d",
+      "compute_capability": "12.0",
+      "device": "NVIDIA GeForce RTX 5090",
+      "driver": "580.126.20",
+      "executed_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+      "graph": {
+        "analysis_sha256": "a757b0022f83ddfa7932267290b5b2119f338fb2c0218af5f529699db1f3ada3",
+        "classification": "screening-only-device-instance",
+        "raw_manifest_sha256_private_commitment": "0c325d6da7f2f4019a5f545aeb2c519eda8732dab1ff2556442c8281b362b948"
+      },
+      "release_generated_qk_source_equal": true,
+      "sanitized_bundle": "cuda/multiarch/sm120",
+      "sanitized_manifest_sha256": "3ae388e2b93cc26959a5dc5dc162a59f3326c61633d1e18de3a0d216d2280cec",
+      "w2": {
+        "classification": "strict-accepted",
+        "followup_analysis_sha256": "9a02e29c6a666c639b51615b63d7a6871c102972667a8758939aee35c3d113af",
+        "followup_raw_manifest_sha256_private_commitment": "6271bd28fb1e4419cdadccef5ee71e556a3b33ed17d8b62acf9be413df1a8396",
+        "screen_analysis_sha256": "db3b4f1827f7823b50fae820c2042736b7dd65d48dc99448a45584a700ae974b",
+        "screen_raw_manifest_sha256_private_commitment": "b5f75136c10afe67030221663ba44b1e4b9a75b57a0534375a8aa8cd50f4bd1b"
+      }
+    },
+    "sm89": {
+      "campaign_archive_normalized": false,
+      "campaign_archive_sha256_private_commitment": "49e4dd1215337b8ec967fd001faf09cf30a1474b83e8d5b0fdb71abf3c56e0d2",
+      "campaign_manifest_sha256": "a2a1fe64a76f7a0bfe4829796ac1ed4d8543742da6c0d98a33d5d397940be094",
+      "canonical_analysis_sha256": "73f35f8cd16f0eed4fe617dd186febf252e55c9fbc2ff0720669180ecf28e533",
+      "canonical_raw_manifest_sha256_private_commitment": "0376bb3564bad844750ecd43f4e6b4cb98cb1a1de7b0ff1f895d82a2dd3a93f6",
+      "compute_capability": "8.9",
+      "device": "NVIDIA GeForce RTX 4090",
+      "driver": "580.159.04",
+      "executed_source_sha256": "7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae",
+      "graph": {
+        "analysis_sha256": "53d8700b2ecffd3583a4cd6e8aa541e9fd8efef4891928f05832c8ddce913859",
+        "classification": "screening-only-device-instance",
+        "raw_manifest_sha256_private_commitment": "3e3bc69c581ca6e90af297649f2da6e5a05d004cc982348f78921e359ed9a00d"
+      },
+      "release_generated_qk_source_equal": true,
+      "sanitized_bundle": "cuda/multiarch/sm89",
+      "sanitized_manifest_sha256": "bd30b4cfe406978ea2bc9eecf30d441043c51c764932eea752e022d01e3f451e",
+      "w2": {
+        "classification": "exploratory-demoted",
+        "followup_analysis_sha256": "e43a7325a582b0e0a12e91f56f3e5a55743ab92d3e77db0805ec2a694eb08a95",
+        "followup_raw_manifest_sha256_private_commitment": "f07a3c8ecd50f7b62c5b20cb9d37c1f39d74028fc5346587872dbd23a3a7cbbe",
+        "screen_analysis_sha256": "9fc5fba222dc6ef10b7b1355eed043281079f62fdecce28239274b94fc5aa26d",
+        "screen_raw_manifest_sha256_private_commitment": "d426826f59952df3ffeac3b861029682b166755560e0f7d28dd2e88bfebe6bf2"
+      }
+    },
+    "sm90": {
+      "campaign_archive_normalized": false,
+      "campaign_archive_sha256_private_commitment": "49e4dd1215337b8ec967fd001faf09cf30a1474b83e8d5b0fdb71abf3c56e0d2",
+      "campaign_manifest_sha256": "a2a1fe64a76f7a0bfe4829796ac1ed4d8543742da6c0d98a33d5d397940be094",
+      "canonical_analysis_sha256": "6266b41a209454ff8d07a8a7625985ef5577f3c685b2807b7fc3cb8381bcf708",
+      "canonical_raw_manifest_sha256_private_commitment": "4a88251f6533a0996ec6b0c53cac396f60d4404f7b1d2fb00953c17e6def9b74",
+      "compute_capability": "9.0",
+      "device": "NVIDIA H100 80GB HBM3",
+      "driver": "580.126.09",
+      "executed_source_sha256": "7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae",
+      "graph": {
+        "analysis_sha256": "12e725e5d667b68df6e9fea962a74925e5dd7dcb73a950e7d0c80584b0c50882",
+        "classification": "screening-only-device-instance",
+        "raw_manifest_sha256_private_commitment": "bcca37d6ad7e672d01a327730dd392201bb68dc195a2a817c0364dbb4489bcb1"
+      },
+      "release_generated_qk_source_equal": true,
+      "sanitized_bundle": "cuda/multiarch/sm90",
+      "sanitized_manifest_sha256": "1996fadccad048605c08ff6c0b212aa34feb69b904b4dabd1d7bb172b79a522f",
+      "w2": {
+        "classification": "screen-no-winner-default-retained",
+        "screen_analysis_sha256": "b66ffe762bbf13f6bbfeda62b5ec7997079399d905a53c945ab407deee89f11e",
+        "screen_raw_manifest_sha256_private_commitment": "f5e8d9e8757fe91576540c02c50c309bcaeb35808660c75b8e827888147633bc"
+      }
+    }
+  },
+  "release": {
+    "cuda_nvrtc": "12.9.86",
+    "cuda_runtime": "12.9.79",
+    "deepgrove_base": "eba96c16158f032821b0bf374ea1421cfddef0a9",
+    "fixture_sha256": "837638a799bef1b8ea7e7a23c77791964ca88f2bfc698f50910655c5f9bddb64",
+    "integration_patch_sha256": "eb9c36eb5aec3c93e52ddcc35d735f816a18ab5330460a05b7a641ba0f5174f0",
+    "mlx": "0.32.0",
+    "mlx_cuda_12": "0.32.0",
+    "model_revision": "361db5da5e74ff6fcdd852d478e1f266ce11013a",
+    "python": "3.12.3",
+    "source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+    "tests_sha256": "f3b0f2be32c372fd96d2d17df55971598a76214ace0fc72d8469fb3dec35fcfa"
+  },
+  "schema": "maple-multiarch-public-index-v1",
+  "scope": {
+    "approximate_paths_included": false,
+    "full_logit_equality_claimed": false,
+    "metal_validated": false,
+    "one_device_instance_per_sku": true,
+    "quality_leaderboard": false,
+    "strict_equals_local_portable_oracle_not_cross_sku": true
+  }
+}
