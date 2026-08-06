@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.nsys-rep
+*.sqlite
+*.safetensors
+*.gguf
+*.raw.jsonl

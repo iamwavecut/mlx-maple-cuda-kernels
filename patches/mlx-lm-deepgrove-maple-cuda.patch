@@ -1,0 +1,1298 @@
+diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
+index a0673f7..2af3bc6 100644
+--- a/mlx_lm/models/maple.py
++++ b/mlx_lm/models/maple.py
+@@ -1,5 +1,6 @@
+ # Copyright © 2026 DeepGrove AI.
+ 
++import math
+ from dataclasses import dataclass
+ from functools import partial
+ from typing import Any, List, Optional
+@@ -24,6 +25,123 @@ from mlx_lm.models.switch_layers import SwitchLinear
+ MLP_CLAMP = 7.0
+ 
+ 
++@dataclass(frozen=True)
++class _CudaProfile:
++    name: str
++    elementwise_threads: int = 128
++    router_threads: int = 256
++    router_rows_per_warp: int = 4
++    router_reference_gemv: bool = False
++
++
++_UNSET = object()
++_kernel_backend_cache = _UNSET
++_cuda_capability_cache = _UNSET
++_cuda_profile_cache = _UNSET
++
++
++def _kernel_backend():
++    global _kernel_backend_cache
++    if _kernel_backend_cache is not _UNSET:
++        return _kernel_backend_cache
++    try:
++        if mx.metal.is_available():
++            _kernel_backend_cache = "metal"
++            return _kernel_backend_cache
++    except (AttributeError, RuntimeError):
++        pass
++    try:
++        if mx.cuda.is_available():
++            _kernel_backend_cache = "cuda"
++            return _kernel_backend_cache
++    except (AttributeError, RuntimeError):
++        pass
++    _kernel_backend_cache = None
++    return _kernel_backend_cache
++
++
++def _cuda_capability():
++    global _cuda_capability_cache
++    if _cuda_capability_cache is not _UNSET:
++        return _cuda_capability_cache
++    if _kernel_backend() != "cuda":
++        _cuda_capability_cache = None
++        return None
++    try:
++        info = mx.device_info(mx.gpu)
++        _cuda_capability_cache = (
++            int(info["compute_capability_major"]),
++            int(info["compute_capability_minor"]),
++        )
++    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
++        _cuda_capability_cache = None
++    return _cuda_capability_cache
++
++
++def _cuda_profile_for_capability(capability):
++    major, minor = capability
++    if (major, minor) < (8, 6):
++        return None
++    for target, name in (
++        ((12, 0), "sm120"),
++        ((10, 0), "sm100"),
++        ((9, 0), "sm90"),
++        ((8, 9), "sm89"),
++        ((8, 6), "sm86"),
++    ):
++        if (major, minor) == target:
++            if target == (8, 6):
++                return _CudaProfile(
++                    name,
++                    elementwise_threads=256,
++                    router_threads=128,
++                    router_rows_per_warp=2,
++                )
++            if target == (8, 9):
++                return _CudaProfile(
++                    name,
++                    elementwise_threads=512,
++                    router_threads=128,
++                    router_rows_per_warp=1,
++                )
++            if target in ((9, 0), (10, 0)):
++                return _CudaProfile(
++                    name,
++                    elementwise_threads=512,
++                    router_threads=512,
++                    router_rows_per_warp=1,
++                    router_reference_gemv=True,
++                )
++            if target == (12, 0):
++                return _CudaProfile(
++                    name,
++                    elementwise_threads=512,
++                    router_threads=256,
++                    router_rows_per_warp=1,
++                    router_reference_gemv=True,
++                )
++            return _CudaProfile(name, router_reference_gemv=target >= (9, 0))
++    return _CudaProfile("future", router_reference_gemv=True)
++
++
++def _cuda_profile():
++    global _cuda_profile_cache
++    if _cuda_profile_cache is not _UNSET:
++        return _cuda_profile_cache
++    capability = _cuda_capability()
++    _cuda_profile_cache = (
++        None if capability is None else _cuda_profile_for_capability(capability)
++    )
++    return _cuda_profile_cache
++
++
++def _cuda_router_grid_size(num_experts, profile):
++    block_rows = profile.router_threads // 32 * profile.router_rows_per_warp
++    if num_experts % block_rows:
++        raise ValueError("router profile does not evenly cover every expert")
++    return num_experts // block_rows * profile.router_threads
++
++
+ @partial(mx.compile, shapeless=True)
+ def clamped_swiglu(gate, x):
+     # Python floats, not 0-d arrays, so bf16 activations stay bf16.
+@@ -123,24 +241,129 @@ def _make_add_rms_norm_kernel(eps):
+     )
+ 
+ 
+-_add_rms_kernels = {}
++def _make_cuda_add_rms_norm_kernel(eps, profile):
++    """CUDA residual add + RMSNorm for one decode token."""
++    source = """
++        constexpr int VECTOR_WIDTH = 4;
++        constexpr int CHUNKS = DIM / (THREADS * VECTOR_WIDTH);
++        int tid = threadIdx.x;
++        int lane = tid & 31;
++        int warp = tid >> 5;
++        float values[CHUNKS][VECTOR_WIDTH];
++        float local_ss = 0.0f;
++
++        #pragma unroll
++        for (int chunk = 0; chunk < CHUNKS; ++chunk) {
++            int base = (chunk * THREADS + tid) * VECTOR_WIDTH;
++            #pragma unroll
++            for (int i = 0; i < VECTOR_WIDTH; ++i) {
++                int j = base + i;
++                float value = static_cast<float>(x[j]) + static_cast<float>(r[j]);
++                T_ rounded = static_cast<T_>(value);
++                h_out[j] = rounded;
++                values[chunk][i] = static_cast<float>(rounded);
++                local_ss += values[chunk][i] * values[chunk][i];
++            }
++        }
++
++        #pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            local_ss += __shfl_down_sync(0xffffffff, local_ss, offset);
++        }
++
++        __shared__ float warp_sums[THREADS / 32];
++        if (lane == 0) warp_sums[warp] = local_ss;
++        __syncthreads();
++
++        float total = lane < THREADS / 32 ? warp_sums[lane] : 0.0f;
++        #pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            total += __shfl_down_sync(0xffffffff, total, offset);
++        }
++        __shared__ float block_sum;
++        if (tid == 0) block_sum = total;
++        __syncthreads();
++        total = block_sum;
++        float scale = rsqrtf(total / static_cast<float>(DIM) + EPSILON);
++
++        #pragma unroll
++        for (int chunk = 0; chunk < CHUNKS; ++chunk) {
++            int base = (chunk * THREADS + tid) * VECTOR_WIDTH;
++            #pragma unroll
++            for (int i = 0; i < VECTOR_WIDTH; ++i) {
++                int j = base + i;
++                hn_out[j] = static_cast<T_>(
++                    values[chunk][i] * scale * static_cast<float>(w[j]));
++            }
++        }
++    """.replace("EPSILON", f"{eps:.10e}f")
++    tag = f"{eps:.3e}".replace(".", "_").replace("-", "m").replace("+", "p")
++    return mx.fast.cuda_kernel(
++        name=f"maple_add_rms_norm_{profile.name}_{tag}",
++        input_names=["x", "r", "w"],
++        output_names=["h_out", "hn_out"],
++        source=source,
++    )
++
++
++_add_rms_kernel_cache = {}
++_last_add_rms_backend = None
+ 
+ 
+ def _add_rms_norm(h, r, w, eps):
+-    kernel = _add_rms_kernels.get(eps)
++    global _last_add_rms_backend
++    backend = _kernel_backend()
++    if backend == "metal":
++        threads = 256
++        key = (backend, eps)
++
++        def make_kernel():
++            return _make_add_rms_norm_kernel(eps)
++
++    elif backend == "cuda":
++        profile = _cuda_profile()
++        if profile is None:
++            raise RuntimeError("unsupported CUDA architecture")
++        threads = profile.elementwise_threads
++        key = (backend, profile.name, eps)
++
++        def make_kernel():
++            return _make_cuda_add_rms_norm_kernel(eps, profile)
++
++    else:
++        raise RuntimeError("no residual add + RMSNorm kernel for this backend")
++    alignment = threads * 4 if backend == "cuda" else threads
++    if h.shape[-1] % alignment:
++        raise ValueError("unsupported residual add + RMSNorm dimension")
++    kernel = _add_rms_kernel_cache.get(key)
+     if kernel is None:
+-        kernel = _add_rms_kernels[eps] = _make_add_rms_norm_kernel(eps)
+-    return kernel(
++        kernel = _add_rms_kernel_cache[key] = make_kernel()
++    template = [("T_", h.dtype), ("DIM", h.shape[-1])]
++    if backend == "cuda":
++        template.extend([("W_", w.dtype), ("THREADS", threads)])
++    outputs = kernel(
+         inputs=[h.reshape(-1), r.reshape(-1), w],
+-        template=[("T_", h.dtype), ("DIM", h.shape[-1])],
+-        grid=(256, 1, 1),
+-        threadgroup=(256, 1, 1),
++        template=template,
++        grid=(threads, 1, 1),
++        threadgroup=(threads, 1, 1),
+         output_shapes=[h.shape, h.shape],
+         output_dtypes=[h.dtype, h.dtype],
+     )
++    _last_add_rms_backend = backend
++    return outputs
+ 
+ 
+ def _add_rms_norm_ok(dim, dtype, w, eps):
++    backend = _kernel_backend()
++    if backend == "cuda":
++        profile = _cuda_profile()
++        if profile is None or dim % (profile.elementwise_threads * 4):
++            return False
++    elif backend == "metal":
++        if dim % 256:
++            return False
++    else:
++        return False
+     x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
+     r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
+     return _matches(
+@@ -226,7 +449,7 @@ def _make_qk_norm_rope_kernel():
+ 
+         constexpr int per_lane = HEAD_DIM / 32;
+         const device T_* xh = x + head * HEAD_DIM;
+-        const device T_* wh = w + head * HEAD_DIM;
++        const device W_* wh = w + head * HEAD_DIM;
+         device T_* oh = out + head * HEAD_DIM;
+ 
+         float ss = 0.0f;
+@@ -263,7 +486,108 @@ def _make_qk_norm_rope_kernel():
+     )
+ 
+ 
+-_qk_norm_rope_kernel = _make_qk_norm_rope_kernel()
++def _make_cuda_qk_norm_rope_kernel(profile, use_rope):
++    """CUDA Q/K RMSNorm with separate RoPE and NoPE kernel bodies."""
++    if use_rope:
++        transform = """
++        __shared__ float rope_sin[ROPE_DIM / 2];
++        __shared__ float rope_cos[ROPE_DIM / 2];
++        for (int p = lane; p < ROPE_DIM / 2; p += 32) {
++            float fraction = static_cast<float>(p)
++                / static_cast<float>(ROPE_DIM / 2);
++            float frequency = exp2f(-fraction * pos_eps[2]);
++            float angle = pos_eps[0] * frequency;
++            rope_cos[p] = cosf(angle);
++            rope_sin[p] = sinf(angle);
++        }
++        __syncwarp();
++
++        #pragma unroll
++        for (int i = 0; i < VALUES_PER_LANE; ++i) {
++            int j = lane * VALUES_PER_LANE + i;
++            T_ normalized = static_cast<T_>(
++                static_cast<float>(xh[j]) * scale * static_cast<float>(wh[j]));
++            float value = static_cast<float>(normalized);
++            if (j < ROPE_DIM) {
++                constexpr int HALF = ROPE_DIM / 2;
++                int p = j < HALF ? j : j - HALF;
++                int pair = j < HALF ? j + HALF : j - HALF;
++                T_ paired_normalized = static_cast<T_>(
++                    static_cast<float>(xh[pair]) * scale
++                    * static_cast<float>(wh[pair]));
++                float paired = static_cast<float>(paired_normalized);
++                value = j < HALF
++                    ? value * rope_cos[p] - paired * rope_sin[p]
++                    : paired * rope_sin[p] + value * rope_cos[p];
++            }
++            oh[j] = static_cast<T_>(value);
++        }
++        """
++    else:
++        transform = """
++        #pragma unroll
++        for (int i = 0; i < VALUES_PER_LANE; ++i) {
++            int j = lane * VALUES_PER_LANE + i;
++            oh[j] = static_cast<T_>(
++                static_cast<float>(xh[j]) * scale * static_cast<float>(wh[j]));
++        }
++        """
++
++    source = (
++        """
++        int head = blockIdx.y;
++        int lane = threadIdx.x;
++        constexpr int VALUES_PER_LANE = HEAD_DIM / 32;
++        const T_* xh = x + head * HEAD_DIM;
++        const W_ * wh = w + head * HEAD_DIM;
++        T_* oh = out + head * HEAD_DIM;
++
++        float sum_sq = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < VALUES_PER_LANE; ++i) {
++            float value = static_cast<float>(xh[lane * VALUES_PER_LANE + i]);
++            sum_sq += value * value;
++        }
++        #pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
++        }
++        sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
++        float scale = rsqrtf(sum_sq / static_cast<float>(HEAD_DIM) + pos_eps[1]);
++    """
++        + transform
++    )
++    return mx.fast.cuda_kernel(
++        name=f"maple_qk_norm_{'rope' if use_rope else 'nope'}_{profile.name}",
++        input_names=["x", "w", "inv_freq", "pos_eps"],
++        output_names=["out"],
++        source=source,
++    )
++
++
++_qk_kernel_cache = {}
++
++
++def _get_qk_norm_rope_kernel(use_rope):
++    backend = _kernel_backend()
++    if backend == "metal":
++        key = (backend,)
++        make_kernel = _make_qk_norm_rope_kernel
++    elif backend == "cuda":
++        profile = _cuda_profile()
++        if profile is None:
++            raise RuntimeError("unsupported CUDA architecture")
++        key = (backend, profile.name, use_rope)
++
++        def make_kernel():
++            return _make_cuda_qk_norm_rope_kernel(profile, use_rope)
++
++    else:
++        raise RuntimeError("no Q/K norm + RoPE kernel for this backend")
++    kernel = _qk_kernel_cache.get(key)
++    if kernel is None:
++        kernel = _qk_kernel_cache[key] = make_kernel()
++    return kernel
+ 
+ 
+ class MapleAttention(nn.Module):
+@@ -293,13 +617,19 @@ class MapleAttention(nn.Module):
+             self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
+         self._eps = args.rms_norm_eps
+         self._rope_base = args.rope_theta
++        self._rope_log2_base = math.log2(args.rope_theta)
+         self._qk_w = None
+         self._inv_freq = None
+         self._fused_qk = None  # None = unprobed, then True/False
++        self._fused_qk_backend = None
+ 
+         # Maple applies RoPE only on sliding-window layers; full-attention
+         # layers use no positional encoding (NoPE).
+         self.use_rope = args.layer_types[layer_idx] == "sliding_attention"
++        # The custom kernel implements the checkpoint's plain RoPE exactly.
++        # Scaling policies have different position math and must stay on MLX's
++        # portable implementation until they receive their own specialization.
++        self._can_fuse_qk = not (self.use_rope and args.rope_scaling is not None)
+         if self.use_rope:
+             rope_dim = int(self.head_dim * args.partial_rotary_factor)
+             self.rope = initialize_rope(
+@@ -312,6 +642,8 @@ class MapleAttention(nn.Module):
+ 
+     def _qk_fused(self, qk, offset):
+         """Both norms and both rope applications in one dispatch."""
++        if not self._can_fuse_qk:
++            raise ValueError("scaled RoPE is unsupported by the fused Q/K kernel")
+         if self._qk_w is None:
+             n_q = self.num_attention_heads
+             n_kv = self.num_key_value_heads
+@@ -336,19 +668,26 @@ class MapleAttention(nn.Module):
+ 
+         # cache.offset is a Python int for a plain cache but an mx.array for
+         # the batched caches; coerce so the pos/eps pair is always uniform.
+-        pos_eps = mx.array([float(offset), self._eps], dtype=mx.float32)
+-        return _qk_norm_rope_kernel(
++        pos_eps = mx.array(
++            [float(offset), self._eps, self._rope_log2_base], dtype=mx.float32
++        )
++        backend = _kernel_backend()
++        template = [
++            ("T_", qk.dtype),
++            ("HEAD_DIM", self.head_dim),
++            ("ROPE_DIM", self.rope.dims if self.use_rope else 0),
++        ]
++        template.append(("W_", self._qk_w.dtype))
++        output = _get_qk_norm_rope_kernel(self.use_rope)(
+             inputs=[qk, self._qk_w, self._inv_freq, pos_eps],
+-            template=[
+-                ("T_", qk.dtype),
+-                ("HEAD_DIM", self.head_dim),
+-                ("ROPE_DIM", self.rope.dims if self.use_rope else 0),
+-            ],
++            template=template,
+             grid=(32, qk.shape[0], 1),
+             threadgroup=(32, 1, 1),
+             output_shapes=[qk.shape],
+             output_dtypes=[qk.dtype],
+         )[0]
++        self._fused_qk_backend = backend
++        return output
+ 
+     def _qk_reference(self, qk, offset):
+         """The same result from stock ops: fallback, and the yardstick the
+@@ -378,7 +717,7 @@ class MapleAttention(nn.Module):
+             qk = qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, self.head_dim)
+             if self._fused_qk is None:
+                 # A nonzero position, so a broken rotation cannot pass.
+-                self._fused_qk = _matches(
++                self._fused_qk = self._can_fuse_qk and _matches(
+                     lambda: (self._qk_fused(qk, 7),),
+                     lambda: (self._qk_reference(qk, 7),),
+                 )
+@@ -618,7 +957,306 @@ def _make_fused_router_kernel():
+     )
+ 
+ 
+-_fused_router_kernel = _make_fused_router_kernel()
++def _make_cuda_router_kernel(profile):
++    """CUDA router GEMV and selected-only top-8 normalization."""
++    source = """
++        constexpr int VALUES_PER_LANE = 4;
++        constexpr int WARP_WIDTH = 32;
++        constexpr int COLS_PER_ITER = WARP_WIDTH * VALUES_PER_LANE;
++        constexpr int WARPS = ROUTER_THREADS / WARP_WIDTH;
++        constexpr int BLOCK_ROWS = WARPS * ROWS_PER_WARP;
++        constexpr int NUM_BLOCKS = NEXP / BLOCK_ROWS;
++
++        int tid = threadIdx.x;
++        int lane = tid & 31;
++        int warp = tid >> 5;
++        int row0 = blockIdx.x * BLOCK_ROWS + warp * ROWS_PER_WARP;
++        float accum[ROWS_PER_WARP] = {0.0f};
++
++        for (int col = lane * VALUES_PER_LANE; col < DIM; col += COLS_PER_ITER) {
++            float xv[VALUES_PER_LANE];
++            #pragma unroll
++            for (int i = 0; i < VALUES_PER_LANE; ++i) {
++                xv[i] = static_cast<float>(x[col + i]);
++            }
++            #pragma unroll
++            for (int row = 0; row < ROWS_PER_WARP; ++row) {
++                const auto* wrow = w + static_cast<long long>(row0 + row) * DIM;
++                #pragma unroll
++                for (int i = 0; i < VALUES_PER_LANE; ++i) {
++                    accum[row] += static_cast<float>(wrow[col + i]) * xv[i];
++                }
++            }
++        }
++
++        #pragma unroll
++        for (int row = 0; row < ROWS_PER_WARP; ++row) {
++            #pragma unroll
++            for (int offset = 16; offset > 0; offset >>= 1) {
++                accum[row] += __shfl_down_sync(0xffffffff, accum[row], offset);
++            }
++        }
++        if (lane == 0) {
++            #pragma unroll
++            for (int row = 0; row < ROWS_PER_WARP; ++row) {
++                logits_scratch[row0 + row] = accum[row];
++            }
++        }
++
++        __syncthreads();
++        __threadfence();
++        __syncthreads();
++        __shared__ int is_last;
++        if (tid == 0) {
++            unsigned int* counter = (unsigned int*)ctr_in;
++            unsigned int previous = atomicAdd(counter, 1u);
++            is_last = previous == static_cast<unsigned int>(NUM_BLOCKS - 1);
++        }
++        __syncthreads();
++        if (!is_last) return;
++
++        volatile float* logits = logits_scratch;
++        __shared__ unsigned char used[NEXP];
++        __shared__ float warp_values[WARPS];
++        __shared__ int warp_indices[WARPS];
++        __shared__ float selected_values[8];
++        __shared__ int selected_indices[8];
++        __shared__ float selected_exp[8];
++        __shared__ float selected_sum;
++
++        for (int expert = tid; expert < NEXP; expert += ROUTER_THREADS) {
++            used[expert] = 0;
++        }
++        __syncthreads();
++
++        #pragma unroll
++        for (int pick = 0; pick < 8; ++pick) {
++            float best = -3.402823466e+38F;
++            int best_idx = -1;
++            for (int expert = tid; expert < NEXP; expert += ROUTER_THREADS) {
++                if (!used[expert]) {
++                    float value = logits[expert];
++                    if (value > best || (value == best && expert < best_idx)) {
++                        best = value;
++                        best_idx = expert;
++                    }
++                }
++            }
++            #pragma unroll
++            for (int offset = 16; offset > 0; offset >>= 1) {
++                float other_value = __shfl_down_sync(0xffffffff, best, offset);
++                int other_idx = __shfl_down_sync(0xffffffff, best_idx, offset);
++                if (other_idx >= 0 &&
++                    (other_value > best ||
++                     (other_value == best && (best_idx < 0 || other_idx < best_idx)))) {
++                    best = other_value;
++                    best_idx = other_idx;
++                }
++            }
++            if (lane == 0) {
++                warp_values[warp] = best;
++                warp_indices[warp] = best_idx;
++            }
++            __syncthreads();
++            if (tid == 0) {
++                float block_best = warp_values[0];
++                int block_idx = warp_indices[0];
++                #pragma unroll
++                for (int candidate = 1; candidate < WARPS; ++candidate) {
++                    float value = warp_values[candidate];
++                    int index = warp_indices[candidate];
++                    if (index >= 0 &&
++                        (value > block_best ||
++                         (value == block_best && index < block_idx))) {
++                        block_best = value;
++                        block_idx = index;
++                    }
++                }
++                selected_values[pick] = block_best;
++                selected_indices[pick] = block_idx;
++                used[block_idx] = 1;
++            }
++            __syncthreads();
++        }
++
++        if (tid < 8) {
++            selected_exp[tid] = expf(selected_values[tid] - selected_values[0]);
++        }
++        __syncthreads();
++        if (tid == 0) {
++            float sum = 0.0f;
++            #pragma unroll
++            for (int i = 0; i < 8; ++i) sum += selected_exp[i];
++            selected_sum = sum + 1e-20f;
++        }
++        __syncthreads();
++        if (tid < 8) {
++            out_indices[tid] = selected_indices[tid];
++            out_scores[tid] = selected_exp[tid] / selected_sum;
++        }
++        __syncthreads();
++        if (tid == 0) {
++            atomicExch((unsigned int*)ctr_in, 0u);
++            __threadfence();
++        }
++    """
++    return mx.fast.cuda_kernel(
++        name=f"maple_fused_router_{profile.name}",
++        input_names=["x", "w", "ctr_in"],
++        output_names=["out_indices", "out_scores", "logits_scratch"],
++        source=source,
++    )
++
++
++def _make_cuda_router_select_kernel(profile):
++    """CUDA softmax/top-8/renorm over logits produced by MLX matmul.
++
++    Hopper and newer MLX matmuls may use an architecture-specific FP32/TF32
++    accumulation path. Reusing that exact GEMV preserves expert selection;
++    this kernel still collapses the remaining softmax and selection chain to
++    one dispatch.
++    """
++    source = """
++        constexpr int WARP_WIDTH = 32;
++        constexpr int WARPS = ROUTER_THREADS / WARP_WIDTH;
++        int tid = threadIdx.x;
++        int lane = tid & 31;
++        int warp = tid >> 5;
++
++        __shared__ unsigned char used[NEXP];
++        __shared__ float warp_values[WARPS];
++        __shared__ int warp_indices[WARPS];
++        __shared__ float selected_values[8];
++        __shared__ int selected_indices[8];
++        __shared__ float selected_exp[8];
++        __shared__ float selected_sum;
++
++        for (int expert = tid; expert < NEXP; expert += ROUTER_THREADS) {
++            used[expert] = 0;
++        }
++        __syncthreads();
++
++        #pragma unroll
++        for (int pick = 0; pick < 8; ++pick) {
++            float best = -3.402823466e+38F;
++            int best_idx = -1;
++            for (int expert = tid; expert < NEXP; expert += ROUTER_THREADS) {
++                if (!used[expert]) {
++                    float value = logits[expert];
++                    if (value > best ||
++                        (value == best && (best_idx < 0 || expert < best_idx))) {
++                        best = value;
++                        best_idx = expert;
++                    }
++                }
++            }
++            #pragma unroll
++            for (int offset = 16; offset > 0; offset >>= 1) {
++                float other_value = __shfl_down_sync(0xffffffff, best, offset);
++                int other_idx = __shfl_down_sync(0xffffffff, best_idx, offset);
++                if (other_idx >= 0 &&
++                    (other_value > best ||
++                     (other_value == best && (best_idx < 0 || other_idx < best_idx)))) {
++                    best = other_value;
++                    best_idx = other_idx;
++                }
++            }
++            if (lane == 0) {
++                warp_values[warp] = best;
++                warp_indices[warp] = best_idx;
++            }
++            __syncthreads();
++            if (tid == 0) {
++                float block_best = warp_values[0];
++                int block_idx = warp_indices[0];
++                #pragma unroll
++                for (int candidate = 1; candidate < WARPS; ++candidate) {
++                    float value = warp_values[candidate];
++                    int index = warp_indices[candidate];
++                    if (index >= 0 &&
++                        (value > block_best ||
++                         (value == block_best && index < block_idx))) {
++                        block_best = value;
++                        block_idx = index;
++                    }
++                }
++                selected_values[pick] = block_best;
++                selected_indices[pick] = block_idx;
++                used[block_idx] = 1;
++            }
++            __syncthreads();
++        }
++
++        if (tid < 8) {
++            selected_exp[tid] = expf(selected_values[tid] - selected_values[0]);
++        }
++        __syncthreads();
++        if (tid == 0) {
++            float sum = 0.0f;
++            #pragma unroll
++            for (int i = 0; i < 8; ++i) sum += selected_exp[i];
++            selected_sum = sum + 1e-20f;
++        }
++        __syncthreads();
++        if (tid < 8) {
++            // MLX argpartition returns its selected suffix from the smallest
++            // to the largest score. Preserve that order: expert aggregation
++            // is mathematically commutative, but its FP32 reduction is not.
++            int output_pick = 7 - tid;
++            out_indices[tid] = selected_indices[output_pick];
++            out_scores[tid] = selected_exp[output_pick] / selected_sum;
++        }
++    """
++    return mx.fast.cuda_kernel(
++        name=f"maple_router_select_{profile.name}",
++        input_names=["logits"],
++        output_names=["out_indices", "out_scores"],
++        source=source,
++    )
++
++
++_router_kernel_cache = {}
++_router_select_kernel_cache = {}
++
++
++def _get_router_select_kernel():
++    profile = _cuda_profile()
++    if profile is None or not profile.router_reference_gemv:
++        raise RuntimeError("router selection kernel requires a modern CUDA profile")
++    key = (profile.name, profile.router_threads)
++    kernel = _router_select_kernel_cache.get(key)
++    if kernel is None:
++        kernel = _router_select_kernel_cache[key] = _make_cuda_router_select_kernel(
++            profile
++        )
++    return kernel
++
++
++def _get_fused_router_kernel():
++    backend = _kernel_backend()
++    if backend == "metal":
++        key = (backend,)
++        make_kernel = _make_fused_router_kernel
++    elif backend == "cuda":
++        profile = _cuda_profile()
++        if profile is None:
++            raise RuntimeError("unsupported CUDA architecture")
++        key = (
++            backend,
++            profile.name,
++            profile.router_threads,
++            profile.router_rows_per_warp,
++        )
++
++        def make_kernel():
++            return _make_cuda_router_kernel(profile)
++
++    else:
++        raise RuntimeError("no fused router kernel for this backend")
++    kernel = _router_kernel_cache.get(key)
++    if kernel is None:
++        kernel = _router_kernel_cache[key] = make_kernel()
++    return kernel
+ 
+ 
+ class MapleGate(nn.Module):
+@@ -633,23 +1271,57 @@ class MapleGate(nn.Module):
+         self.weight = mx.zeros((args.num_experts, args.hidden_size))
+         self._router_ctr = None
+         self._fused = None  # None = unprobed, then True/False
++        self._fused_backend = None
+ 
+     def _fused_call(self, x):
++        backend = _kernel_backend()
++        profile = _cuda_profile() if backend == "cuda" else None
++        threads = profile.router_threads if profile is not None else 256
++        rows_per_warp = profile.router_rows_per_warp if profile is not None else 4
++        if profile is not None and profile.router_reference_gemv:
++            if self.top_k != 8:
++                raise ValueError("unsupported fused router top-k")
++            logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
++            inds, scores = _get_router_select_kernel()(
++                inputs=[logits.reshape(-1)],
++                template=[
++                    ("NEXP", self.num_experts),
++                    ("ROUTER_THREADS", threads),
++                ],
++                grid=(threads, 1, 1),
++                threadgroup=(threads, 1, 1),
++                output_shapes=[(8,), (8,)],
++                output_dtypes=[mx.int32, mx.float32],
++            )
++            self._fused_backend = backend
++            shape = x.shape[:-1] + (self.top_k,)
++            return inds.reshape(shape), scores.reshape(shape)
++        block_rows = threads // 32 * rows_per_warp
++        if self.top_k != 8 or self.num_experts % block_rows or self.hidden_size % 128:
++            raise ValueError("unsupported fused router dimensions")
+         if self._router_ctr is None:
+             self._router_ctr = mx.zeros((8,), dtype=mx.uint32)
+             mx.eval(self._router_ctr)
+-        inds, scores, _ = _fused_router_kernel(
++        grid_size = (
++            (self.num_experts // 32) * 256
++            if backend == "metal"
++            else _cuda_router_grid_size(self.num_experts, profile)
++        )
++        inds, scores, _ = _get_fused_router_kernel()(
+             inputs=[x.reshape(-1), self.weight, self._router_ctr],
+             template=[
+                 ("T_", self.weight.dtype),
+                 ("NEXP", self.num_experts),
+                 ("DIM", self.hidden_size),
++                ("ROUTER_THREADS", threads),
++                ("ROWS_PER_WARP", rows_per_warp),
+             ],
+-            grid=((self.num_experts // 32) * 256, 1, 1),
+-            threadgroup=(256, 1, 1),
++            grid=(grid_size, 1, 1),
++            threadgroup=(threads, 1, 1),
+             output_shapes=[(8,), (8,), (self.num_experts,)],
+             output_dtypes=[mx.int32, mx.float32, mx.float32],
+         )
++        self._fused_backend = backend
+         shape = x.shape[:-1] + (self.top_k,)
+         return inds.reshape(shape), scores.reshape(shape)
+ 
+@@ -670,10 +1342,18 @@ class MapleGate(nn.Module):
+             mx.eval(inds, scores, ref_inds, ref_scores)
+         except Exception:
+             return False
+-        return (
+-            inds.shape == ref_inds.shape
+-            and bool(mx.all((inds >= 0) & (inds < self.num_experts)))
+-            and bool(mx.allclose(mx.sort(scores), mx.sort(ref_scores), atol=1e-5))
++        valid = inds.shape == ref_inds.shape and bool(
++            mx.all((inds >= 0) & (inds < self.num_experts))
++        )
++        profile = _cuda_profile() if _kernel_backend() == "cuda" else None
++        if profile is not None and profile.router_reference_gemv:
++            return (
++                valid
++                and bool(mx.array_equal(inds, ref_inds))
++                and bool(mx.allclose(scores, ref_scores, atol=1e-5))
++            )
++        return valid and bool(
++            mx.allclose(mx.sort(scores), mx.sort(ref_scores), atol=1e-5)
+         )
+ 
+     def __call__(self, x):
+@@ -1039,8 +1719,8 @@ class Model(nn.Module):
+ 
+         # Stack per-expert weights from the Hugging Face layout into the
+         # SwitchGLU layout. Already-converted checkpoints pass through.
+-        for l in range(self.args.num_hidden_layers):
+-            prefix = f"model.layers.{l}"
++        for layer_idx in range(self.args.num_hidden_layers):
++            prefix = f"model.layers.{layer_idx}"
+             for m in ["gate_proj", "down_proj", "up_proj"]:
+                 for k in ["weight", "scales", "biases", "bias"]:
+                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+diff --git a/tests/test_maple_kernels.py b/tests/test_maple_kernels.py
+index 6e232ba..2c7767c 100644
+--- a/tests/test_maple_kernels.py
++++ b/tests/test_maple_kernels.py
+@@ -9,7 +9,13 @@ is off on this machine", not "the model is broken". A precision failure does
+ mean the model is wrong.
+ """
+ 
++import json
++import subprocess
++import sys
++import tempfile
+ import unittest
++from pathlib import Path
++from unittest import mock
+ 
+ import mlx.core as mx
+ import numpy as np
+@@ -32,6 +38,146 @@ def _args(**kw):
+ 
+ 
+ class TestMapleKernels(unittest.TestCase):
++    def test_benchmark_source_sha_falls_back_outside_a_git_checkout(self):
++        """Disposable source bundles must retain their pinned provenance."""
++        from benchmarks import maple_kernel_benchmark as benchmark
++
++        failure = subprocess.CalledProcessError(128, ["git", "rev-parse", "HEAD"])
++        with mock.patch.object(benchmark.subprocess, "run", side_effect=failure):
++            with mock.patch.dict(
++                benchmark.os.environ, {"MAPLE_SOURCE_SHA": "pinned-source"}
++            ):
++                self.assertEqual(benchmark._git_sha(), "pinned-source")
++
++    def test_kernel_benchmark_cli_smoke(self):
++        """The CLI must emit one environment and every kernel result record."""
++        backend = maple._kernel_backend()
++        if backend is None or (backend == "cuda" and maple._cuda_profile() is None):
++            self.skipTest("custom kernel backend unavailable")
++        root = Path(__file__).resolve().parents[1]
++        with tempfile.TemporaryDirectory() as temp_dir:
++            output = Path(temp_dir) / "results.jsonl"
++            completed = subprocess.run(
++                [
++                    sys.executable,
++                    "benchmarks/maple_kernel_benchmark.py",
++                    "--output",
++                    str(output),
++                    "--warmup",
++                    "1",
++                    "--trials",
++                    "2",
++                ],
++                cwd=root,
++                text=True,
++                capture_output=True,
++            )
++            self.assertEqual(
++                completed.returncode, 0, completed.stdout + completed.stderr
++            )
++            records = [json.loads(line) for line in output.read_text().splitlines()]
++        self.assertEqual(sum(r["type"] == "environment" for r in records), 1)
++        results = {r["kernel"] for r in records if r["type"] == "result"}
++        self.assertEqual(
++            results,
++            {"add_rms_norm", "qk_norm_rope", "qk_norm_nope", "router"},
++        )
++
++    def test_cuda_elementwise_sweep_cli_smoke(self):
++        """Every supported block-size candidate must run through the CLI."""
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        root = Path(__file__).resolve().parents[1]
++        with tempfile.TemporaryDirectory() as temp_dir:
++            output = Path(temp_dir) / "results.jsonl"
++            completed = subprocess.run(
++                [
++                    sys.executable,
++                    "benchmarks/maple_elementwise_sweep.py",
++                    "--output",
++                    str(output),
++                    "--warmup",
++                    "1",
++                    "--trials",
++                    "2",
++                    "--stress-dispatches",
++                    "2",
++                ],
++                cwd=root,
++                text=True,
++                capture_output=True,
++            )
++            self.assertEqual(
++                completed.returncode, 0, completed.stdout + completed.stderr
++            )
++            records = [json.loads(line) for line in output.read_text().splitlines()]
++        candidates = {
++            record["threads"] for record in records if record.get("status") == "ok"
++        }
++        self.assertEqual(candidates, {64, 128, 256, 512})
++
++    def test_cuda_architecture_profiles(self):
++        """Known generations must map to their tuned profile floors."""
++        expected = {
++            (8, 6): ("sm86", 256, 128, 2, False),
++            (8, 9): ("sm89", 512, 128, 1, False),
++            (9, 0): ("sm90", 512, 512, 1, True),
++            (10, 0): ("sm100", 512, 512, 1, True),
++            (12, 0): ("sm120", 512, 256, 1, True),
++            (13, 0): ("future", 128, 256, 4, True),
++        }
++        for capability, (
++            name,
++            elementwise_threads,
++            router_threads,
++            rows_per_warp,
++            reference_gemv,
++        ) in expected.items():
++            with self.subTest(capability=capability):
++                profile = maple._cuda_profile_for_capability(capability)
++                self.assertIsNotNone(profile)
++                self.assertEqual(profile.name, name)
++                self.assertEqual(profile.elementwise_threads, elementwise_threads)
++                self.assertEqual(profile.router_threads, router_threads)
++                self.assertEqual(profile.router_rows_per_warp, rows_per_warp)
++                self.assertEqual(profile.router_reference_gemv, reference_gemv)
++        self.assertIsNone(maple._cuda_profile_for_capability((8, 0)))
++
++    def test_cuda_router_launch_covers_every_expert(self):
++        """Every tuned launch must produce exactly one row for every expert."""
++        for threads in (64, 128, 256, 512):
++            for rows_per_warp in (1, 2, 4, 8):
++                profile = maple._CudaProfile(
++                    "test",
++                    router_threads=threads,
++                    router_rows_per_warp=rows_per_warp,
++                )
++                with self.subTest(threads=threads, rows_per_warp=rows_per_warp):
++                    grid = maple._cuda_router_grid_size(256, profile)
++                    block_rows = threads // 32 * rows_per_warp
++                    self.assertEqual(grid // threads * block_rows, 256)
++
++    def test_scaled_rope_does_not_use_the_unscaled_cuda_kernel(self):
++        """A scaling policy unsupported by the JIT kernel must stay portable."""
++        args = _args(
++            num_hidden_layers=1,
++            layer_types=["sliding_attention"],
++            rope_scaling={"type": "linear", "factor": 2.0},
++        )
++        attention = maple.MapleAttention(args, 0)
++        self.assertFalse(attention._can_fuse_qk)
++
++    def test_kernel_factories_are_lazy(self):
++        """A fresh import must not construct a backend-specific kernel."""
++        code = """
++from mlx_lm.models import maple
++assert maple._add_rms_kernel_cache == {}
++assert maple._qk_kernel_cache == {}
++assert maple._router_kernel_cache == {}
++assert maple._router_select_kernel_cache == {}
++"""
++        subprocess.run([sys.executable, "-c", code], check=True)
++
+     def test_fused_router_matches_reference(self):
+         """Fused router (gemv+softmax+top8) vs the pure-MLX path."""
+         args = _args()
+@@ -41,8 +187,11 @@ class TestMapleKernels(unittest.TestCase):
+         ).astype(mx.bfloat16)
+         mx.eval(gate.weight)
+         x0 = (mx.random.normal((1, 1, args.hidden_size)) * 0.5).astype(mx.bfloat16)
+-        if not gate._probe(x0):
++        backend = maple._kernel_backend()
++        if backend is None or (backend == "cuda" and maple._cuda_profile() is None):
+             self.skipTest("fused router disabled on this build")
++        self.assertTrue(gate._probe(x0), f"{backend} router failed its live probe")
++        self.assertEqual(gate._fused_backend, backend)
+ 
+         set_matches = 0
+         trials = 32
+@@ -69,6 +218,106 @@ class TestMapleKernels(unittest.TestCase):
+         # expert; that is legitimate, but it must be rare.
+         self.assertGreater(set_matches, trials * 0.75)
+ 
++    def test_fused_router_counter_resets_across_dispatches(self):
++        """Every dispatch must elect one last block and start the next at zero."""
++        backend = maple._kernel_backend()
++        if backend is None or (backend == "cuda" and maple._cuda_profile() is None):
++            self.skipTest("fused router disabled on this build")
++        args = _args(num_experts=256)
++        gate = maple.MapleGate(args)
++        mx.random.seed(17)
++        gate.weight = (
++            mx.random.normal((args.num_experts, args.hidden_size)) * 0.05
++        ).astype(mx.bfloat16)
++        mx.eval(gate.weight)
++
++        for dispatch in range(128):
++            x = (
++                mx.random.normal((1, 1, args.hidden_size)) * 0.5 + dispatch / 1024.0
++            ).astype(mx.bfloat16)
++            inds, scores = gate._fused_call(x)
++            ref_inds, ref_scores = gate._reference(x)
++            mx.eval(inds, scores, ref_inds, ref_scores)
++            self.assertEqual(gate._fused_backend, backend)
++            self.assertTrue(bool(mx.all((inds >= 0) & (inds < args.num_experts))))
++            self.assertTrue(
++                bool(
++                    mx.allclose(
++                        mx.sort(scores), mx.sort(ref_scores), rtol=1e-5, atol=1e-5
++                    )
++                ),
++                f"dispatch {dispatch} produced stale or incomplete scores",
++            )
++
++    def test_cuda_router_reference_gemv_profile_matches_portable_selection(self):
++        """Modern profiles may fuse selection while retaining MLX matmul logits."""
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        previous = maple._cuda_profile_cache
++        profile = maple._cuda_profile()
++        maple._cuda_profile_cache = maple._CudaProfile(
++            "test_reference_gemv",
++            elementwise_threads=profile.elementwise_threads,
++            router_threads=256,
++            router_rows_per_warp=4,
++            router_reference_gemv=True,
++        )
++        try:
++            args = _args(num_experts=256)
++            gate = maple.MapleGate(args)
++            mx.random.seed(190)
++            gate.weight = (
++                mx.random.normal((args.num_experts, args.hidden_size)) * 0.05
++            ).astype(mx.bfloat16)
++            x = (mx.random.normal((1, 1, args.hidden_size)) * 0.5).astype(mx.bfloat16)
++            indices, scores = gate._fused_call(x)
++            ref_indices, ref_scores = gate._reference(x)
++            mx.eval(indices, scores, ref_indices, ref_scores)
++            self.assertEqual(
++                list(map(int, indices.reshape(-1))),
++                list(map(int, ref_indices.reshape(-1))),
++                "selection must preserve argpartition order for deterministic "
++                "expert aggregation",
++            )
++            self.assertTrue(
++                bool(mx.allclose(scores, ref_scores, rtol=1e-5, atol=1e-5)),
++                "selection scores must remain within the routing tolerance",
++            )
++        finally:
++            maple._cuda_profile_cache = previous
++
++    def test_modern_cuda_router_probe_rejects_reordered_experts(self):
++        """The live guard must enforce the aggregation order on modern GPUs."""
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        previous = maple._cuda_profile_cache
++        profile = maple._cuda_profile()
++        maple._cuda_profile_cache = maple._CudaProfile(
++            "test_reference_gemv_probe",
++            elementwise_threads=profile.elementwise_threads,
++            router_threads=256,
++            router_rows_per_warp=1,
++            router_reference_gemv=True,
++        )
++        try:
++            args = _args(num_experts=256)
++            gate = maple.MapleGate(args)
++            mx.random.seed(191)
++            gate.weight = (
++                mx.random.normal((args.num_experts, args.hidden_size)) * 0.05
++            ).astype(mx.bfloat16)
++            x = (mx.random.normal((1, 1, args.hidden_size)) * 0.5).astype(mx.bfloat16)
++            ref_indices, ref_scores = gate._reference(x)
++            reverse = mx.array([7, 6, 5, 4, 3, 2, 1, 0])
++            reordered = (
++                mx.take(ref_indices, reverse, axis=-1),
++                mx.take(ref_scores, reverse, axis=-1),
++            )
++            with mock.patch.object(gate, "_fused_call", return_value=reordered):
++                self.assertFalse(gate._probe(x))
++        finally:
++            maple._cuda_profile_cache = previous
++
+     def test_router_logits_are_float32(self):
+         """Routing must not round the expert logits to bf16.
+ 
+@@ -123,11 +372,17 @@ class TestMapleKernels(unittest.TestCase):
+         w = (mx.random.normal((dim,)) * 0.1 + 1.0).astype(mx.bfloat16)
+         x = (mx.random.normal((1, 1, dim)) * 0.5).astype(mx.bfloat16)
+         r = (mx.random.normal((1, 1, dim)) * 0.5).astype(mx.bfloat16)
+-        if not maple._add_rms_norm_ok(dim, mx.bfloat16, w, eps):
++        backend = maple._kernel_backend()
++        if backend is None or (backend == "cuda" and maple._cuda_profile() is None):
+             self.skipTest("fused add+norm disabled on this build")
++        self.assertTrue(
++            maple._add_rms_norm_ok(dim, mx.bfloat16, w, eps),
++            f"{backend} add+norm fast path failed its live comparison",
++        )
+ 
+         h, hn = maple._add_rms_norm(x, r, w, eps)
+         mx.eval(h, hn)
++        self.assertEqual(maple._last_add_rms_backend, backend)
+         # The residual stream must be rounded exactly once, like a bf16 add.
+         self.assertTrue(mx.array_equal(h, x + r), "residual add is not bit-exact")
+         ref = mx.fast.rms_norm(
+@@ -139,49 +394,86 @@ class TestMapleKernels(unittest.TestCase):
+         self.assertTrue(
+             np.allclose(got, want, rtol=8e-3), f"max |d| {np.abs(got - want).max()}"
+         )
++        if backend == "cuda":
++            self.assertTrue(mx.array_equal(hn, ref), "CUDA BF16 norm must be exact")
++            weight32 = w.astype(mx.float32)
++            _, norm32 = maple._add_rms_norm(x, r, weight32, eps)
++            ref32 = mx.fast.rms_norm((x + r).astype(mx.float32), weight32, eps).astype(
++                mx.bfloat16
++            )
++            mx.eval(norm32, ref32)
++            self.assertTrue(
++                mx.array_equal(norm32, ref32),
++                "CUDA kernel cache aliased BF16 and FP32 weights",
++            )
++
++    def test_add_rms_norm_rejects_unsupported_dimension_before_compile(self):
++        """A partial CUDA block must never read or write past an odd width."""
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        dim, eps = 1537, 1e-6
++        w = mx.ones((dim,), dtype=mx.bfloat16)
++        cached = set(maple._add_rms_kernel_cache)
++        self.assertFalse(maple._add_rms_norm_ok(dim, mx.bfloat16, w, eps))
++        self.assertEqual(set(maple._add_rms_kernel_cache), cached)
+ 
+     def test_qk_norm_rope_matches_reference(self):
+         """Fused per-head norm + partial RoPE vs q_norm/k_norm + mx.fast.rope,
+         on both the RoPE and the NoPE layer type."""
++        backend = maple._kernel_backend()
++        if backend is None or (backend == "cuda" and maple._cuda_profile() is None):
++            self.skipTest("Q/K custom kernel unavailable on this backend")
+         for layer_type in ("sliding_attention", "full_attention"):
+-            args = _args(num_hidden_layers=1, layer_types=[layer_type])
+-            attn = maple.MapleAttention(args, 0)
+-            n = args.num_attention_heads + args.num_key_value_heads
+-            attn.q_norm.weight = (
+-                mx.random.normal((args.head_dim,)) * 0.1 + 1.0
+-            ).astype(mx.bfloat16)
+-            attn.k_norm.weight = (
+-                mx.random.normal((args.head_dim,)) * 0.1 + 1.0
+-            ).astype(mx.bfloat16)
+-            qk = (mx.random.normal((n, args.head_dim)) * 0.5).astype(mx.bfloat16)
+-            mx.eval(attn.parameters(), qk)
+-
+-            # A position well past the sliding window, so a rotation that
+-            # ignores the offset cannot pass.
+-            got, want = attn._qk_fused(qk, 613), attn._qk_reference(qk, 613)
+-            mx.eval(got, want)
+-            self.assertEqual(got.dtype, mx.bfloat16, layer_type)
+-            g = np.array(got.astype(mx.float32))
+-            w = np.array(want.astype(mx.float32))
+-            self.assertTrue(
+-                np.allclose(g, w, rtol=8e-3, atol=8e-3),
+-                f"{layer_type}: max |d| {np.abs(g - w).max()}",
+-            )
++            for weight_dtype in (mx.bfloat16, mx.float32):
++                args = _args(num_hidden_layers=1, layer_types=[layer_type])
++                attn = maple.MapleAttention(args, 0)
++                n = args.num_attention_heads + args.num_key_value_heads
++                attn.q_norm.weight = (
++                    mx.random.normal((args.head_dim,)) * 0.1 + 1.0
++                ).astype(weight_dtype)
++                attn.k_norm.weight = (
++                    mx.random.normal((args.head_dim,)) * 0.1 + 1.0
++                ).astype(weight_dtype)
++                qk = (mx.random.normal((n, args.head_dim)) * 0.5).astype(mx.bfloat16)
++                mx.eval(attn.parameters(), qk)
++
++                for offset in (0, 7, 511, 613):
++                    with self.subTest(
++                        layer_type=layer_type,
++                        weight_dtype=weight_dtype,
++                        offset=offset,
++                    ):
++                        got = attn._qk_fused(qk, offset)
++                        want = attn._qk_reference(qk, offset)
++                        mx.eval(got, want)
++                        self.assertEqual(attn._fused_qk_backend, backend)
++                        self.assertEqual(got.dtype, mx.bfloat16)
++                        g = np.array(got.astype(mx.float32))
++                        w = np.array(want.astype(mx.float32))
++                        self.assertTrue(
++                            np.allclose(g, w, rtol=8e-3, atol=8e-3),
++                            f"max |d| {np.abs(g - w).max()}",
++                        )
++                        if backend == "cuda":
++                            self.assertTrue(
++                                mx.array_equal(got, want),
++                                "CUDA fused Q/K must preserve the reference rounding; "
++                                f"layer_type={layer_type}, weight_dtype={weight_dtype}, "
++                                f"offset={offset}, mismatches={(g != w).sum()}, "
++                                f"max |d|={np.abs(g - w).max()}",
++                            )
+ 
+     def test_probe_rejects_a_mismatched_kernel(self):
+-        """The self-check must latch the fallback rather than ship garbage.
+-
+-        Norm weights in a dtype the kernel was not templated for are the
+-        realistic case: the kernel reinterprets the buffer and the output is
+-        silently wrong, so only a value check catches it.
+-        """
++        """The self-check must latch the fallback rather than ship garbage."""
++        if maple._kernel_backend() != "metal":
++            self.skipTest("covers the Metal live-probe path")
+         args = _args(num_hidden_layers=1, layer_types=["sliding_attention"])
+-        attn = maple.MapleAttention(args, 0)  # q_norm/k_norm default to float32
++        attn = maple.MapleAttention(args, 0)
+         qk = (mx.random.normal((20, args.head_dim)) * 0.5).astype(mx.bfloat16)
+         mx.eval(attn.parameters(), qk)
+         self.assertFalse(
+             maple._matches(
+-                lambda: (attn._qk_fused(qk, 7),),
++                lambda: (mx.zeros_like(qk),),
+                 lambda: (attn._qk_reference(qk, 7),),
+             )
+         )
+@@ -215,7 +507,8 @@ class TestMapleKernels(unittest.TestCase):
+         fast = decode(None)
+         if not model.model._fused_add_norm:
+             self.skipTest("fused decode disabled on this build")
+-        self.assertTrue(all(l.self_attn._fused_qk for l in model.layers))
++        if not all(layer.self_attn._fused_qk for layer in model.layers):
++            self.skipTest("Q/K fused decode disabled on this build")
+         slow = decode(False)
+         self.assertEqual(int(fast.argmax()), int(slow.argmax()), "argmax differs")
+         self.assertTrue(
