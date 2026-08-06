@@ -28,12 +28,28 @@ instance; displayed tok/s values are arithmetic means.
 
 The cached-LHS mode is exact in these runs but remains opt-in: its cache is
 process-global and keyed only by top-k. The conservative source default is the
-exact-probed fused Q/K path alone. Historical `sm86` results remain in
+exact-probed fused Q/K path alone.
+
+### Historical RTX 3090 / `sm86` result
+
+The earlier accepted `sm86` validation remains published. It is shown
+separately because it used fewer pairs on a shared host with an active
+co-tenant, rather than the later 12-process single-device campaign; its
+absolute throughput is therefore not directly comparable with the fresh table.
+
+| Strict configuration | Portable MLX | Strict | Paired gain | 95% CI | Pairs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Exact Q/K default | 179.39 tok/s | **195.27 tok/s** | **+8.51%** | +0.90%–+16.70% | 8 |
+| Q/K + cached decode LHS | 177.56 tok/s | **209.58 tok/s** | **+18.28%** | +5.18%–+33.00% | 6 |
+
+The 3090 run passed its array-exact, random 1024-token, and fixed 20-case
+512/1024-token gates. The small-n intervals are exploratory after tuning and
+have no multiple-testing correction. Full retained records are indexed by
 [`results/summary.csv`](results/summary.csv).
 
 ### Exactness gate
 
-For every target, the release gate required:
+For each of the four fresh multiarchitecture targets, the release gate required:
 
 - shape, dtype, and value equality through `mx.array_equal` for live fused
   outputs, with all 24 Q/K layers active and no silent fallback;
