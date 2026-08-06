@@ -23,6 +23,8 @@ git checkout eba96c16158f032821b0bf374ea1421cfddef0a9
 git apply --check /path/to/mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.patch
 git apply /path/to/mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.patch
 cp -R /path/to/mlx-maple-cuda-kernels/benchmarks/. benchmarks/
+mkdir -p tests/data
+cp /path/to/mlx-maple-cuda-kernels/tests/data/sm100_qk_rope_boundary.npz tests/data/
 
 uv venv --python 3.12
 source .venv/bin/activate
