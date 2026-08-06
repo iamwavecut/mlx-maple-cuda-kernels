@@ -14,6 +14,8 @@
   snapshots.
 - Published the current warm `sm86` measurements: 195.27 tok/s conservative
   Q/K default and 209.58 tok/s Q/K + cached-LHS profile.
+- Added a pinned canonical NVIDIA inference QuickStart and exact-head entry
+  point that asserts the patched model source and reports active/fallback state.
 - Archived the initial 256-token multi-architecture results as superseded
   historical evidence pending fresh `sm89`-`sm120` validation.
 

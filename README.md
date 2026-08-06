@@ -112,6 +112,8 @@ speedup.
   fallback tests, architecture profiles, dependency/race checks, and defaults.
 - [`benchmarks/`](benchmarks): correctness, common-slice, factorial, tuning,
   router, and ternary harnesses, plus a pinned fixed-slice input generator.
+- [`examples/nvidia_generate.py`](examples/nvidia_generate.py): canonical
+  exact-head NVIDIA inference entry point with source and path-state checks.
 - [`results/`](results): sanitized trials, paired statistics, and superseded
   initial-port results retained as historical evidence.
 
@@ -119,33 +121,83 @@ The frozen laboratory implementation is commit
 `b3d03fb19b522f307d0df7ba2ea347711a2ee337`; published `src/maple.py` has
 SHA-256 `7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae`.
 
-## Quick start
+## NVIDIA QuickStart (canonical strict inference)
 
-See [`docs/integration.md`](docs/integration.md) for the complete pinned
-workflow. In short:
+This path uses the patched package implementation, the exact LM head, no KV
+quantization, and only fail-closed strict-auto kernels. It is the recommended
+starting point for NVIDIA inference. Current exactness and performance evidence
+is limited to `sm86`; other CUDA architectures may fall back safely but need
+fresh validation before making strict/performance claims. Prerequisites are a
+host supported by an MLX CUDA wheel, an NVIDIA GPU with enough memory for the
+checkpoint, Git, and [uv](https://docs.astral.sh/uv/).
+
+### 1. Pin, patch, and install
 
 ```bash
+git clone https://github.com/iamwavecut/mlx-maple-cuda-kernels.git
 git clone https://github.com/deepgrove-ai/mlx-lm-deepgrove.git
 cd mlx-lm-deepgrove
 git checkout eba96c16158f032821b0bf374ea1421cfddef0a9
-git apply --check /path/to/mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.patch
-git apply /path/to/mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.patch
-cp -R /path/to/mlx-maple-cuda-kernels/benchmarks/. benchmarks/
+git apply --check ../mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.patch
+git apply ../mlx-maple-cuda-kernels/patches/mlx-lm-deepgrove-maple-cuda.patch
+
 uv venv --python 3.12
-uv pip install -e '.[cuda12]' rich pytest
-python benchmarks/prepare_maple_common_slice.py
+source .venv/bin/activate
+uv pip install -e '.[cuda12]' rich huggingface_hub
+
+hf download deepgrove/maple-preview-2bit-mlx \
+  --revision 361db5da5e74ff6fcdd852d478e1f266ce11013a \
+  --local-dir ./maple-preview-2bit-mlx
 ```
 
-Load the package implementation rather than the checkpoint-local model:
+Use `.[cuda13]` instead of `.[cuda12]` only when that is the appropriate MLX
+wheel for the host. The published campaign used MLX/MLX-CUDA 0.32.0, but did not
+record enough runtime/driver telemetry to extend its validation claim across
+CUDA wheel variants.
 
-```python
-from mlx_lm import load
+### 2. Set the process profile
 
-model, tokenizer = load(
-    model_path,
-    model_config={"model_file": None, "use_flash_head": False},
-)
+Set these variables before Python starts and before the first CUDA operation:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export MLX_CUDA_USE_CUDNN_SDPA=0
+export MLX_USE_CUDA_GRAPHS=1
+export MLX_CUDA_GRAPH_CACHE_SIZE=400
+export MLX_MAX_OPS_PER_BUFFER=100
+export MLX_MAX_MB_PER_BUFFER=100
 ```
+
+`MLX_CUDA_USE_CUDNN_SDPA=0` is part of the deterministic exactness contract,
+not a credited kernel speedup.
+
+### 3. Generate
+
+From the patched `mlx-lm-deepgrove` checkout:
+
+```bash
+python ../mlx-maple-cuda-kernels/examples/nvidia_generate.py \
+  --model ./maple-preview-2bit-mlx \
+  --prompt "Write a haiku about a maple grove." \
+  --max-tokens 256
+```
+
+The entry point deliberately passes
+`model_config={"model_file": None, "use_flash_head": False}`, asserts that the
+loaded class comes from the patched package rather than checkpoint-local Python,
+uses greedy exact-head generation, and prints `strict_path_state` after the
+run. On an unsupported policy or failed exact probe, Q/K reports a portable
+fallback rather than silently using a non-exact kernel. A decode-reaching run
+on the validated `sm86` profile should report 24 active Q/K layers; `False` is a
+safe fallback, while `None` means that layer did not reach a single-token probe.
+
+For the opt-in warm, single-device `B=1`, `L=1`, top-8 workload only, add
+`--cached-lhs`. Its cache is process-global and keyed only by top-k, so do not
+use that option when switching devices or models in one process. It remains off
+by default because its isolated speed effect was inconclusive.
+
+See [`docs/integration.md`](docs/integration.md) for patch verification, tests,
+benchmark reproduction, and the fixed-slice input generator.
 
 ## Known limitations
 
