@@ -155,32 +155,27 @@ wheel for the host. The published campaign used MLX/MLX-CUDA 0.32.0, but did not
 record enough runtime/driver telemetry to extend its validation claim across
 CUDA wheel variants.
 
-### 2. Set the process profile
+### 2. Generate
 
-Set these variables before Python starts and before the first CUDA operation:
-
-```bash
-export CUDA_VISIBLE_DEVICES=0
-export MLX_CUDA_USE_CUDNN_SDPA=0
-export MLX_USE_CUDA_GRAPHS=1
-export MLX_CUDA_GRAPH_CACHE_SIZE=400
-export MLX_MAX_OPS_PER_BUFFER=100
-export MLX_MAX_MB_PER_BUFFER=100
-```
-
-`MLX_CUDA_USE_CUDNN_SDPA=0` is part of the deterministic exactness contract,
-not a credited kernel speedup.
-
-### 3. Generate
-
-From the patched `mlx-lm-deepgrove` checkout:
+From the patched `mlx-lm-deepgrove` checkout, apply the recommended process
+profile directly to the inference command:
 
 ```bash
+MLX_CUDA_USE_CUDNN_SDPA=0 \
+MLX_USE_CUDA_GRAPHS=1 \
+MLX_CUDA_GRAPH_CACHE_SIZE=400 \
+MLX_MAX_OPS_PER_BUFFER=100 \
+MLX_MAX_MB_PER_BUFFER=100 \
 python ../mlx-maple-cuda-kernels/examples/nvidia_generate.py \
   --model ./maple-preview-2bit-mlx \
   --prompt "Write a haiku about a maple grove." \
   --max-tokens 256
 ```
+
+The example intentionally leaves GPU visibility and selection to the caller.
+The inline variables apply only to this process and are set before its first
+CUDA operation. `MLX_CUDA_USE_CUDNN_SDPA=0` is part of the deterministic
+exactness contract, not a credited kernel speedup.
 
 The entry point deliberately passes
 `model_config={"model_file": None, "use_flash_head": False}`, asserts that the
