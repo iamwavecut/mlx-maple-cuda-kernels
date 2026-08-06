@@ -13,38 +13,31 @@ off by default.
 
 ## Strict multi-architecture result
 
-All four fresh NVIDIA targets passed the same deterministic strict methodology
-under architecture-bound sealed campaign revisions.
+Four fresh NVIDIA targets passed the same deterministic strict methodology
+under architecture-bound sealed campaign revisions. The earlier accepted RTX
+3090 result is retained in the same table and marked as historical.
 Values are warm `B=1`, `L=1`, 128-token prompt / 512-token decode throughput.
-Ratios are paired geometric means over 12 fresh model processes on one device
-instance; displayed tok/s values are arithmetic means.
+For the four fresh rows, ratios are paired geometric means over 12 fresh model
+processes on one device instance; displayed tok/s values are arithmetic means.
 
 | GPU | CC | Portable | Exact Q/K default | Paired gain (95% CI) | Q/K + cached-LHS opt-in |
 | --- | --- | ---: | ---: | ---: | ---: |
+| RTX 3090† | `sm86` | 179.39 | **195.27** | **+8.51%** (+0.90%–+16.70%) | 209.58, **+18.28%** |
 | RTX 4090 | `sm89` | 182.36 | **209.84** | **+15.31%** (+11.29%–+19.49%) | 214.66, **+18.01%** |
 | H100 80GB HBM3 | `sm90` | 202.62 | **233.67** | **+15.24%** (+12.86%–+17.66%) | 246.34, **+21.54%** |
 | B200 | `sm100` | 241.51 | **280.70** | **+16.28%** (+14.23%–+18.37%) | 297.47, **+23.37%** |
 | RTX 5090 | `sm120` | 398.49 | **429.72** | **+7.84%** (+6.88%–+8.81%) | 438.01, **+9.92%** |
 
+† The RTX 3090 row is accepted historical evidence from a shared host with an
+active co-tenant: Q/K used 8 pairs and cached LHS used 6, rather than the later
+12-process design. Its cached-LHS gain uses its own 177.56 tok/s portable
+baseline. It passed the array-exact, random 1024-token, and fixed 20-case
+512/1024-token gates; its small-n intervals are exploratory after tuning and
+have no multiple-testing correction.
+
 The cached-LHS mode is exact in these runs but remains opt-in: its cache is
 process-global and keyed only by top-k. The conservative source default is the
-exact-probed fused Q/K path alone.
-
-### Historical RTX 3090 / `sm86` result
-
-The earlier accepted `sm86` validation remains published. It is shown
-separately because it used fewer pairs on a shared host with an active
-co-tenant, rather than the later 12-process single-device campaign; its
-absolute throughput is therefore not directly comparable with the fresh table.
-
-| Strict configuration | Portable MLX | Strict | Paired gain | 95% CI | Pairs |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Exact Q/K default | 179.39 tok/s | **195.27 tok/s** | **+8.51%** | +0.90%–+16.70% | 8 |
-| Q/K + cached decode LHS | 177.56 tok/s | **209.58 tok/s** | **+18.28%** | +5.18%–+33.00% | 6 |
-
-The 3090 run passed its array-exact, random 1024-token, and fixed 20-case
-512/1024-token gates. The small-n intervals are exploratory after tuning and
-have no multiple-testing correction. Full retained records are indexed by
+exact-probed fused Q/K path alone. Full retained records are indexed by
 [`results/summary.csv`](results/summary.csv).
 
 ### Exactness gate
