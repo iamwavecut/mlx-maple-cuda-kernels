@@ -1,0 +1,407 @@
+{
+  "acceleration_eligible": true,
+  "acceleration_state": "active",
+  "campaign_manifest_sha256": "b191ab1ef17b1c915117a07e479776e4c8f0778d6fa6663e9cafef9b945eb9e8",
+  "correctness": {
+    "common": {
+      "1024": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      },
+      "512": {
+        "all_exact": true,
+        "cases": 20,
+        "strict_path_state": {
+          "add_rms_norm": false,
+          "approximate_add_rms": false,
+          "approximate_router": false,
+          "cached_decode_lhs": true,
+          "qk_norm": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "router": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "router_indices_uint32": false,
+          "ternary_up_gate": false
+        }
+      }
+    },
+    "factor_token_hash_count": 1,
+    "multi_seed": {
+      "all_cases_exact": true,
+      "cases": 3,
+      "type": "summary"
+    },
+    "random_1024": true,
+    "w2_stock_projections": 144
+  },
+  "correctness_pass": true,
+  "device": {
+    "architecture": "sm_86",
+    "compute_capability_major": 8,
+    "compute_capability_minor": 6,
+    "device_name": "NVIDIA GeForce RTX 3090",
+    "total_memory": 25769803776
+  },
+  "failures": [],
+  "hardware": {
+    "compute_capability": "8.6",
+    "driver_version": "580.159.03",
+    "max_memory_clock_mhz": "9751",
+    "max_sm_clock_mhz": "2100",
+    "memory_total_mib": "24576",
+    "name": "NVIDIA GeForce RTX 3090",
+    "power_limit_w": "350.00"
+  },
+  "mlx": "0.32.0",
+  "mlx_cuda": "0.32.0",
+  "model_manifest_sha256": "f376857c2abbeac99140012656f28e8e91dadf9f4f322d287c1408745fd36c3e",
+  "pass": true,
+  "performance": {
+    "direct_qk_lhs": {
+      "ci95": [
+        1.108617623125743,
+        1.1680214814792267
+      ],
+      "geometric_mean": 1.137931983273741,
+      "p_value": 5.32611465006251e-05,
+      "pairs": 6,
+      "percent": 13.793198327374089,
+      "ratios": [
+        1.099667525972432,
+        1.1700465165120504,
+        1.1244876329208509,
+        1.1202502103459353,
+        1.1686145940188462,
+        1.1462841126748613
+      ],
+      "reference_mean_tps": 148.11403102982396,
+      "strict_profile_mean_tps": 168.51920325242486,
+      "wins": 6
+    },
+    "factor_effects": {
+      "lhs_main": {
+        "ci95": [
+          1.03710321108627,
+          1.072578434422897
+        ],
+        "geometric_mean": 1.0546916793460877,
+        "p_value": 0.00013878991392070287,
+        "pairs": 8,
+        "percent": 5.469167934608765,
+        "ratios": [
+          1.0501479318471423,
+          1.0809326407677273,
+          1.0905820597532676,
+          1.0506398549840223,
+          1.0384023362539982,
+          1.0306244908186832,
+          1.060272191887511,
+          1.0374312811667636
+        ],
+        "wins": 8
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.1207834634253668,
+          1.1771723666462446
+        ],
+        "geometric_mean": 1.1486319350159186,
+        "p_value": 3.0990262089137818e-06,
+        "pairs": 8,
+        "percent": 14.863193501591866,
+        "ratios": [
+          1.1266155098026707,
+          1.185920011863641,
+          1.2077624683406827,
+          1.1434415955318709,
+          1.1135850583598266,
+          1.1211514003912582,
+          1.1659886518448057,
+          1.1280762893669183
+        ],
+        "wins": 8
+      },
+      "qk_main": {
+        "ci95": [
+          1.078811022640991,
+          1.0994243679197937
+        ],
+        "geometric_mean": 1.0890689265018894,
+        "p_value": 1.2581005109787446e-07,
+        "pairs": 8,
+        "percent": 8.906892650188936,
+        "ratios": [
+          1.0728160058564575,
+          1.0971266544614167,
+          1.1074475850207235,
+          1.0883287837479378,
+          1.0724023044642288,
+          1.0878369477719907,
+          1.099706906175759,
+          1.0873744698523156
+        ],
+        "wins": 8
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.0854475960229932,
+          1.111152338049508
+        ],
+        "geometric_mean": 1.0982247648597108,
+        "p_value": 2.852729506443912e-07,
+        "pairs": 8,
+        "percent": 9.822476485971077,
+        "ratios": [
+          1.0791908166821667,
+          1.0969053216127764,
+          1.1138608683937297,
+          1.101973980173582,
+          1.0771556773839244,
+          1.0969206885125422,
+          1.1224572553941947,
+          1.0980868150964878
+        ],
+        "wins": 8
+      }
+    },
+    "factor_means_tps": {
+      "L": 154.69513982474245,
+      "Q": 159.72746478101388,
+      "QL": 167.08416926489386,
+      "R": 145.46089387366783
+    },
+    "fresh_process": {
+      "mean_tps": {
+        "Q": 154.9546579606896,
+        "QL": 159.73243968573397,
+        "R": 145.8901409636889
+      },
+      "qk_lhs_over_reference": {
+        "ci95": [
+          1.0573252014806285,
+          1.131237504217849
+        ],
+        "geometric_mean": 1.0936571318606123,
+        "p_value": 0.00011376781425473278,
+        "pairs": 12,
+        "percent": 9.365713186061232,
+        "ratios": [
+          1.1052554309340137,
+          1.1259666590036626,
+          1.1064513301988292,
+          1.1150886275521223,
+          1.0069967171346306,
+          1.0938185307096995,
+          1.0749689383011543,
+          1.162555751606999,
+          1.158712164918449,
+          1.1540610878236863,
+          1.0524248524872537,
+          0.9843870392223679
+        ],
+        "wins": 11
+      },
+      "qk_only_over_reference": {
+        "ci95": [
+          1.0273129468806685,
+          1.0949630000607502
+        ],
+        "geometric_mean": 1.060598730113188,
+        "p_value": 0.001880120402732224,
+        "pairs": 12,
+        "percent": 6.059873011318806,
+        "ratios": [
+          1.063102018165829,
+          1.0852999514120194,
+          1.095014636481592,
+          1.0956225163494675,
+          0.9221909585211402,
+          1.0676932630716516,
+          1.045641090613816,
+          1.0987561975055053,
+          1.1216829716572136,
+          1.0292177035299557,
+          1.058940445436161,
+          1.0582965534295063
+        ],
+        "wins": 11
+      },
+      "statistical_unit": "fresh model process on one device instance"
+    },
+    "strict_acceleration_claim_eligible": true
+  },
+  "profile": "sm86",
+  "run_manifest_sha256": "7452e59f73a4c461f72211cba44c3a31ae66e3f32541ca0591485bc2ea19fbb9",
+  "schema": 2,
+  "source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+  "strict_path_state": {
+    "add_rms_norm": false,
+    "approximate_add_rms": false,
+    "approximate_router": false,
+    "cached_decode_lhs": false,
+    "qk_norm": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "router": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "router_indices_uint32": false,
+    "ternary_up_gate": false,
+    "type": "strict_path_state"
+  },
+  "type": "maple_architecture_summary"
+}

@@ -2,8 +2,8 @@
 
 ## Current strict evidence
 
-`summary.csv` contains historical `sm86` rows and two fresh rows for each of
-`sm89`, `sm90`, `sm100`, and `sm120`:
+`summary.csv` contains two fresh rows for each of `sm86`, `sm89`, `sm90`,
+`sm100`, and `sm120`, plus retained historical `sm86` rows:
 
 - `strict_qk_default_fresh_process`: conservative exact-probed Q/K source default;
 - `strict_qk_cached_lhs_opt_in_fresh_process`: exact Q/K plus the lifecycle-limited cached
@@ -12,8 +12,8 @@
 For the fresh matrix, throughput columns are arithmetic means across 12 fresh
 model processes on one device instance. Gains and confidence intervals are
 geometric statistics from paired within-process ratios. Do not compare
-absolute rates across hosts as a GPU ranking or pool the historical `sm86`
-design with the fresh matrix.
+absolute rates across hosts as a GPU ranking. Historical `sm86` rows remain
+separately labeled and are not pooled with the fresh matrix.
 
 [`PUBLIC-INDEX.json`](PUBLIC-INDEX.json) binds every canonical baseline, graph, W2, Blackwell, campaign, source, analysis, sanitized-bundle, and private raw-manifest commitment used by the release.
 
@@ -22,6 +22,7 @@ design with the fresh matrix.
 Each directory under `cuda/multiarch/` contains a 15-file sanitized baseline
 bundle plus its leaf `SHA256SUMS`:
 
+- `sm86`: RTX 3090, driver 580.159.03;
 - `sm89`: RTX 4090, driver 580.159.04;
 - `sm90`: H100 80GB HBM3, driver 580.126.09;
 - `sm100`: B200, driver 580.126.20;
@@ -55,19 +56,21 @@ Every fresh target had 24/24 Q/K layers active, an exact random 1024-token gate,
 three exact multi-seed cases, 20/20 exact cases at both 512 and 1024 tokens, and
 144 deterministic stock W2 projection fingerprints. W2 candidates separately
 had to match all 144 reference arrays before timing. Common-slice equality
-covers token IDs, decoded text, selected-token-logprob hash, and top-1 hash. It is finite
-regression evidence, not exhaustive full-logit equality or a quality score.
+covers token IDs, decoded text, selected-token-logprob hash, and top-1 hash. It
+is finite regression evidence, not exhaustive full-logit equality or a quality score.
 
-Executed Maple source hashes differ by campaign stage: `7785da2a…` on
-`sm89/sm90`, `b34cd977…` on `sm100`, and release `28ceabac…` on `sm120`.
-Generated release Q/K source matches the executed profile-specific source for
-the earlier three targets; this narrow bridge is disclosed rather than calling
-the whole files identical.
+Executed Maple source hashes differ by campaign stage: release `28ceabac…` on
+`sm86/sm120`, `7785da2a…` on `sm89/sm90`, and `b34cd977…` on `sm100`.
+The release Q/K source was run directly on `sm86` and `sm120`; generated release
+Q/K source matches the executed profile-specific source for the earlier three
+targets. This narrow bridge is disclosed rather than calling the whole files
+identical.
 
 ## Historical evidence
 
-The top-level `cuda/sm86-*.jsonl` files are the revised historical RTX 3090
-campaign. `legacy-initial-port/` preserves the original short-oracle data only
+The top-level `cuda/sm86-*.jsonl` files are the earlier revised RTX 3090
+campaign; the fresh current-source bundle is under `cuda/multiarch/sm86`.
+`legacy-initial-port/` preserves the original short-oracle data only
 for transparency; tolerant probes admitted paths now classified as semantic,
 so those records are not current strict claims. Mac/Metal remains unvalidated
 with the current source.

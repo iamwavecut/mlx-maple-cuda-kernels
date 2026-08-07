@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: "Selitskiy"
     given-names: "Valeriy"
-version: 0.3.0
-date-released: 2026-08-06
+version: 0.3.1
+date-released: 2026-08-07
 url: "https://github.com/iamwavecut/mlx-maple-cuda-kernels"
 license: MIT
 repository-code: "https://github.com/iamwavecut/mlx-maple-cuda-kernels"

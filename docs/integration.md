@@ -3,8 +3,8 @@
 ## Validated scope
 
 - Linux, Python 3.12.3, MLX/MLX-CUDA 0.32.0, CUDA 12.9.
-- Fresh strict evidence on one RTX 4090 (`sm89`), H100 80GB HBM3 (`sm90`),
-  B200 (`sm100`), and RTX 5090 (`sm120`) instance.
+- Fresh strict evidence on one RTX 3090 (`sm86`), RTX 4090 (`sm89`), H100
+  80GB HBM3 (`sm90`), B200 (`sm100`), and RTX 5090 (`sm120`) instance.
 - Checkpoint `deepgrove/maple-preview-2bit-mlx` revision
   `361db5da5e74ff6fcdd852d478e1f266ce11013a`.
 - DeepGrove base `eba96c16158f032821b0bf374ea1421cfddef0a9`.

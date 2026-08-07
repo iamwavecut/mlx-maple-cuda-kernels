@@ -33,6 +33,22 @@
       "validated_rope_kernel_name": "maple_qk_norm_rope_sm120",
       "validated_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8"
     },
+    "sm86": {
+      "nope_name_equal": true,
+      "nope_source_equal": true,
+      "release_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "release_nope_kernel_name": "maple_qk_norm_nope_sm86",
+      "release_rope_generated_source_sha256": "3a0f6321d88c2c943fc1be52a4f687ef831b235050a64e0bd4a6c2943cb50f01",
+      "release_rope_kernel_name": "maple_qk_norm_rope_sm86",
+      "release_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+      "rope_name_equal": true,
+      "rope_source_equal": true,
+      "validated_nope_generated_source_sha256": "e50cf30f22942cdef2c959c6578228f867c0c55c47ecdb50b5c6300c46d2df7a",
+      "validated_nope_kernel_name": "maple_qk_norm_nope_sm86",
+      "validated_rope_generated_source_sha256": "3a0f6321d88c2c943fc1be52a4f687ef831b235050a64e0bd4a6c2943cb50f01",
+      "validated_rope_kernel_name": "maple_qk_norm_rope_sm86",
+      "validated_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8"
+    },
     "sm89": {
       "nope_name_equal": true,
       "nope_source_equal": true,

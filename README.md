@@ -13,27 +13,19 @@ off by default.
 
 ## Strict multi-architecture result
 
-Four fresh NVIDIA targets passed the same deterministic strict methodology
-under architecture-bound sealed campaign revisions. The earlier accepted RTX
-3090 result is retained in the same table and marked as historical.
-Values are warm `B=1`, `L=1`, 128-token prompt / 512-token decode throughput.
-For the four fresh rows, ratios are paired geometric means over 12 fresh model
-processes on one device instance; displayed tok/s values are arithmetic means.
+All five fresh NVIDIA targets passed the deterministic strict methodology under
+architecture-bound sealed campaign revisions. Values are warm `B=1`, `L=1`,
+128-token prompt / 512-token decode throughput. Ratios are paired geometric
+means over 12 fresh model processes on one device instance; displayed tok/s
+values are arithmetic means.
 
 | GPU | CC | Portable | Exact Q/K default | Paired gain (95% CI) | Q/K + cached-LHS opt-in |
 | --- | --- | ---: | ---: | ---: | ---: |
-| RTX 3090† | `sm86` | 179.39 | **195.27** | **+8.51%** (+0.90%–+16.70%) | 209.58, **+18.28%** |
+| RTX 3090 | `sm86` | 145.89 | **154.95** | **+6.06%** (+2.73%–+9.50%) | 159.73, **+9.37%** |
 | RTX 4090 | `sm89` | 182.36 | **209.84** | **+15.31%** (+11.29%–+19.49%) | 214.66, **+18.01%** |
 | H100 80GB HBM3 | `sm90` | 202.62 | **233.67** | **+15.24%** (+12.86%–+17.66%) | 246.34, **+21.54%** |
 | B200 | `sm100` | 241.51 | **280.70** | **+16.28%** (+14.23%–+18.37%) | 297.47, **+23.37%** |
 | RTX 5090 | `sm120` | 398.49 | **429.72** | **+7.84%** (+6.88%–+8.81%) | 438.01, **+9.92%** |
-
-† The RTX 3090 row is accepted historical evidence from a shared host with an
-active co-tenant: Q/K used 8 pairs and cached LHS used 6, rather than the later
-12-process design. Its cached-LHS gain uses its own 177.56 tok/s portable
-baseline. It passed the array-exact, random 1024-token, and fixed 20-case
-512/1024-token gates; its small-n intervals are exploratory after tuning and
-have no multiple-testing correction.
 
 The cached-LHS mode is exact in these runs but remains opt-in: its cache is
 process-global and keyed only by top-k. The conservative source default is the
@@ -42,7 +34,7 @@ exact-probed fused Q/K path alone. Full retained records are indexed by
 
 ### Exactness gate
 
-For each of the four fresh multiarchitecture targets, the release gate required:
+For each of the five fresh multiarchitecture targets, the release gate required:
 
 - shape, dtype, and value equality through `mx.array_equal` for live fused
   outputs, with all 24 Q/K layers active and no silent fallback;
@@ -157,8 +149,9 @@ single-model/single-device warm workload described above.
   [`results/cuda/multiarch/`](results/cuda/multiarch/), plus compact strict,
   graph, W2, and Blackwell summaries in [`results/cuda/`](results/cuda/).
 
-The baseline full-file source hashes were `7785da2a…` for `sm89/sm90`,
-`b34cd977…` for `sm100`, and the release `28ceabac…` for `sm120`. The release
+The baseline full-file source hashes were the release `28ceabac…` for
+`sm86/sm120`, `7785da2a…` for `sm89/sm90`, and `b34cd977…` for
+`sm100`. The release
 changes are architecture-isolated; captured generated RoPE/NoPE kernel hashes
 match the validated source for every profile. See
 [`release-source-equivalence.json`](results/cuda/release-source-equivalence.json).

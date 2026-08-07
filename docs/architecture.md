@@ -48,7 +48,7 @@ invalidation is not encoded in its identity.
 
 | Profile | Tested GPU | Driver | Elementwise threads | Router fallback strategy | Fresh strict Q/K gate |
 | --- | --- | --- | ---: | --- | --- |
-| `sm86` | RTX 3090 | historical artifact | 256 | portable in strict mode | historical revised campaign |
+| `sm86` | RTX 3090 | 580.159.03 | 256 | portable in strict mode | pass |
 | `sm89` | RTX 4090 | 580.159.04 | 512 | portable in strict mode | pass |
 | `sm90` | H100 80GB HBM3 | 580.126.09 | 512 | portable in strict mode | pass |
 | `sm100` | B200 | 580.126.20 | 512 | portable in strict mode | pass after RoPE fix |
@@ -59,10 +59,10 @@ enabled in strict mode. These are exact representative-SKU claims, not blanket
 support for every GPU sharing a compute capability. Unknown capabilities use a
 conservative future profile and must pass their own live probes.
 
-The release source was directly run on `sm120`. The earlier runs used recorded
-full-file source hashes; captured generated RoPE/NoPE kernel hashes match the
-release for `sm89`, `sm90`, and `sm100`. That is a code-generation isolation
-check, not whole-module rerun equivalence.
+The release source was directly run on `sm86` and `sm120`. The earlier runs used
+recorded full-file source hashes; captured generated RoPE/NoPE kernel hashes
+match the release for `sm89`, `sm90`, and `sm100`. That is a code-generation
+isolation check, not whole-module rerun equivalence.
 
 ## Deterministic oracle
 

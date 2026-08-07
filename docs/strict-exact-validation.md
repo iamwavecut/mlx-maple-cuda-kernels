@@ -134,4 +134,4 @@ boundary and complete architecture gate after either toolchain changes.
   GatherQMM replacement, retaining bf16 projection boundaries and slot order.
 - Repeat the full architecture gate for every new path and after MLX, CUDA,
   compiler, driver, or checkpoint changes; the current Q/K and cached-LHS
-  gates are complete on `sm89`, `sm90`, `sm100`, and `sm120`.
+  gates are complete on `sm86`, `sm89`, `sm90`, `sm100`, and `sm120`.

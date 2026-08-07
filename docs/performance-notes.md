@@ -9,27 +9,31 @@ are displayed; effects are geometric means of paired ratios.
 
 | GPU | Portable | Q/K default | Gain (95% CI) | Q/K + cached-LHS | Gain (95% CI) |
 | --- | ---: | ---: | ---: | ---: | ---: |
+| RTX 3090 / `sm86` | 145.89 | 154.95 | +6.06% (+2.73%–+9.50%) | 159.73 | +9.37% (+5.73%–+13.12%) |
 | RTX 4090 / `sm89` | 182.36 | 209.84 | +15.31% (+11.29%–+19.49%) | 214.66 | +18.01% (+13.68%–+22.50%) |
 | H100 80GB HBM3 / `sm90` | 202.62 | 233.67 | +15.24% (+12.86%–+17.66%) | 246.34 | +21.54% (+19.10%–+24.03%) |
 | B200 / `sm100` | 241.51 | 280.70 | +16.28% (+14.23%–+18.37%) | 297.47 | +23.37% (+19.55%–+27.31%) |
 | RTX 5090 / `sm120` | 398.49 | 429.72 | +7.84% (+6.88%–+8.81%) | 438.01 | +9.92% (+8.89%–+10.96%) |
 
-All eight comparisons won 12/12 pairs. Cached LHS remains off by default due to
-its cache lifecycle. Absolute rates are not cross-GPU rankings: hosts, clocks,
-and GPUs differ, and each claim is a single-instance observation.
+The RTX 3090 comparisons won 11/12 pairs; each of the other eight comparisons
+won 12/12. Cached LHS remains off by default due to its cache lifecycle.
+Absolute rates are not cross-GPU rankings: hosts, clocks, and GPUs differ, and
+each claim is a single-instance observation.
 
-The historical RTX 3090 / `sm86` experiment used a different paired design and
-shared host. Its conservative Q/K estimate was +8.51%; Q/K plus cached LHS was
-+18.28%. It remains auditable but should not be pooled with the fresh matrix.
+The earlier shared-host RTX 3090 estimates (+8.51% Q/K and +18.28% Q/K plus
+cached LHS) remain auditable as historical rows but are not pooled with this
+fresh current-source matrix.
 
 ## Graph screen
 
-Five-block screens used the same device instance as each strict baseline. The
-common campaign profile was cache 400 / 100 ops / 100 MB. It is reproducible,
-not asserted globally optimal.
+For `sm89`–`sm120`, five-block screens used the same device instance as each
+strict baseline. The fresh `sm86` extension did not repeat graph screening. The
+common profile is cache 400 / 100 ops / 100 MB; it is reproducible, not asserted
+globally optimal.
 
 | Profile | 100 vs 20 ops factorial effect | Direct recommended B/A |
 | --- | ---: | ---: |
+| `sm86` | not repeated in the fresh extension | not repeated |
 | `sm89` | +19.73%, `p=0.00230` | +25.07%, `p=0.0148` |
 | `sm90` | +8.45%, CI crosses 1 | +6.58%, CI crosses 1 |
 | `sm100` | +10.90%, `p=6.82e-5` | +6.60%, CI crosses 1 |
@@ -43,6 +47,7 @@ slower than 100 MB in this screen; cache 2000 had no supported benefit over 400.
 The W2 study used an architecture-specific MLX 0.32.0 wheel built from a sealed
 runtime tile-override patch. It is not part of the normal QuickStart.
 
+- `sm86`: no fresh tile screen; stock W2 remains the strict default.
 - `sm120`: `16x32x128` strict-accepted, +1.615% (95% CI +1.322%–+1.909%),
   12/12 fresh-process wins, `p=9.63e-8`.
 - `sm89`: same tile array-exact but +0.066% (CI -1.259%–+1.409%); demoted.

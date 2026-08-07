@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 — 2026-08-07
+
+- Re-ran RTX 3090 (`sm86`) with the current release source and the same
+  12-fresh-process strict baseline used by the multiarchitecture matrix.
+- Published the allowlisted `sm86` bundle, raw-manifest commitment, campaign
+  provenance, generated-kernel identity, and updated primary table.
+- Measured exact Q/K at +6.06% (95% CI +2.73%–+9.50%) and exact Q/K plus
+  cached LHS at +9.37% (+5.73%–+13.12%); both passed the complete finite
+  correctness gate with all 24 Q/K layers active.
+- Retained the earlier shared-host `sm86` records as historical evidence rather
+  than pooling them with the fresh current-source result.
+
 ## 0.3.0 — 2026-08-06
 
 - Completed fresh fail-closed strict campaigns on RTX 4090 (`sm89`), H100

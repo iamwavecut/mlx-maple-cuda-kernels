@@ -69,6 +69,26 @@
         "screen_raw_manifest_sha256_private_commitment": "b5f75136c10afe67030221663ba44b1e4b9a75b57a0534375a8aa8cd50f4bd1b"
       }
     },
+    "sm86": {
+      "campaign_archive_normalized": true,
+      "campaign_archive_sha256_private_commitment": "1f7bba07b40089062a8d49c9246bd07be5486e62b7111130c52a9ce84389a1fb",
+      "campaign_manifest_sha256": "b191ab1ef17b1c915117a07e479776e4c8f0778d6fa6663e9cafef9b945eb9e8",
+      "canonical_analysis_sha256": "d47337facfb97a93c126c4d84aa9a65e4e9d16b02b1fa44c6057b983999ff69d",
+      "canonical_raw_manifest_sha256_private_commitment": "7452e59f73a4c461f72211cba44c3a31ae66e3f32541ca0591485bc2ea19fbb9",
+      "compute_capability": "8.6",
+      "device": "NVIDIA GeForce RTX 3090",
+      "driver": "580.159.03",
+      "executed_source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
+      "graph": {
+        "classification": "not-repeated-in-fresh-sm86-extension"
+      },
+      "release_generated_qk_source_equal": true,
+      "sanitized_bundle": "cuda/multiarch/sm86",
+      "sanitized_manifest_sha256": "25d4872b764a8b990dd5fc9431e61ed1464b1cb5267f3ff1add776f4f7712424",
+      "w2": {
+        "classification": "stock-default-retained-no-fresh-tile-screen"
+      }
+    },
     "sm89": {
       "campaign_archive_normalized": false,
       "campaign_archive_sha256_private_commitment": "49e4dd1215337b8ec967fd001faf09cf30a1474b83e8d5b0fdb71abf3c56e0d2",
@@ -131,11 +151,19 @@
     "model_revision": "361db5da5e74ff6fcdd852d478e1f266ce11013a",
     "python": "3.12.3",
     "source_sha256": "28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8",
-    "tests_sha256": "f3b0f2be32c372fd96d2d17df55971598a76214ace0fc72d8469fb3dec35fcfa"
+    "tests_sha256": "f3b0f2be32c372fd96d2d17df55971598a76214ace0fc72d8469fb3dec35fcfa",
+    "version": "0.3.1"
   },
   "schema": "maple-multiarch-public-index-v1",
   "scope": {
     "approximate_paths_included": false,
+    "fresh_profiles": [
+      "sm86",
+      "sm89",
+      "sm90",
+      "sm100",
+      "sm120"
+    ],
     "full_logit_equality_claimed": false,
     "metal_validated": false,
     "one_device_instance_per_sku": true,

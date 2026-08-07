@@ -2,7 +2,7 @@
 
 ## Frozen inputs
 
-Fresh `sm89`–`sm120` campaign inputs:
+Fresh `sm86`–`sm120` campaign inputs:
 
 - checkpoint: `deepgrove/maple-preview-2bit-mlx` revision
   `361db5da5e74ff6fcdd852d478e1f266ce11013a`, with exact recursive model
@@ -18,19 +18,17 @@ Executed full-file Maple hashes were:
 
 | Profile | Executed source SHA-256 |
 | --- | --- |
+| `sm86`, `sm120` | `28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8` |
 | `sm89`, `sm90` | `7785da2a85b97b9fd7759d8756b1daf2231ec8b912d42b4b7bc9c04637b371ae` |
 | `sm100` | `b34cd9777cf5a8775ed4e814fe7e14c987a9021627224168595c92ddf21edae4` |
-| `sm120` | `28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8` |
 
 The release source is `28ceabac…`. A local capture test hashes the exact CUDA
 source passed to `mx.fast.cuda_kernel`; release RoPE/NoPE generated source
 matches the validated profile source for `sm89`, `sm90`, and `sm100`. This is
 an architecture code-generation bridge, not a claim that the whole release
-file was freshly rerun on those three devices. The `sm120` run directly used
-the release file.
-
-Historical `sm86` evidence used an earlier campaign and has its own provenance
-under `../provenance/`; it is not pooled with the fresh matrix.
+file was freshly rerun on those three devices. The fresh `sm86` and `sm120`
+runs directly used the release file. Earlier `sm86` evidence remains historical
+and is not pooled with the fresh matrix.
 
 ## Deterministic process environment
 

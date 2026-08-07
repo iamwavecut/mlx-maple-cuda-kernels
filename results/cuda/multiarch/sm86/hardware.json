@@ -1,0 +1,18 @@
+{
+  "device": {
+    "architecture": "sm_86",
+    "compute_capability_major": 8,
+    "compute_capability_minor": 6,
+    "device_name": "NVIDIA GeForce RTX 3090",
+    "total_memory": 25769803776
+  },
+  "gpu": {
+    "compute_capability": "8.6",
+    "driver_version": "580.159.03",
+    "max_memory_clock_mhz": "9751",
+    "max_sm_clock_mhz": "2100",
+    "memory_total_mib": "24576",
+    "name": "NVIDIA GeForce RTX 3090",
+    "power_limit_w": "350.00"
+  }
+}
