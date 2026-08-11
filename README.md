@@ -2,9 +2,11 @@
 
 Fail-closed CUDA research kernels for
 [DeepGrove's Maple preview](https://github.com/deepgrove-ai/mlx-lm-deepgrove).
-The strict lane preserves the stock token stream and array boundaries; known
-approximate router, add/RMS, ternary, FlashHead, and KV-quantized paths remain
-off by default.
+The default lane fuses the whole MoE block into one dispatch and is 73-88%
+faster than portable MLX, within ~1 ULP of bf16; `MAPLE_MOE_MEGAKERNEL=0`
+returns an array-exact lane that preserves the stock token stream and array
+boundaries, still 7-17% faster. Known approximate router, add/RMS, ternary,
+FlashHead, and KV-quantized paths remain off by default.
 
 > **Status:** independent community research, not an MLX or DeepGrove release
 > and not a claim of official model-author support. Evidence is scoped to the
@@ -58,7 +60,7 @@ Fresh processes per mode, interleaved order, warm `B=1`, `L=1` BF16 decode,
 reproduces the previous release path. Ratios are paired geometric means over
 the processes of one device instance.
 
-| GPU | CC | off | strict (default) | Paired gain (95% CI) | Wins |
+| GPU | CC | off | strict (exact lane) | Paired gain (95% CI) | Wins |
 | --- | --- | ---: | ---: | ---: | ---: |
 | RTX 3090 | `sm86` | 152.29 | **164.94** | **+6.68%** (+4.33%–+9.09%) | 8/8 |
 | RTX 4090 | `sm89` | 157.66 | **184.25** | **+16.91%** (+15.27%–+18.56%) | 6/6 |
@@ -66,7 +68,7 @@ the processes of one device instance.
 | B200 | `sm100` | 141.87 | **165.19** | +11.77% (−4.35%–+30.61%) | 5/6 |
 | RTX 5090 | `sm120` | 242.61 | **269.34** | **+10.63%** (+8.84%–+12.46%) | 6/6 |
 
-The opt-in megakernel on the same runs:
+The megakernel — the default lane — on the same runs:
 
 | GPU | CC | megakernel | Paired gain (95% CI) | Wins | Token stream |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -153,6 +155,18 @@ out is a quality *regression*.
 
 ### What is on by default
 
+- **The MoE megakernel** — router, experts, activation, score-weighted
+  aggregation and the preceding add/RMSNorm in **one dispatch**, with three
+  atomic-counter grid barriers. Worth 73-88%, and the reason the default
+  throughput is what it is.
+
+  It is within ~1 ULP of bf16 rather than array-exact: `qmm_naive` gets its
+  accuracy from a tensor-core MMA, which a software fp32 reduction cannot
+  reproduce. So it can change a greedy token on a near-tie, and on 846 scored
+  tokens roughly 9% of top-1 predictions differ. What that costs in quality was
+  measured rather than assumed, and the answer is nothing — see the table
+  above. **Set `MAPLE_MOE_MEGAKERNEL=0` for the array-exact lane**, which is
+  what a reproducibility claim, a regression baseline or a bisect needs.
 - `_use_fused_add_rms` — residual add + RMSNorm in one dispatch. The shipped
   kernel before this release used the elementwise thread count and two chunks
   per thread; `mx.fast.rms_norm` uses 512 threads with four contiguous
@@ -164,32 +178,32 @@ out is a quality *regression*.
   removing the slice-and-reshape chain around it. Bit-identical by
   construction: the per-head arithmetic is unchanged.
 
-Component medians on the same host: add+RMSNorm +3.3%, QKV split +2.2%,
-together +7.0%.
+The two array-exact fusions are worth, as component medians on one host,
+add+RMSNorm +3.3%, QKV split +2.2%, together +7.0%. They are what
+`MAPLE_MOE_MEGAKERNEL=0` leaves you with.
+
+Every path falls back rather than failing. The megakernel declines a non-CUDA
+backend, experts that are not 2-bit affine at group size 128, a `top_k` other
+than 8, or a hidden size its block partition does not divide; the two exact
+fusions each run a live comparison at first use and switch themselves off if it
+does not match.
 
 ### What is opt-in
 
-- `MAPLE_MOE_MEGAKERNEL=1` — router, experts, activation, score-weighted
-  aggregation and the preceding add/RMSNorm in **one dispatch**, with three
-  atomic-counter grid barriers. Worth 73-88%. It is within ~1 ULP of bf16
-  rather than array-exact: `qmm_naive` gets its accuracy from a tensor-core
-  MMA, which a software fp32 reduction cannot reproduce.
-
-  It is off by default because this repository's contract is a reproducible
-  token stream, **not** because it is known to cost quality — the suite above
-  finds no regression on any supported architecture. If you are serving rather
-  than reproducing, this is the switch you want.
 - `MAPLE_COMPILED_ROUTER=1` — the stock router chain under `mx.compile`.
   Array-exact, and in isolation it cuts the router's host cost from 96.5 us to
   77.9 us per layer, but paired over ten fresh processes the end-to-end effect
   was 1.0062x with a 95% interval of 0.9927-1.0198 and 6/10 wins. Exact but
-  not distinguishable from zero, so it ships off.
+  not distinguishable from zero, so it ships off. The megakernel absorbs the
+  router anyway, so this only applies with the megakernel off.
 
 Every lane is also a module attribute (`maple._use_moe_megakernel` and
 friends), which is what the tests flip; the environment only seeds them at
 import, so a server does not have to reach into the module before the model
-loads. `MAPLE_FUSED_ADD_RMS=0` and `MAPLE_FUSED_QKV=0` turn the defaults back
-off, which is how `off` is measured in every table here.
+loads. `MAPLE_FUSED_ADD_RMS=0` and `MAPLE_FUSED_QKV=0` turn the exact fusions
+off, which is how `off` is measured in every table here — and because the
+megakernel rides the fused add/RMSNorm carrier, `MAPLE_FUSED_ADD_RMS=0`
+switches it off too.
 
 ### Exactness protocol
 
@@ -278,15 +292,18 @@ throughput by +1.615% (95% CI +1.322%–+1.909%, 12/12 wins,
 MLX backend**. RTX 4090 and B200 candidates were array-exact but failed their
 performance gates; H100 retained its stock tile.
 
-## Strict defaults
+## Defaults
+
+Everything below is per-path. `MAPLE_MOE_MEGAKERNEL=0` turns the one
+non-array-exact default off and leaves a fully array-exact configuration.
 
 | Path | Default | Strict status |
 | --- | --- | --- |
 | Q/K norm + partial RoPE/NoPE | auto-probed | array-exact on the listed SKUs/toolchains |
 | Fused QKV split (`_use_fused_qkv`) | **on** | array-exact by construction; probed live |
 | Residual add + RMSNorm (`_use_fused_add_rms`) | **on** | array-exact once the thread mapping matches `mx.fast.rms_norm` |
-| MoE megakernel (`_use_moe_megakernel`) | off | within ~1 ULP of bf16; not array-exact |
-| Compiled router (`_use_compiled_router`) | off | array-exact; end-to-end effect not distinguishable from zero |
+| MoE megakernel (`MAPLE_MOE_MEGAKERNEL`) | **on** | within ~1 ULP of bf16; not array-exact; no measurable quality cost |
+| Compiled router (`MAPLE_COMPILED_ROUTER`) | off | array-exact; end-to-end effect not distinguishable from zero |
 | Cached flat decode LHS | off | exact in campaign; lifecycle-limited opt-in |
 | Router GEMV/softmax/top-8 | off | normalized scores not array-exact |
 | Residual add + RMSNorm, original kernel | off | thread mapping differs from `mx.fast.rms_norm` |
@@ -327,10 +344,15 @@ python ../mlx-maple-cuda-kernels/examples/nvidia_generate.py \
   --max-tokens 256
 ```
 
-That is the strict default: a token stream identical to stock, 7-17% faster.
-For the fastest lane, add `MAPLE_MOE_MEGAKERNEL=1` to the environment above —
-73-88% instead, at the cost of a reproducible token stream and nothing else
-that has been measurable. See [Quality](#quality).
+That is the default lane: the MoE megakernel, 73-88% faster than portable MLX.
+It is within ~1 ULP of bf16 rather than array-exact, so its token stream is not
+reproducible against stock — and on 846 scored tokens that costs no measurable
+quality. See [Quality](#quality).
+
+If you need the stream itself to be reproducible — a paper claim, a regression
+baseline, a bisect — add `MAPLE_MOE_MEGAKERNEL=0`. That leaves the two
+array-exact fusions, still 7-17% faster than portable MLX, with a token stream
+identical to stock on 8/8 screened prompts.
 
 Pin `mlx==0.32.0` and the matching `mlx-cuda-12==0.32.0` wheel to reproduce the
 published version claim. The example passes

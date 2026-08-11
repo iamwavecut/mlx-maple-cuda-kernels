@@ -3,10 +3,10 @@
 ## Current release: the fusion campaign
 
 The release source is [`../src/maple.py`](../src/maple.py), SHA-256
-`2fad29b38a48a584cb5b746306f25b6ecd2656211bcfa9dbd122c2d8f46c4421`.
+`195d0e741eb15bf4387c6eadcbc3574a9676149d27cb6e1d9ecb2fde52e2a4b8`.
 The integration patch against DeepGrove base
 `eba96c16158f032821b0bf374ea1421cfddef0a9` is SHA-256
-`862f0eadc1b06eb70f8f94688ba5a1943651bc7e4657bbbb9405acda14a727ed`.
+`830d44f10298c4e83d17a7461f1b8fec378cc94e2e442ea646359401f53f29ca`.
 
 Both were checked the way a user gets them: clone `mlx-lm-deepgrove`, check out
 that base, `git apply`. The patch applies clean, reproduces the four checked-in
@@ -16,15 +16,22 @@ and `tests/test_maple_kernels.py` then passes from the patched tree (23 passed,
 9 skipped on a non-CUDA host, 38 subtests).
 
 Every number in the fusion tables was measured on rented instances, one process
-per data point, from a source that differs from the checked-in one in two ways,
-neither of which touches arithmetic. The megakernel grid was the pre-tuning
-constant 32, which leaves the strict and `off` lanes untouched and understates
-the fast lane; the retuned rule was confirmed afterwards on a fresh RTX 4090
-that had not been part of the sweep. And the lane flags are now seeded from the
-environment rather than being plain literals, which changes how a lane is
-selected, not what it computes — the defaults are the same values the
-measurements ran under. `results/cuda/megakernel-grid-and-quality.jsonl` holds
-both the sweep and the confirmation.
+per data point, from a source that has since changed in three ways. None of the
+three changes what a lane computes, and every table here names its lane and
+sets the flags directly, so each column measures the same code before and after.
+
+1. The megakernel grid was the pre-tuning constant 32. That leaves the exact
+   and `off` lanes untouched and understates the megakernel column; the retuned
+   rule was confirmed afterwards on a fresh RTX 4090 that had not been part of
+   the sweep.
+2. The lane flags are now seeded from the environment rather than written as
+   literals, which changes how a lane is selected, not what it does.
+3. The megakernel's default flipped from off to on. The column labelled
+   `megakernel` was always measured with it on, and the column labelled
+   `strict` with it off.
+
+`results/cuda/megakernel-grid-and-quality.jsonl` holds both the sweep and the
+confirmation.
 
 ## Earlier multi-architecture campaign
 

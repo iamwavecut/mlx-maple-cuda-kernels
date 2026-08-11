@@ -754,18 +754,21 @@ assert maple._router_select_kernel_cache == {}
         self.assertTrue(mx.array_equal(ri, ci), "compiled router reordered experts")
         self.assertTrue(mx.array_equal(rs, cs), "compiled router moved the weights")
 
-    def test_moe_megakernel_is_opt_in(self):
-        """The approximate fast lane must stay off unless asked for.
+    def test_the_strict_lane_stays_one_variable_away(self):
+        """The megakernel is the default, so the exact lane must stay reachable.
 
         Read the defaults rather than the module attributes: the attributes are
-        seeded from the environment, and a run that opted into the fast lane
+        seeded from the environment, and a run that chose a lane explicitly
         should not fail this.
         """
         with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertFalse(maple._env_flag("MAPLE_MOE_MEGAKERNEL", False))
+            self.assertTrue(maple._env_flag("MAPLE_MOE_MEGAKERNEL", True))
             self.assertFalse(maple._env_flag("MAPLE_COMPILED_ROUTER", False))
             self.assertTrue(maple._env_flag("MAPLE_FUSED_ADD_RMS", True))
             self.assertTrue(maple._env_flag("MAPLE_FUSED_QKV", True))
+        with mock.patch.dict("os.environ", {"MAPLE_MOE_MEGAKERNEL": "0"}):
+            self.assertFalse(maple._env_flag("MAPLE_MOE_MEGAKERNEL", True),
+                             "the array-exact lane must be one variable away")
 
     def test_env_flag_only_accepts_affirmative_spellings(self):
         """A deployment sets these; a typo must not silently flip a lane."""

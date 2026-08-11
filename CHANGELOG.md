@@ -13,13 +13,18 @@
   consume the fused qkv projection and emit queries, keys and values in their
   final shapes, removing the slice-and-reshape chain. Bit-identical by
   construction.
-- Added an opt-in MoE megakernel that runs the router, experts, activation,
-  score-weighted aggregation and the preceding add/RMSNorm in one dispatch,
-  using atomic-counter grid barriers with a co-residency-safe 32-block grid.
+- **Made the MoE megakernel the default lane.** It runs the router, experts,
+  activation, score-weighted aggregation and the preceding add/RMSNorm in one
+  dispatch, using atomic-counter grid barriers, and is worth 73-88%. It is
+  within ~1 ULP of bf16 rather than array-exact, so **the default token stream
+  is no longer reproducible against stock** — about 9% of top-1 predictions on
+  near-ties differ. The quality suite below finds no cost to that on any
+  supported architecture. `MAPLE_MOE_MEGAKERNEL=0` restores the array-exact
+  lane, which is what a reproducibility claim or a bisect needs.
 - Added an opt-in compiled router: the stock chain under `mx.compile`,
   array-exact, but its end-to-end effect measured 1.0062x with a 95% interval
   of 0.9927-1.0198, so it ships off.
-- Validated on all five targets. Strict lane: RTX 3090 +6.68%, RTX 4090
+- Validated on all five targets. Array-exact lane: RTX 3090 +6.68%, RTX 4090
   +16.91%, H100 80GB +9.32%, B200 +11.77%, RTX 5090 +10.63%, and an identical
   token stream on 8/8 screened prompts on every one. Megakernel: +79.51%,
   +87.04%, +76.11%, +73.86%, +75.35%.

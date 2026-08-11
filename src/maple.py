@@ -80,17 +80,24 @@ _use_fused_qkv = _env_flag("MAPLE_FUSED_QKV", True)           # split + norm + R
 # zero on the measured host.  Exact but unproven stays opt-in.
 _use_compiled_router = _env_flag("MAPLE_COMPILED_ROUTER", False)
 
-# Opt-in fast lane: the whole MoE block (router, experts, activation,
-# score-weighted aggregation and the preceding add/RMSNorm) in one dispatch.
-# It is within ~1 ULP of bf16 rather than array-exact, because a software fp32
-# reduction cannot reproduce what qmm_naive gets from a tensor-core MMA.
+# The fast lane, on by default: the whole MoE block (router, experts,
+# activation, score-weighted aggregation and the preceding add/RMSNorm) in one
+# dispatch, worth 73-88%.  It is within ~1 ULP of bf16 rather than array-exact,
+# because a software fp32 reduction cannot reproduce what qmm_naive gets from a
+# tensor-core MMA, so it can change a greedy token on a near-tie.
 #
-# It is opt-in because this repository's contract is bit-exactness, not because
-# it is known to cost quality: a 846-token teacher-forced suite through the
-# decode path moves corpus perplexity by -0.8% to -1.3% on all five supported
-# architectures, which is unbiased last-bit noise in the favourable direction.
-# `MAPLE_MOE_MEGAKERNEL=1` buys 73-88% and gives up a reproducible token stream.
-_use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", False)
+# What that costs was measured rather than assumed: an 846-token teacher-forced
+# suite through the decode path moves corpus perplexity by -0.8% to -1.3% on all
+# five supported architectures -- unbiased last-bit noise, and if anything in
+# the favourable direction.  What it does cost is a token stream reproducible
+# against stock, which roughly 9% of top-1 predictions no longer are.
+#
+# `MAPLE_MOE_MEGAKERNEL=0` returns the array-exact strict lane, which is what a
+# reproducibility claim, a regression baseline or a bisect needs.  It falls back
+# on its own for anything it cannot serve: a non-CUDA backend, experts that are
+# not 2-bit affine at group size 128, a top_k other than 8, or a hidden size the
+# block partition does not divide.
+_use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 
 
 def _kernel_backend():
