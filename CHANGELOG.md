@@ -25,6 +25,14 @@
   +87.04%, +76.11%, +73.86%, +75.35%.
 - The GPU wait per step measures 0.002-0.004 ms from a 3090 to a B200, so the
   host-bound finding is not specific to a small GPU.
+- Made the megakernel grid depend on the device instead of a fixed 32 blocks,
+  which was tuned on a 3090 and left 18.3% on an RTX 4090 and 14.3% on a B200.
+  Selected from compute capability and memory, overridable and clamped.
+- Added `benchmarks/maple_quality_suite.py`: twelve documents scored one token
+  at a time against a cache. The strict lane matches the reference mean NLL to
+  the last digit with zero top-1 changes on all five architectures; the
+  megakernel moves corpus perplexity by -0.8% to -1.3%, which rules out a
+  quality regression without being an improvement.
 - Adopted a screened equivalence protocol after finding that the stock path is
   not always reproducible run to run. Verdicts are now taken only inside the
   region where three reference runs agree.

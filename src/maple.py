@@ -1,6 +1,7 @@
 # Copyright © 2026 DeepGrove AI.
 
 import math
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, List, Optional
@@ -2455,7 +2456,52 @@ def _moe_megakernel_lpr(k):
     return None
 
 
-def _moe_megakernel_plan(block, ln, dtype, grid=32, threads=512):
+def _moe_megakernel_grid(default=None):
+    """Blocks for the megakernel: as many as the device certainly holds.
+
+    The grid barrier is only correct while every block is resident, and MLX
+    exposes neither the multiprocessor count nor occupancy, so the grid cannot
+    be read off the device.  Compute capability and memory are safe proxies in
+    this class: at 512 threads and ~33 KB of shared memory a multiprocessor
+    holds three blocks, so 96 blocks need 32 multiprocessors and 192 need 64 --
+    comfortably inside anything with the memory to hold this checkpoint.
+
+    Measured medians for the fast lane, four fresh processes per point:
+
+        grid          32      64      96     128     192   chosen
+        RTX 3090   357.5   375.0   365.3   370.2   333.9       64
+        RTX 4090   429.1   469.1   507.7   478.5   463.3       96
+        H100 80GB  344.8   359.0   365.9   358.4   356.2       96
+        RTX 5090   422.9   424.9   435.3   427.2   426.7       96
+        B200       293.4   327.9   324.9   332.1   335.4      192
+
+    Ampere consumer parts peak lower than the rest and lose measurably at 96,
+    so they stay at 64.  The very large parts keep scaling, so they get 192.
+    `MAPLE_MOE_MEGAKERNEL_GRID` overrides all of it; the cap keeps a typo from
+    turning into a deadlock rather than a slowdown.
+    """
+    raw = os.environ.get("MAPLE_MOE_MEGAKERNEL_GRID")
+    if raw:
+        try:
+            return max(8, min(int(raw), 240))
+        except ValueError:
+            pass
+    if default is not None:
+        return default
+    capability = _cuda_capability()
+    if capability == (8, 6):
+        return 64
+    try:
+        total = mx.device_info(mx.gpu).get("total_memory", 0)
+    except (AttributeError, RuntimeError, TypeError):
+        total = 0
+    if total >= 100 * (1 << 30):
+        return 192
+    return 96
+
+
+def _moe_megakernel_plan(block, ln, dtype, grid=None, threads=512):
+    grid = _moe_megakernel_grid() if grid is None else grid
     mlp = getattr(block, "switch_mlp", None)
     if mlp is None or _cuda_profile() is None:
         return False

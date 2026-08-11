@@ -77,7 +77,8 @@ The opt-in megakernel on the same runs:
 | RTX 5090 | `sm120` | **426.66** | **+75.35%** (+71.10%–+79.70%) | 6/6 | 0/8 |
 
 **The strict lane reproduced the stock token stream on 8/8 screened prompts on
-every architecture.** The megakernel does not, as designed.
+every architecture.** The megakernel does not, as designed — see the quality
+section below for what that costs.
 
 The `sm100` strict interval crosses zero and its megakernel interval is wide:
 that host had the lowest absolute throughput of the five despite the largest
@@ -90,6 +91,65 @@ does not grow; on `sm86` that is 154.75 / 163.51 / 274.72 tok/s at 6.478 GB.
 Absolute rates are not a cross-GPU ranking: each row is one device instance on
 one host, and for this workload the host CPU moves the number more than the
 GPU does.
+
+That megakernel column was measured at the fixed grid of 32 blocks this release
+originally shipped, so it understates the lane on everything but a 3090; the
+next section is the retune, and the shipped default is faster than the table.
+
+### Megakernel grid
+
+The grid barrier is correct only while every block is resident, and MLX exposes
+neither the multiprocessor count nor occupancy, so the block count cannot be
+read off the device. It is selected from compute capability and memory instead.
+Medians for the fast lane, four fresh processes per point:
+
+| GPU | 32 | 64 | 96 | 128 | 192 | shipped |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX 3090 | 357.5 | **375.0** | 365.3 | 370.2 | 333.9 | 64 |
+| RTX 4090 | 429.1 | 469.1 | **507.7** | 478.5 | 463.3 | 96 |
+| H100 80GB | 344.8 | 359.0 | **365.9** | 358.4 | 356.2 | 96 |
+| RTX 5090 | 422.9 | 424.9 | **435.3** | 427.2 | 426.7 | 96 |
+| B200 | 293.4 | 327.9 | 324.9 | 332.1 | **335.4** | 192 |
+
+Leaving this at a fixed 32 costs 2.9% on RTX 5090 and 18.3% on RTX 4090.
+`MAPLE_MOE_MEGAKERNEL_GRID` overrides the choice; the value is clamped so a
+typo becomes a slowdown rather than a deadlock.
+
+Compare rows, not columns, with the release table above: that one is a paired
+measurement inside single processes, this one is a separate sweep on separate
+instances, and the absolute tok/s of a host-bound workload tracks the CPU it
+was rented with. A confirmation run of the shipped rule on a fresh RTX 4090
+selected 96 without being told to and measured 260.4 off, 280.8 strict
+(+7.8%), **465.0 megakernel (+78.6%)**, with strict identical on 8/8 screened
+prompts.
+
+### Quality
+
+Token equality answers whether the greedy path changed. It does not answer
+whether the model is worse, which is the question that matters for a lane that
+is within ~1 ULP rather than array-exact. `benchmarks/maple_quality_suite.py`
+scores twelve documents — prose, dialogue, code, SQL, structured text and
+arithmetic — one token at a time against a cache, so the fused decode kernels
+are actually exercised.
+
+| GPU | reference ppl | strict | megakernel | top-1 changed |
+| --- | ---: | --- | ---: | ---: |
+| RTX 3090 | 33.1857 | identical | 32.8173 (−1.1%) | 78 / 846 |
+| RTX 4090 | 33.1857 | identical | 32.8173 (−1.1%) | 78 / 846 |
+| H100 80GB | 32.9462 | identical | 32.6704 (−0.8%) | 80 / 846 |
+| RTX 5090 | 33.1647 | identical | 32.7340 (−1.3%) | 75 / 846 |
+| B200 | 33.1647 | identical | 32.7340 (−1.3%) | 75 / 846 |
+
+The strict lane matches the reference to the last digit of the mean NLL on
+every architecture, with zero top-1 changes — bit-exactness confirmed at the
+level of the distribution, not just the sampled token.
+
+The megakernel's perplexity is **lower** than the reference on all five, by
+0.8-1.3%. That is the signature of unbiased last-bit noise, not of a better or
+worse model: the same perturbation that flips 9% of top-1 predictions on
+near-ties moves the likelihood slightly, and it happened to move down here. It
+is not a quality improvement and should not be read as one. What it does rule
+out is a quality *regression*.
 
 ### What is on by default
 
@@ -278,6 +338,10 @@ single-model/single-device warm workload described above.
 - detailed allowlisted artifacts under
   [`results/cuda/multiarch/`](results/cuda/multiarch/), plus compact strict,
   graph, W2, and Blackwell summaries in [`results/cuda/`](results/cuda/).
+- The fusion release, the megakernel grid sweep and the quality suite are in
+  [`sm86-fusion-release.jsonl`](results/cuda/sm86-fusion-release.jsonl),
+  [`fusion-multiarch.jsonl`](results/cuda/fusion-multiarch.jsonl) and
+  [`megakernel-grid-and-quality.jsonl`](results/cuda/megakernel-grid-and-quality.jsonl).
 
 The baseline full-file source hashes were the release `28ceabac…` for
 `sm86/sm120`, `7785da2a…` for `sm89/sm90`, and `b34cd977…` for

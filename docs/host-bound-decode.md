@@ -31,8 +31,10 @@ throughput moved by roughly nothing.
 
 The corollary is more useful: because the GPU has milliseconds of slack per
 step, it is worth *spending* GPU time to buy back host operations. The MoE
-megakernel recomputes the residual add and RMSNorm redundantly in all 32 blocks
-purely to avoid needing a fourth grid barrier, and that trade is free.
+megakernel recomputes the residual add and RMSNorm redundantly in every block
+purely to avoid needing a fourth grid barrier, and that trade is free — free
+enough that raising the grid from 32 to 96 blocks, which triples the redundant
+work, is worth up to 18% because it finishes the expert pass sooner.
 
 ## The cost model
 

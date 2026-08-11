@@ -1,12 +1,30 @@
 # Source provenance
 
-## Fresh multi-architecture campaign
+## Current release: the fusion campaign
 
 The release source is [`../src/maple.py`](../src/maple.py), SHA-256
-`28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8`.
+`fa600724669a6cf6b2191ed220900f71f3f671714ca45e5f364448fb13f36d8c`.
 The integration patch against DeepGrove base
 `eba96c16158f032821b0bf374ea1421cfddef0a9` is SHA-256
-`eb9c36eb5aec3c93e52ddcc35d735f816a18ab5330460a05b7a641ba0f5174f0`.
+`e502db7407476530bf95f1bc7a9076c001a22db16e24a3968b2854b595f55067`;
+it applies clean to that base and reproduces the four checked-in files byte for
+byte, the fixture `tests/data/sm100_qk_rope_boundary.npz` included — without it
+the Blackwell boundary test fails in a clean clone.
+
+Every number in the fusion tables was measured on rented instances, one process
+per data point, from a source that differs from the checked-in one only in the
+megakernel grid: the strict and `off` lanes are untouched by that constant, and
+the retuned grid was confirmed on a fresh RTX 4090 after the fact.
+`results/cuda/megakernel-grid-and-quality.jsonl` holds both the sweep and the
+confirmation.
+
+## Earlier multi-architecture campaign
+
+That campaign's release source was SHA-256
+`28ceabac2b7570ff3712473c88eb7698b5a1904cd1b9cd55c698794fd457ccb8` and its
+integration patch
+`eb9c36eb5aec3c93e52ddcc35d735f816a18ab5330460a05b7a641ba0f5174f0`; both
+predate the fusion work above and are what the `0.3.x` tables were taken on.
 
 Fresh baseline execution used:
 
