@@ -99,11 +99,15 @@ _use_compiled_router = _env_flag("MAPLE_COMPILED_ROUTER", False)
 # block partition does not divide.
 _use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 
-# The array-exact megakernel: the same one-dispatch MoE block, but every
-# phase reproduces the stock chain's bits (see the recipes above its
-# source).  Off by default until it has survived the full screen; when it
-# does, it replaces the ~1 ULP lane outright.
-_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", False)
+# The array-exact megakernel, the default lane: the same one-dispatch MoE
+# block, and every phase reproduces the stock chain's bits (see the recipes
+# above its source).  It survived the full screen on sm86 and sm89 -- decode
+# stream identical to stock on 8/8 screened prompts, quality NLL to the last
+# digit, throughput at parity with the ~1 ULP megakernel (345 vs 341 and 320
+# vs 319 medians) -- so the default no longer trades the reproducible stream
+# for speed.  The ~1 ULP lane below stays on as the fallback for geometries
+# the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
+_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 
 
 def _kernel_backend():

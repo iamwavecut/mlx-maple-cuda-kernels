@@ -853,11 +853,16 @@ assert maple._router_select_kernel_cache == {}
             "next attention input differs from the stock chain",
         )
 
-    def test_exact_megakernel_is_opt_in_for_now(self):
-        """Until the full screen passes, the exact lane must not self-enable."""
+    def test_exact_megakernel_is_the_default_lane(self):
+        """The screened exact lane leads; the ~1 ULP lane is the fallback."""
         with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertTrue(
+                maple._env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
+            )
+        with mock.patch.dict("os.environ", {"MAPLE_MOE_MEGAKERNEL_EXACT": "0"}):
             self.assertFalse(
-                maple._env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", False)
+                maple._env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True),
+                "the escape hatch must stay one variable away",
             )
 
     def test_megakernel_tail_norm_is_exactly_the_fuse(self):

@@ -20,6 +20,14 @@
   partials, then one add), not the flat-array `all_reduce` linear order the
   first probe pinned — the shape picks the kernel and the bits; and the
   renorm division is IEEE `div.rn`.
+- **Made the array-exact megakernel the default lane** after it reached
+  throughput parity on two architectures with the full screen green each
+  time: sm86 345.2 vs 341.1 and sm89 320.3 vs 318.9 median tok/s against the
+  ~1 ULP megakernel, stream identical to stock on 8/8 screened prompts on
+  both, quality NLL to the last digit. The default now carries the strict
+  lane's reproducible stream at the fast lane's speed; the ~1 ULP lane
+  remains as the fallback for geometries the exact plan declines, and
+  `MAPLE_MOE_MEGAKERNEL_EXACT=0` restores the previous behavior.
 - Closed the exact lane's throughput gap with bit-neutral load and
   scheduling work: `qmm_tile` loads a full 128-k tile (two `uint4` reads and
   one scale/bias pair) instead of eight per-atom triples, phase C runs all

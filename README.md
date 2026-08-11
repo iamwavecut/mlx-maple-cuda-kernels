@@ -2,11 +2,13 @@
 
 Fail-closed CUDA research kernels for
 [DeepGrove's Maple preview](https://github.com/deepgrove-ai/mlx-lm-deepgrove).
-The default lane fuses the whole MoE block into one dispatch and is 73-88%
-faster than portable MLX, within ~1 ULP of bf16; `MAPLE_MOE_MEGAKERNEL=0`
-returns an array-exact lane that preserves the stock token stream and array
-boundaries, still 7-17% faster. Known approximate router, add/RMS, ternary,
-FlashHead, and KV-quantized paths remain off by default.
+The default lane fuses the whole MoE block into one dispatch at 73-88% over
+portable MLX **and reproduces the stock token stream bit for bit**: the
+array-exact megakernel leads, the ~1 ULP megakernel serves as fallback for
+geometries the exact plan declines, and `MAPLE_MOE_MEGAKERNEL_EXACT=0
+MAPLE_MOE_MEGAKERNEL=0` steps down to the two-fusion strict lane. Known
+approximate router, add/RMS, ternary, FlashHead, and KV-quantized paths
+remain off by default.
 
 > **Status:** independent community research, not an MLX or DeepGrove release
 > and not a claim of official model-author support. Evidence is scoped to the
@@ -166,11 +168,19 @@ tests before live data caught it.
 
 After three rounds of bit-neutral load and scheduling work — tile-wide
 `uint4` weight reads, single-projection warp tasks with the activation folded
-into the next phase's shared load, paired router reads — the trade is gone on
-the dev host: **exact 345 vs ~1 ULP 341 median tok/s** (strict 176), with the
-stream and quality checks re-verified after every optimization. It ships
-opt-in pending multi-architecture confirmation, after which it is the natural
-default: the fast lane's speed with the strict lane's stream.
+into the next phase's shared load, paired router reads — the trade is gone:
+
+| Host | strict | ~1 ULP megakernel | exact megakernel | exact stream |
+| --- | ---: | ---: | ---: | --- |
+| RTX 3090 (shared dev) | 176.3 | 341.1 | **345.2** | 8/8 identical |
+| RTX 4090 (secure) | 175.8 | 318.9 | **320.3** | 8/8 identical |
+
+Medians over fresh interleaved processes; quality NLL bit-identical to strict
+on both. **The exact lane is now the default**: the fast lane's speed with
+the strict lane's stream. The ~1 ULP megakernel stays enabled as the fallback
+for geometries the exact plan declines (it gates on 256 experts, top-8,
+bf16, 2-bit affine gs=128, 128-divisible dims), and sm90/sm100/sm120
+confirmation runs are the outstanding follow-up.
 
 ### Quality
 
@@ -357,7 +367,8 @@ non-array-exact default off and leaves a fully array-exact configuration.
 | Q/K norm + partial RoPE/NoPE | auto-probed | array-exact on the listed SKUs/toolchains |
 | Fused QKV split (`_use_fused_qkv`) | **on** | array-exact by construction; probed live |
 | Residual add + RMSNorm (`_use_fused_add_rms`) | **on** | array-exact once the thread mapping matches `mx.fast.rms_norm` |
-| MoE megakernel (`MAPLE_MOE_MEGAKERNEL`) | **on** | within ~1 ULP of bf16; not array-exact; no measurable quality cost |
+| Exact MoE megakernel (`MAPLE_MOE_MEGAKERNEL_EXACT`) | **on** | array-exact; stock stream on 8/8 screened prompts (sm86, sm89) |
+| MoE megakernel (`MAPLE_MOE_MEGAKERNEL`) | **on** (fallback) | within ~1 ULP of bf16; runs only where the exact plan declines |
 | Compiled router (`MAPLE_COMPILED_ROUTER`) | off | array-exact; end-to-end effect not distinguishable from zero |
 | Cached flat decode LHS | off | exact in campaign; lifecycle-limited opt-in |
 | Router GEMV/softmax/top-8 | off | normalized scores not array-exact |

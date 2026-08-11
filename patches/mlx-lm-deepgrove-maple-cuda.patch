@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..52e01de 100644
+index a0673f7..49864d0 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index a0673f7..52e01de 100644
  from dataclasses import dataclass
  from functools import partial
  from typing import Any, List, Optional
-@@ -17,32 +19,210 @@ from mlx_lm.models.base import (
+@@ -17,32 +19,214 @@ from mlx_lm.models.base import (
  )
  from mlx_lm.models.cache import KVCache, RotatingKVCache
  from mlx_lm.models.rope_utils import initialize_rope
@@ -95,11 +95,15 @@ index a0673f7..52e01de 100644
 +# block partition does not divide.
 +_use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 +
-+# The array-exact megakernel: the same one-dispatch MoE block, but every
-+# phase reproduces the stock chain's bits (see the recipes above its
-+# source).  Off by default until it has survived the full screen; when it
-+# does, it replaces the ~1 ULP lane outright.
-+_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", False)
++# The array-exact megakernel, the default lane: the same one-dispatch MoE
++# block, and every phase reproduces the stock chain's bits (see the recipes
++# above its source).  It survived the full screen on sm86 and sm89 -- decode
++# stream identical to stock on 8/8 screened prompts, quality NLL to the last
++# digit, throughput at parity with the ~1 ULP megakernel (345 vs 341 and 320
++# vs 319 medians) -- so the default no longer trades the reproducible stream
++# for speed.  The ~1 ULP lane below stays on as the fallback for geometries
++# the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
++_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 +
 +
 +def _kernel_backend():
@@ -234,7 +238,7 @@ index a0673f7..52e01de 100644
      """
      try:
          got, want = fast(), reference()
-@@ -51,9 +231,8 @@ def _matches(fast, reference, tol=2e-2):
+@@ -51,9 +235,8 @@ def _matches(fast, reference, tol=2e-2):
          return False
      return len(got) == len(want) and all(
          g.shape == w.shape
@@ -246,7 +250,7 @@ index a0673f7..52e01de 100644
          for g, w in zip(got, want)
      )
  
-@@ -123,24 +302,129 @@ def _make_add_rms_norm_kernel(eps):
+@@ -123,24 +306,129 @@ def _make_add_rms_norm_kernel(eps):
      )
  
  
@@ -383,7 +387,7 @@ index a0673f7..52e01de 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -154,6 +438,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
+@@ -154,6 +442,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
      )
  
  
@@ -513,7 +517,7 @@ index a0673f7..52e01de 100644
  # Inlined rather than imported from switch_layers: those helpers are private
  # (underscore-prefixed), and this file must keep loading against whatever
  # mlx-lm a user has installed when it ships inside a checkpoint.
-@@ -226,7 +633,7 @@ def _make_qk_norm_rope_kernel():
+@@ -226,7 +637,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -522,7 +526,7 @@ index a0673f7..52e01de 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +670,244 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +674,244 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -768,7 +772,7 @@ index a0673f7..52e01de 100644
  
  
  class MapleAttention(nn.Module):
-@@ -293,13 +937,20 @@ class MapleAttention(nn.Module):
+@@ -293,13 +941,20 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -789,7 +793,7 @@ index a0673f7..52e01de 100644
          if self.use_rope:
              rope_dim = int(self.head_dim * args.partial_rotary_factor)
              self.rope = initialize_rope(
-@@ -310,45 +961,61 @@ class MapleAttention(nn.Module):
+@@ -310,45 +965,61 @@ class MapleAttention(nn.Module):
                  max_position_embeddings=args.max_position_embeddings,
              )
  
@@ -879,7 +883,7 @@ index a0673f7..52e01de 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -375,14 +1042,30 @@ class MapleAttention(nn.Module):
+@@ -375,14 +1046,30 @@ class MapleAttention(nn.Module):
              n_q = self.num_attention_heads
              n_kv = self.num_key_value_heads
              qk_size = (n_q + n_kv) * self.head_dim
@@ -913,7 +917,7 @@ index a0673f7..52e01de 100644
              out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
              queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
              keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-@@ -409,6 +1092,9 @@ class MapleAttention(nn.Module):
+@@ -409,6 +1096,9 @@ class MapleAttention(nn.Module):
                  queries = self.rope(queries, offset=offset)
                  keys = self.rope(keys, offset=offset)
  
@@ -923,7 +927,7 @@ index a0673f7..52e01de 100644
          if cache is not None:
              keys, values = cache.update_and_fetch(keys, values)
  
-@@ -419,6 +1105,48 @@ class MapleAttention(nn.Module):
+@@ -419,6 +1109,48 @@ class MapleAttention(nn.Module):
          output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
          return self.o_proj(output)
  
@@ -972,7 +976,7 @@ index a0673f7..52e01de 100644
  
  class MapleMLP(nn.Module):
      def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-@@ -618,7 +1346,335 @@ def _make_fused_router_kernel():
+@@ -618,7 +1350,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -1309,7 +1313,7 @@ index a0673f7..52e01de 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1689,84 @@ class MapleGate(nn.Module):
+@@ -633,23 +1693,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -1408,7 +1412,7 @@ index a0673f7..52e01de 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -659,6 +1776,19 @@ class MapleGate(nn.Module):
+@@ -659,6 +1780,19 @@ class MapleGate(nn.Module):
          gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
          return group_expert_select(gates, self.top_k)
  
@@ -1428,7 +1432,7 @@ index a0673f7..52e01de 100644
      def _probe(self, x):
          # Not _matches(): the two paths may order the selected experts
          # differently, and an exact tie at the top-k boundary may legitimately
-@@ -670,13 +1800,34 @@ class MapleGate(nn.Module):
+@@ -670,13 +1804,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -1466,7 +1470,7 @@ index a0673f7..52e01de 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1846,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,6 +1850,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -1610,7 +1614,7 @@ index a0673f7..52e01de 100644
  class MapleSwitchGLU(nn.Module):
      """SwitchGLU with the up and gate projections fused into one gather
      matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +1993,78 @@ class MapleSwitchGLU(nn.Module):
+@@ -705,8 +1997,78 @@ class MapleSwitchGLU(nn.Module):
              input_dims, 2 * hidden_dims, num_experts, bias=bias
          )
          self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
@@ -1689,7 +1693,7 @@ index a0673f7..52e01de 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,16 +2073,1255 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2077,1255 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -2947,7 +2951,7 @@ index a0673f7..52e01de 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +3389,82 @@ class MapleModel(nn.Module):
+@@ -792,29 +3393,82 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -3037,7 +3041,7 @@ index a0673f7..52e01de 100644
  
      def __call__(
          self,
-@@ -836,12 +3486,29 @@ class MapleModel(nn.Module):
+@@ -836,12 +3490,29 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
@@ -3069,7 +3073,7 @@ index a0673f7..52e01de 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -1021,6 +3688,32 @@ class Model(nn.Module):
+@@ -1021,6 +3692,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -3102,7 +3106,7 @@ index a0673f7..52e01de 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +3732,8 @@ class Model(nn.Module):
+@@ -1039,8 +3736,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
@@ -3293,7 +3297,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/tests/test_maple_kernels.py b/tests/test_maple_kernels.py
-index 6e232ba..bb315aa 100644
+index 6e232ba..63325d6 100644
 --- a/tests/test_maple_kernels.py
 +++ b/tests/test_maple_kernels.py
 @@ -9,7 +9,14 @@ is off on this machine", not "the model is broken". A precision failure does
@@ -3852,7 +3856,7 @@ index 6e232ba..bb315aa 100644
          slow = decode(False)
          self.assertEqual(int(fast.argmax()), int(slow.argmax()), "argmax differs")
          self.assertTrue(
-@@ -270,5 +680,250 @@ class TestMapleKernels(unittest.TestCase):
+@@ -270,5 +680,255 @@ class TestMapleKernels(unittest.TestCase):
          self.assertTrue(mx.array_equal(grouped[f"{prefix}.scales"], scales))
  
  
@@ -4029,11 +4033,16 @@ index 6e232ba..bb315aa 100644
 +            "next attention input differs from the stock chain",
 +        )
 +
-+    def test_exact_megakernel_is_opt_in_for_now(self):
-+        """Until the full screen passes, the exact lane must not self-enable."""
++    def test_exact_megakernel_is_the_default_lane(self):
++        """The screened exact lane leads; the ~1 ULP lane is the fallback."""
 +        with mock.patch.dict("os.environ", {}, clear=True):
++            self.assertTrue(
++                maple._env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
++            )
++        with mock.patch.dict("os.environ", {"MAPLE_MOE_MEGAKERNEL_EXACT": "0"}):
 +            self.assertFalse(
-+                maple._env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", False)
++                maple._env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True),
++                "the escape hatch must stay one variable away",
 +            )
 +
 +    def test_megakernel_tail_norm_is_exactly_the_fuse(self):
