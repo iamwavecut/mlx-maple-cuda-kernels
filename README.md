@@ -125,6 +125,25 @@ selected 96 without being told to and measured 260.4 off, 280.8 strict
 (+7.8%), **465.0 megakernel (+78.6%)**, with strict identical on 8/8 screened
 prompts.
 
+### Toward an exact fast lane
+
+The megakernel's ~1 ULP story exists because a software fp32 loop cannot
+reproduce `qmm_naive`, the kernel the stock path actually dispatches to for a
+decode step's eight gathered experts. It turns out it can be reproduced —
+exactly. `benchmarks/maple_qmm_naive_repro.py` re-derives the stock result bit
+for bit in a custom kernel: dequant as `bf16(bf16(q*s)+z)`, the same
+`m16n8k16` bf16 tensor-core atom with one row of A populated, k-tiles of 128
+accumulated in order, one epilogue rounding. Every column of both expert
+projections matches on real weights.
+
+Two useful facts fall out. The CUDA dispatch sends `M*B < 8` to `gather_qmv`,
+a different kernel — a decode step routes 8 experts, so the model's own path
+is `qmm_naive`, and single-expert comparisons measure the wrong reference.
+And each output column's bits depend only on the k-order, so any grid layout
+over columns preserves them — which is what makes an array-exact expert phase
+inside the megakernel constructively possible. That lane — megakernel speed
+with the strict lane's reproducible stream — is the next piece of work.
+
 ### Quality
 
 Token equality answers whether the greedy path changed. It does not answer
@@ -164,7 +183,9 @@ out is a quality *regression*.
   the decode loop now issues one fuse per step instead of one per layer
   (measured: 1 against 25 on the shipped checkpoint). The tail reproduces the
   exact fuse bit for bit — a CUDA test asserts it — so it adds nothing to the
-  lane's error story.
+  lane's error story. End-to-end it is worth +2.2% (RTX 3090) and +3.5%
+  (RTX 4090) as paired geomeans over ten interleaved fresh-process pairs,
+  with the token stream bit-identical to the pre-tail build in every one.
 
   It is within ~1 ULP of bf16 rather than array-exact: `qmm_naive` gets its
   accuracy from a tensor-core MMA, which a software fp32 reduction cannot

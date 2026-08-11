@@ -11,6 +11,18 @@
   output is bit-identical to the standalone fuse — the lane's ~1 ULP story
   stays confined to the MoE math. The 846-token quality suite reproduces the
   previous build's corpus NLL to the last digit in all three lanes.
+- Measured the tail end-to-end on rented hosts, paired and interleaved:
+  +2.2% paired geomean on an RTX 3090 (8/10 wins) and +3.5% on an RTX 4090
+  (8/10 wins), token stream bit-identical in every process. Conservative --
+  both hosts carried external CPU load.
+- Proved the stock MoE matmul is reproducible bit for bit in a custom kernel
+  (`benchmarks/maple_qmm_naive_repro.py`): dequant as bf16(bf16(q*s)+z), the
+  same m16n8k16 bf16 tensor-core atom, k-tiles in order, one epilogue
+  rounding — every column of both projections matches `qmm_naive` exactly on
+  real weights. The decode dispatch picks qmm_naive whenever a step routes 8
+  experts (M*B >= 8); gather_qmv is the B=1 kernel and was the wrong earlier
+  reference. This makes an array-exact megakernel expert phase — a fast lane
+  that keeps the strict lane's reproducible stream — constructively possible.
 - Added `benchmarks/maple_fast_lane_profile.py`: exclusive host time per
   sub-block with the megakernel on. On the shared-GPU dev host the step's
   remaining host budget is attention 681 us, KV-cache updates 334 us,
