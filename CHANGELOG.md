@@ -42,6 +42,13 @@
   matches the ~1 ULP megakernel (341 median) while carrying the stock
   stream.
 
+- Pinned the bit recipes for the next fusion frontier, the attention block
+  (`benchmarks/maple_attention_semantics.py`): the decode SDPA kernel
+  (`kernel_sdpav_1pass`, the `kL <= 1024` route) reproduced 12/12 bitwise at
+  five context lengths, and the dense bf16 qkv/o_proj gemv 12/12 at both
+  shapes. With the qkv-split and add+RMSNorm fusions already exact, every
+  decode attention op except long-context SDPA has a proven recipe.
+
 ## 0.5.0 — 2026-08-11
 
 - Folded the next layer's residual add + RMSNorm into the megakernel as a
