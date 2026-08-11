@@ -13,8 +13,10 @@ stock building block of the router / aggregation chain:
   top-8       argpartition(kth=-8) tail order == argsort tail (ascending by
               value), including ties
   renorm      scores.sum(-1): linear 8-element fp32 sum, then + 1e-20
-  aggregate   (y32 * s).sum(axis=-2): order NOT yet pinned (14/16 for both
-              linear-mul and fma candidates); read col_reduce before relying
+  aggregate   (y32 * s).sum(axis=-2): col_reduce_small's linear loop with the
+              multiply rounded separately -- __fmul_rn then __fadd_rn, NO fma
+              contraction (contraction is exactly what broke the obvious
+              candidates)
 
 Prints one JSON report. Every "x/y" is bitwise array_equal counts.
 
@@ -130,6 +132,18 @@ SUM8_SRC = r"""
     out[0] = s;
 """
 
+AGG_SRC = r"""
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= NC_) return;
+    float s = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const float p = __fmul_rn(__bfloat162float(y[e * NC_ + c]), sc[e]);
+        s = __fadd_rn(s, p);
+    }
+    out[c] = __nv_bfloat16(s);
+"""
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -223,6 +237,27 @@ def main():
         mx.eval(got, ref)
         hits += int(mx.array_equal(got, ref).item())
     report["renorm_sum8_linear"] = f"{hits}/64"
+
+    # --- aggregation ---
+    kern = mx.fast.cuda_kernel(
+        name="exact_aggregate", input_names=["y", "sc"],
+        output_names=["out"], source=AGG_SRC)
+    nc = 2048
+    hits = 0
+    for i in range(64):
+        mx.random.seed(4000 + i)
+        y = mx.random.normal((8, nc)).astype(mx.bfloat16)
+        sc = mx.softmax(mx.random.normal((8,)).astype(mx.float32))
+        mx.eval(y, sc)
+        ref = ((y.astype(mx.float32) * sc[:, None])
+               .sum(axis=0).astype(mx.bfloat16))
+        (got,) = kern(
+            inputs=[y.reshape(-1), sc], template=[("NC_", nc)],
+            grid=(nc, 1, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(nc,)], output_dtypes=[mx.bfloat16])
+        mx.eval(got, ref)
+        hits += int(mx.array_equal(got, ref).item())
+    report["aggregate_linear_uncontracted"] = f"{hits}/64"
 
     print(json.dumps(report), flush=True)
 

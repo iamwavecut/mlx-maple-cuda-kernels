@@ -141,8 +141,18 @@ a different kernel — a decode step routes 8 experts, so the model's own path
 is `qmm_naive`, and single-expert comparisons measure the wrong reference.
 And each output column's bits depend only on the k-order, so any grid layout
 over columns preserves them — which is what makes an array-exact expert phase
-inside the megakernel constructively possible. That lane — megakernel speed
-with the strict lane's reproducible stream — is the next piece of work.
+inside the megakernel constructively possible.
+
+The rest of the block is pinned too (`benchmarks/maple_exact_lane_semantics.py`,
+all bitwise on hardware): the fp32 logits gemv order, an exact online-softmax
+port, argpartition's returned order (argsort's ascending tail, ties included —
+load-bearing because it feeds the aggregation sum), the linear renorm sum, and
+the aggregation as `col_reduce_small`'s linear loop with the multiply rounded
+separately from the sum — `__fmul_rn` then `__fadd_rn`, where letting the
+compiler contract to fma is exactly what breaks equality. Every component of
+the stock MoE block now has a proven bit recipe: the exact megakernel —
+megakernel speed with the strict lane's reproducible stream — is an assembly
+task, and it is the next piece of work.
 
 ### Quality
 

@@ -28,8 +28,11 @@
   logits gemv order, an exact online-softmax port (100/100), argpartition's
   tail being argsort's tail including ties (400/400), and the linear renorm
   sum. Together with the qmm_naive reproduction this reduces the exact
-  megakernel to an assembly task; only the stock aggregation order is still
-  unpinned.
+  megakernel to an assembly task. The aggregation order was the last holdout
+  and fell to the same method: `sum(axis=-2)` over 8 experts dispatches to
+  `col_reduce_small`'s linear loop, and the load-bearing detail is that the
+  stock chain rounds the fp32 multiply in its own kernel before the sum --
+  `__fmul_rn` then `__fadd_rn`, never fmaf. 64/64 bitwise.
 - Added `benchmarks/maple_fast_lane_profile.py`: exclusive host time per
   sub-block with the megakernel on. On the shared-GPU dev host the step's
   remaining host budget is attention 681 us, KV-cache updates 334 us,
