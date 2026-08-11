@@ -378,12 +378,31 @@ This is deliberately narrower than claiming whole-module equivalence.
   device instance measured once, not a fleet claim.
 - **MLX CUDA 0.32.0 needs a driver newer than 550.163.** An L40S offered with
   driver 550.163.01 could not start MLX at all
-  (`cudaMallocManaged failed: unknown error`). Working hosts here ran 575-580.
-- The megakernel's grid barrier assumes every block is resident. MLX does not
-  expose the multiprocessor count, so the grid is fixed at 32 blocks, which
-  every CUDA GPU of this era holds at once. Throughput is flat from 32 to 160
-  blocks on RTX 3090 and only falls off past 192, so the conservative choice
-  costs nothing; raising it on a smaller device would risk a deadlock.
+  (`cudaMallocManaged failed: unknown error`). Working hosts here ran 575-610.
+- **A CUDA 13 toolkit on the host breaks every custom kernel.** `mlx-cuda-12`
+  compiles kernels with its bundled nvrtc 12.9 but takes headers from
+  `$CUDA_HOME/include`, defaulting to `/usr/local/cuda`. On a host whose
+  toolkit is 13.x that mixes nvrtc 12 with CUDA 13 headers and every
+  `mx.fast.cuda_kernel` fails to compile inside `cuda_fp8.hpp`, which surfaces
+  as *every* fast path silently falling back. Install the matching headers and
+  point `CUDA_HOME` at them:
+
+  ```bash
+  pip install 'nvidia-cuda-runtime-cu12==12.9.*'
+  mkdir -p ~/cuda12 && ln -s "$(python -c 'import nvidia.cuda_runtime, pathlib; print(pathlib.Path(nvidia.cuda_runtime.__file__).parent / "include")')" ~/cuda12/include
+  export CUDA_HOME=~/cuda12
+  ```
+- The megakernel's grid barrier assumes every block is resident, and MLX
+  exposes neither the multiprocessor count nor occupancy, so the grid is
+  inferred from compute capability and memory rather than measured. The rule is
+  deliberately conservative — 64 to 192 blocks where residency is certain — and
+  `MAPLE_MOE_MEGAKERNEL_GRID` overrides it. A value far above what the device
+  holds would deadlock, which is why the override is clamped at 240.
+- **The megakernel wants the GPU to itself.** Its barrier spins, so a GPU
+  shared with another CUDA process pays for the spin. On a 3090 running two
+  other workloads the fast lane swung between 183 and 340 tok/s across four
+  fresh processes while `off` swung between 123 and 211 — usable, but not
+  something to benchmark on.
 - Community-cloud hosts share the CPU even when the GPU is dedicated, and this
   workload is host-bound. One host with an idle GPU and a load average of 4-9
   returned between 104.7 and 325.8 tok/s for the same configuration. Check

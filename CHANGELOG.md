@@ -28,6 +28,9 @@
 - Made the megakernel grid depend on the device instead of a fixed 32 blocks,
   which was tuned on a 3090 and left 18.3% on an RTX 4090 and 14.3% on a B200.
   Selected from compute capability and memory, overridable and clamped.
+- Documented that a CUDA 13 toolkit on the host makes every custom kernel fail
+  to compile, because `mlx-cuda-12` pairs its bundled nvrtc 12.9 with headers
+  from `$CUDA_HOME`. It presents as every fast path silently falling back.
 - Made every lane selectable from the environment (`MAPLE_MOE_MEGAKERNEL`,
   `MAPLE_COMPILED_ROUTER`, `MAPLE_FUSED_ADD_RMS`, `MAPLE_FUSED_QKV`). The fast
   lane previously required importing the module and setting an attribute before
