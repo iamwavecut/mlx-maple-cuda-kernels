@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Attention megakernel (`MAPLE_ATTENTION_MEGAKERNEL=1`, research): the whole
+  decode attention block — 2-bit qkv projection on the qmv recipe, per-head
+  RMSNorm + partial RoPE, KV-cache append into caller-owned buffers that
+  mirror the stock physical layout, single-token SDPA, 2-bit output
+  projection — as one dispatch behind three grid barriers, with on-device
+  step counters so CUDA graphs capture once. Bit-identical to stock on
+  4/4 streams, across the window-rotation boundary and across the
+  kL>1024 fallback hand-back. On a clean sm86: +20.6% median with CUDA
+  graphs (+13.3% without) over the exact-MoE-only lane, with a much
+  tighter spread. Off by default pending multi-arch validation.
+
 ## 0.6.0 — 2026-08-11
 
 - **Built the array-exact megakernel** (`MAPLE_MOE_MEGAKERNEL_EXACT=1`,

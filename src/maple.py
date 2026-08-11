@@ -3535,16 +3535,20 @@ def _attn_mega_call(layer, hn, c):
 
 
 def _attn_mega_writeback(attn, c):
-    """Push the fused buffers back into the stock cache before leaving."""
+    """Push the fused buffers back into the stock cache before leaving.
+
+    The stock buffers did not grow while the fused path ran, so they are
+    rebuilt outright from our slices; the counters were kept in lockstep
+    all along, so update_and_fetch continues seamlessly.
+    """
     state = getattr(attn, "_mega_state", None)
-    if state is None or state.synced_offset < 0 or c.keys is None:
+    if state is None or state.synced_offset < 0:
         return
-    n = min(c.keys.shape[2], state.cap)
-    k = c.keys
-    v = c.values
-    k[..., :n, :] = state.kbuf[..., :n, :].astype(c.keys.dtype)
-    v[..., :n, :] = state.vbuf[..., :n, :].astype(c.values.dtype)
-    mx.eval(k, v)
+    n = min(state.synced_offset, state.cap)
+    if n > 0:
+        c.keys = state.kbuf[..., :n, :]
+        c.values = state.vbuf[..., :n, :]
+        mx.eval(c.keys, c.values)
     state.synced_offset = -1
 
 

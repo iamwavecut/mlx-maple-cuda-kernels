@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..49864d0 100644
+index a0673f7..2276540 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index a0673f7..49864d0 100644
  from dataclasses import dataclass
  from functools import partial
  from typing import Any, List, Optional
-@@ -17,32 +19,214 @@ from mlx_lm.models.base import (
+@@ -17,32 +19,218 @@ from mlx_lm.models.base import (
  )
  from mlx_lm.models.cache import KVCache, RotatingKVCache
  from mlx_lm.models.rope_utils import initialize_rope
@@ -104,6 +104,10 @@ index a0673f7..49864d0 100644
 +# for speed.  The ~1 ULP lane below stays on as the fallback for geometries
 +# the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
 +_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
++
++# Research flag: the one-dispatch decode attention block.  Off by default
++# until it survives the full stream screen.
++_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", False)
 +
 +
 +def _kernel_backend():
@@ -238,7 +242,7 @@ index a0673f7..49864d0 100644
      """
      try:
          got, want = fast(), reference()
-@@ -51,9 +235,8 @@ def _matches(fast, reference, tol=2e-2):
+@@ -51,9 +239,8 @@ def _matches(fast, reference, tol=2e-2):
          return False
      return len(got) == len(want) and all(
          g.shape == w.shape
@@ -250,7 +254,7 @@ index a0673f7..49864d0 100644
          for g, w in zip(got, want)
      )
  
-@@ -123,24 +306,129 @@ def _make_add_rms_norm_kernel(eps):
+@@ -123,24 +310,129 @@ def _make_add_rms_norm_kernel(eps):
      )
  
  
@@ -387,7 +391,7 @@ index a0673f7..49864d0 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -154,6 +442,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
+@@ -154,6 +446,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
      )
  
  
@@ -517,7 +521,7 @@ index a0673f7..49864d0 100644
  # Inlined rather than imported from switch_layers: those helpers are private
  # (underscore-prefixed), and this file must keep loading against whatever
  # mlx-lm a user has installed when it ships inside a checkpoint.
-@@ -226,7 +637,7 @@ def _make_qk_norm_rope_kernel():
+@@ -226,7 +641,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -526,7 +530,7 @@ index a0673f7..49864d0 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +674,244 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +678,244 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -772,7 +776,7 @@ index a0673f7..49864d0 100644
  
  
  class MapleAttention(nn.Module):
-@@ -293,13 +941,20 @@ class MapleAttention(nn.Module):
+@@ -293,15 +945,23 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -792,8 +796,11 @@ index a0673f7..49864d0 100644
 +        self._can_fuse_qk = not (self.use_rope and args.rope_scaling is not None)
          if self.use_rope:
              rope_dim = int(self.head_dim * args.partial_rotary_factor)
++            self._rope_dim = rope_dim
              self.rope = initialize_rope(
-@@ -310,45 +965,61 @@ class MapleAttention(nn.Module):
+                 rope_dim,
+                 args.rope_theta,
+@@ -310,45 +970,61 @@ class MapleAttention(nn.Module):
                  max_position_embeddings=args.max_position_embeddings,
              )
  
@@ -883,7 +890,7 @@ index a0673f7..49864d0 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -375,14 +1046,30 @@ class MapleAttention(nn.Module):
+@@ -375,14 +1051,30 @@ class MapleAttention(nn.Module):
              n_q = self.num_attention_heads
              n_kv = self.num_key_value_heads
              qk_size = (n_q + n_kv) * self.head_dim
@@ -917,7 +924,7 @@ index a0673f7..49864d0 100644
              out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
              queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
              keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-@@ -409,6 +1096,9 @@ class MapleAttention(nn.Module):
+@@ -409,6 +1101,9 @@ class MapleAttention(nn.Module):
                  queries = self.rope(queries, offset=offset)
                  keys = self.rope(keys, offset=offset)
  
@@ -927,7 +934,7 @@ index a0673f7..49864d0 100644
          if cache is not None:
              keys, values = cache.update_and_fetch(keys, values)
  
-@@ -419,6 +1109,48 @@ class MapleAttention(nn.Module):
+@@ -419,6 +1114,48 @@ class MapleAttention(nn.Module):
          output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
          return self.o_proj(output)
  
@@ -976,7 +983,7 @@ index a0673f7..49864d0 100644
  
  class MapleMLP(nn.Module):
      def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-@@ -618,7 +1350,335 @@ def _make_fused_router_kernel():
+@@ -618,7 +1355,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -1313,7 +1320,7 @@ index a0673f7..49864d0 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1693,84 @@ class MapleGate(nn.Module):
+@@ -633,23 +1698,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -1368,7 +1375,7 @@ index a0673f7..49864d0 100644
 +            (self.num_experts // 32) * 256
 +            if backend == "metal"
 +            else _cuda_router_grid_size(self.num_experts, profile)
-+        )
+         )
 +        template = [
 +            ("T_", self.weight.dtype),
 +            ("NEXP", self.num_experts),
@@ -1380,7 +1387,7 @@ index a0673f7..49864d0 100644
 +            mx.uint32
 +            if backend == "cuda" and _cuda_router_indices_uint32
 +            else mx.int32
-         )
++        )
 +        if backend == "cuda":
 +            # The multi-block completion counter is a zero-initialized output,
 +            # not hidden mutable input state.  This makes graph dependencies
@@ -1412,7 +1419,7 @@ index a0673f7..49864d0 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -659,6 +1780,19 @@ class MapleGate(nn.Module):
+@@ -659,6 +1785,19 @@ class MapleGate(nn.Module):
          gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
          return group_expert_select(gates, self.top_k)
  
@@ -1432,7 +1439,7 @@ index a0673f7..49864d0 100644
      def _probe(self, x):
          # Not _matches(): the two paths may order the selected experts
          # differently, and an exact tie at the top-k boundary may legitimately
-@@ -670,13 +1804,34 @@ class MapleGate(nn.Module):
+@@ -670,13 +1809,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -1470,7 +1477,7 @@ index a0673f7..49864d0 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1850,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,6 +1855,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -1614,7 +1621,7 @@ index a0673f7..49864d0 100644
  class MapleSwitchGLU(nn.Module):
      """SwitchGLU with the up and gate projections fused into one gather
      matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +1997,78 @@ class MapleSwitchGLU(nn.Module):
+@@ -705,8 +2002,78 @@ class MapleSwitchGLU(nn.Module):
              input_dims, 2 * hidden_dims, num_experts, bias=bias
          )
          self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
@@ -1693,7 +1700,7 @@ index a0673f7..49864d0 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,16 +2077,1255 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2082,1730 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -2694,6 +2701,481 @@ index a0673f7..49864d0 100644
 +"""
 +
 +
++# The attention megakernel: the whole decode attention block -- qkv gemv,
++# per-head RMSNorm + RoPE, the KV-cache append, single-token SDPA and the
++# output projection -- in one dispatch behind three grid barriers.  Every
++# phase is a proven bit recipe:
++#   qkv / o_proj   the dense bf16 gemv order (maple_attention_semantics.py,
++#                  12/12 at both shapes)
++#   split+norm+rope  a line-for-line port of the shipped exact split kernel
++#   sdpa           the kernel_sdpav_1pass port (12/12 at five context
++#                  lengths); the kL > 1024 route is not ported, so the plan
++#                  gates on capacity and the caller falls back per layer
++#   cache append   value-identical writes into caller-owned contiguous
++#                  buffers at the same physical slot the stock rotating
++#                  cache uses -- SDPA walks the same physical order, so the
++#                  bits cannot move
++_ATTN_MEGAKERNEL_HEADER = r"""
++// The stock qmv row: 2-bit affine, group_size 128, elems_per_thread 16.
++// Lane l owns 16 consecutive elements at stride 512; each tile is exactly
++// one packed word and one scale/bias pair; the per-element accumulators are
++// bf16 and take one HFMA rounding per tile; the tail is a linear float sum
++// of the sixteen lanesums, then the butterfly.  Matches qmv.cu bit for bit.
++__device__ __forceinline__ float qmv_row(
++    const float* xf,             // activations, exact float(bf16) values
++    const unsigned int* wq,      // packed rows [n][k/16]
++    const __nv_bfloat16* sc,     // scales [n][k/128]
++    const __nv_bfloat16* bi,     // biases [n][k/128]
++    int row,
++    int k,
++    int lane) {
++    const unsigned int* wrow = wq + (long long)row * (k >> 4);
++    const __nv_bfloat16* srow = sc + (long long)row * (k >> 7);
++    const __nv_bfloat16* brow = bi + (long long)row * (k >> 7);
++    __nv_bfloat16 sums[16];
++    #pragma unroll
++    for (int i = 0; i < 16; ++i) sums[i] = __nv_bfloat16(0.0f);
++    for (int base = lane * 16; base < k; base += 512) {
++        const unsigned int word = wrow[base >> 4];
++        const __nv_bfloat16 scale = srow[base >> 7];
++        const __nv_bfloat16 bias = brow[base >> 7];
++        #pragma unroll
++        for (int i = 0; i < 16; ++i) {
++            const int q = (word >> (2 * i)) & 3;
++            const __nv_bfloat16 wdq = __hadd(
++                __hmul(__nv_bfloat16(float(q)), scale), bias);
++            sums[i] = __hfma(__nv_bfloat16(xf[base + i]), wdq, sums[i]);
++        }
++    }
++    float sum = 0.0f;
++    #pragma unroll
++    for (int i = 0; i < 16; ++i) sum += __bfloat162float(sums[i]);
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1)
++        sum += __shfl_xor_sync(0xffffffffu, sum, o);
++    return sum;
++}
++"""
++
++_ATTN_MEGAKERNEL_SOURCE = r"""
++    constexpr int WARP = 32;
++    constexpr int HD = 128;
++    constexpr int VPL = HD / WARP;      // per-lane values in a head row
++    constexpr int NH = NQ_ + 2 * NKV_;
++    constexpr int QKVROWS = NH * HD;
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int blk = blockIdx.x;
++    const int wglobal = blk * (THREADS_ / 32) + warp;
++
++    constexpr int OFF_QKV = 16;
++    constexpr int OFF_Q = OFF_QKV + QKVROWS;
++    constexpr int OFF_O = OFF_Q + NQ_ * HD;
++    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
++    float* stq_kv = scratch + OFF_QKV;
++    float* stq = scratch + OFF_Q;
++    float* sto = scratch + OFF_O;
++
++    // Persistent step counters, advanced by the kernel itself so every
++    // input pointer stays stable and the CUDA graph is captured once.
++    float* live = const_cast<float*>(scalars);
++    const float pos = live[0];
++    const int kL = static_cast<int>(live[1]);
++    const int slot = static_cast<int>(live[2]);
++    constexpr float eps = EPS_;
++    constexpr float log2b = LOG2B_;
++
++    // ---- phase A: the fused qkv projection, the stock qmv recipe ----------
++    __shared__ float hn_s[KH_];
++    for (int i = tid; i < KH_; i += THREADS_)
++        hn_s[i] = static_cast<float>(hn[i]);
++    __syncthreads();
++    for (int row = wglobal; row < QKVROWS; row += GRID_ * (THREADS_ / 32)) {
++        const float sum = qmv_row(
++            hn_s, reinterpret_cast<const unsigned int*>(wqkv),
++            reinterpret_cast<const __nv_bfloat16*>(sqkv),
++            reinterpret_cast<const __nv_bfloat16*>(bqkv),
++            row, KH_, lane);
++        if (lane == 0)
++            stq_kv[row] = static_cast<float>(static_cast<T_>(sum));
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[0], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[8], 1u);
++        else while (atomicAdd(&ctr[8], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase B: split + QK norm + RoPE + cache append, block 0 ----------
++    // One warp per head, the shipped exact split kernel line for line.
++    if (blk == 0 && warp < NH) {
++        const int head = warp;
++        const float* xh = stq_kv + head * HD;
++        T_* kc = const_cast<T_*>(kcache);
++        T_* vc = const_cast<T_*>(vcache);
++        if (head >= NQ_ + NKV_) {
++            const int kvh = head - NQ_ - NKV_;
++            T_* vh = vc + ((long long)kvh * CAP_ + slot) * HD;
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                const int j = lane * VPL + i;
++                vh[j] = static_cast<T_>(xh[j]);
++            }
++        } else {
++            const T_* wh = wqk + head * HD;
++            float sum_sq = 0.0f;
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                const float value = xh[lane * VPL + i];
++                sum_sq += value * value;
++            }
++            #pragma unroll
++            for (int offset = 16; offset > 0; offset >>= 1)
++                sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, offset);
++            sum_sq = __shfl_sync(0xffffffffu, sum_sq, 0);
++            const float nscale = rsqrtf(sum_sq / (float)HD + eps);
++
++            // Partial RoPE: only the first RD_ dims rotate, paired
++            // (p, p + RD_/2), exactly as the shipped split kernel.
++            float rope_cos[VPL], rope_sin[VPL];
++            if (ROPE_) {
++                #pragma unroll
++                for (int i = 0; i < VPL; ++i) {
++                    const int j = lane * VPL + i;
++                    if (j < RD_) {
++                        constexpr int rhalf = RD_ > 0 ? RD_ / 2 : 1;
++                        const int pp = (j < rhalf) ? j : j - rhalf;
++                        const float fraction =
++                            (float)pp / (float)(RD_ / 2);
++                        const float frequency = exp2f(-fraction * log2b);
++                        const float angle = pos * frequency;
++                        rope_cos[i] = cosf(angle);
++                        rope_sin[i] = sinf(angle);
++                    }
++                }
++            }
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                const int j = lane * VPL + i;
++                const T_ normalized = static_cast<T_>(
++                    xh[j] * nscale * static_cast<float>(wh[j]));
++                float value = static_cast<float>(normalized);
++                if (ROPE_ && j < RD_) {
++                    constexpr int rhalf = RD_ > 0 ? RD_ / 2 : 1;
++                    const int pair = j < rhalf ? j + rhalf : j - rhalf;
++                    const T_ paired_normalized = static_cast<T_>(
++                        xh[pair] * nscale * static_cast<float>(wh[pair]));
++                    const float paired = static_cast<float>(paired_normalized);
++                    value = (j < rhalf)
++                        ? value * rope_cos[i] - paired * rope_sin[i]
++                        : SECOND_HALF_;
++                }
++                const T_ out_b = static_cast<T_>(value);
++                if (head < NQ_) {
++                    stq[head * HD + j] = static_cast<float>(out_b);
++                } else {
++                    const int kvh = head - NQ_;
++                    kc[((long long)kvh * CAP_ + slot) * HD + j] = out_b;
++                }
++            }
++        }
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[1], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[9], 1u);
++        else while (atomicAdd(&ctr[9], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase C: single-token SDPA, one head per block --------------------
++    // The kernel_sdpav_1pass port: 32 warps interleave the keys, base-2
++    // online softmax, xor butterflies, __frcp_rn, shared transpose merge.
++    if (blk < NQ_) {
++        const int head = blk;
++        const int kvh = head / (NQ_ / NKV_);
++        __shared__ float outs[32][33];
++        __shared__ float maxs[32];
++        __shared__ float sums[32];
++        const float scale_log2 = SCALE_ * 1.44269504088896340736f;
++        float q[VPL], k[VPL], o[VPL];
++        #pragma unroll
++        for (int i = 0; i < VPL; ++i) {
++            q[i] = scale_log2 * stq[head * HD + VPL * lane + i];
++            o[i] = 0.0f;
++        }
++        float max_score = -3.402823466e38f;
++        float sum_exp = 0.0f;
++        const long long kh = (long long)kvh * CAP_ * HD;
++        for (int i = warp; i < kL; i += 32) {
++            #pragma unroll
++            for (int j = 0; j < VPL; ++j)
++                k[j] = static_cast<float>(
++                    kcache[kh + (long long)i * HD + VPL * lane + j]);
++            float score = 0.0f;
++            #pragma unroll
++            for (int j = 0; j < VPL; ++j) score += q[j] * k[j];
++            #pragma unroll
++            for (int off = 16; off > 0; off >>= 1)
++                score += __shfl_xor_sync(0xffffffffu, score, off);
++            const float new_max = fmaxf(max_score, score);
++            const float factor = exp2f(max_score - new_max);
++            const float exp_score = exp2f(score - new_max);
++            max_score = new_max;
++            sum_exp = sum_exp * factor + exp_score;
++            #pragma unroll
++            for (int j = 0; j < VPL; ++j)
++                o[j] = o[j] * factor + exp_score * static_cast<float>(
++                    vcache[kh + (long long)i * HD + VPL * lane + j]);
++        }
++        if (lane == 0) { maxs[warp] = max_score; sums[warp] = sum_exp; }
++        __syncthreads();
++        max_score = maxs[lane];
++        float new_max = max_score;
++        #pragma unroll
++        for (int off = 16; off > 0; off >>= 1)
++            new_max = fmaxf(new_max,
++                            __shfl_xor_sync(0xffffffffu, new_max, off));
++        const float factor = exp2f(max_score - new_max);
++        float se = sums[lane] * factor;
++        #pragma unroll
++        for (int off = 16; off > 0; off >>= 1)
++            se += __shfl_xor_sync(0xffffffffu, se, off);
++        se = (se == 0.0f) ? 0.0f : __frcp_rn(se);
++        #pragma unroll
++        for (int i = 0; i < VPL; ++i) {
++            outs[lane][warp] = o[i];
++            __syncthreads();
++            float ot = outs[warp][lane] * factor;
++            #pragma unroll
++            for (int off = 16; off > 0; off >>= 1)
++                ot += __shfl_xor_sync(0xffffffffu, ot, off);
++            o[i] = ot * se;
++            __syncthreads();
++        }
++        if (lane == 0) {
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i)
++                sto[head * HD + VPL * warp + i] = static_cast<float>(
++                    static_cast<T_>(o[i]));
++        }
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[2], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[10], 1u);
++        else while (atomicAdd(&ctr[10], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase D: the output projection, the stock qmv recipe -------------
++    for (int row = wglobal; row < KH_; row += GRID_ * (THREADS_ / 32)) {
++        const float sum = qmv_row(
++            sto, reinterpret_cast<const unsigned int*>(wo),
++            reinterpret_cast<const __nv_bfloat16*>(so_),
++            reinterpret_cast<const __nv_bfloat16*>(bo_),
++            row, NQ_ * HD, lane);
++        if (lane == 0) out[row] = static_cast<T_>(sum);
++    }
++
++    if (blk == 0 && tid == 0) {
++        live[0] = pos + 1.0f;
++        live[1] = (kL < CAP_) ? (float)(kL + 1) : (float)CAP_;
++        const int nslot = slot + 1;
++        live[2] = (nslot == CAP_) ? 0.0f : (float)nslot;
++    }
++"""
++
++
++_attn_megakernel_cache = {}
++
++
++def _attn_megakernel(profile_name, use_rope, scale, eps, log2b):
++    key = (profile_name, use_rope, scale, eps, log2b)
++    kernel = _attn_megakernel_cache.get(key)
++    if kernel is None:
++        second_half = (
++            "__fmaf_rn(value, rope_cos[i], "
++            "__fmul_rn(paired, rope_sin[i]))"
++            if profile_name in ("sm100", "sm120")
++            else "paired * rope_sin[i] + value * rope_cos[i]"
++        )
++        src = (_ATTN_MEGAKERNEL_SOURCE
++               .replace("SECOND_HALF_", second_half)
++               .replace("SCALE_", f"{scale:.17e}f")
++               .replace("EPS_", f"{eps:.10e}f")
++               .replace("LOG2B_", f"{log2b:.17e}f"))
++        kernel = _attn_megakernel_cache[key] = mx.fast.cuda_kernel(
++            name=f"maple_attn_megakernel_{'rope' if use_rope else 'nope'}"
++                 f"_{profile_name}",
++            input_names=["hn", "wqkv", "sqkv", "bqkv", "wqk",
++                         "wo", "so_", "bo_", "kcache", "vcache", "scalars"],
++            output_names=["out", "scratch"],
++            source=src,
++            header=_ATTN_MEGAKERNEL_HEADER,
++        )
++    return kernel
++
++
++class _AttnMegaState:
++    """Caller-owned contiguous KV buffers mirroring the stock cache.
++
++    The stock cache object stays the source of truth for counters; the
++    buffers here are the truth for contents while the fused path runs, and
++    are written back whenever the layer leaves the fused regime.
++    """
++
++    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "synced_offset")
++
++    def __init__(self, kv_heads, cap, dtype):
++        self.kbuf = mx.zeros((1, kv_heads, cap, 128), dtype)
++        self.vbuf = mx.zeros((1, kv_heads, cap, 128), dtype)
++        self.ctr = mx.zeros((8,), mx.float32)
++        mx.eval(self.kbuf, self.vbuf, self.ctr)
++        self.cap = cap
++        self.synced_offset = -1
++
++
++def _attn_mega_call(layer, hn, c):
++    """One-dispatch decode attention, or None to fall back to the stock path."""
++    attn = layer.self_attn
++    qkv = attn.qkv_proj
++    op = attn.o_proj
++    if (
++        _cuda_profile() is None
++        or hn.dtype != mx.bfloat16
++        or attn.head_dim != 128
++        or not attn.use_qk_norm
++        or not attn._can_fuse_qk
++        or attn._fused_qk is not True
++        or getattr(qkv, "bits", None) != 2
++        or getattr(op, "bits", None) != 2
++        or getattr(qkv, "group_size", None) != 128
++        or getattr(op, "group_size", None) != 128
++        or getattr(qkv, "mode", "affine") != "affine"
++        or getattr(qkv, "biases", None) is None
++        or getattr(op, "biases", None) is None
++        or "bias" in qkv or "bias" in op
++        or hn.shape[-1] % 512 != 0
++        or (attn.num_attention_heads * 128) % 512 != 0
++    ):
++        return None
++    from mlx_lm.models.cache import KVCache, RotatingKVCache
++
++    rotating = isinstance(c, RotatingKVCache)
++    if not rotating and not isinstance(c, KVCache):
++        return None
++    if rotating and (c.keep != 0 or c.max_size is None):
++        return None
++
++    state = getattr(attn, "_mega_state", None)
++    cap = c.max_size if rotating else 1024
++    if state is None or state.cap != cap:
++        state = _AttnMegaState(attn.num_key_value_heads, cap, hn.dtype)
++        attn._mega_state = state
++
++    offset = c.offset
++    if rotating:
++        idx = c._idx
++        if idx == c.max_size:
++            idx = 0
++        kl_after = min(offset + 1, cap)
++        slot = idx
++    else:
++        slot = offset
++        kl_after = offset + 1
++    if kl_after > cap:
++        _attn_mega_writeback(attn, c)
++        return None
++
++    if state.synced_offset != offset:
++        # (Re)enter the fused regime: copy the stock cache's physical layout
++        # into our buffers and seed the on-device step counters once.
++        if c.keys is not None and offset > 0:
++            n = min(c.keys.shape[2], cap)
++            kb, vb = state.kbuf, state.vbuf
++            kb[..., :n, :] = c.keys[..., :n, :].astype(hn.dtype)
++            vb[..., :n, :] = c.values[..., :n, :].astype(hn.dtype)
++            mx.eval(kb, vb)
++        ctr = state.ctr
++        ctr[0] = float(offset)
++        ctr[1] = float(kl_after)
++        ctr[2] = float(slot)
++        mx.eval(ctr)
++        state.synced_offset = offset
++
++    if attn._qk_w is None:
++        attn._ensure_qk_constants()
++
++    kernel = _attn_megakernel(
++        _cuda_profile().name, attn.use_rope, float(attn.scale),
++        float(attn._eps), float(attn._rope_log2_base),
++    )
++    kh = hn.shape[-1]
++    try:
++        out, _ = kernel(
++            inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
++                    attn._qk_w, op.weight, op.scales, op.biases,
++                    state.kbuf, state.vbuf, state.ctr],
++            template=[
++                ("T_", hn.dtype), ("KH_", kh),
++                ("NQ_", attn.num_attention_heads),
++                ("NKV_", attn.num_key_value_heads),
++                ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
++                ("RD_", getattr(attn, "_rope_dim", 0) if attn.use_rope else 0),
++                ("THREADS_", 1024), ("GRID_", 64),
++            ],
++            grid=(64 * 1024, 1, 1), threadgroup=(1024, 1, 1),
++            output_shapes=[
++                (1, 1, kh),
++                (16 + (attn.num_attention_heads
++                       + 2 * attn.num_key_value_heads) * 128
++                 + attn.num_attention_heads * 128 * 2,),
++            ],
++            output_dtypes=[hn.dtype, mx.float32],
++            init_value=0,
++        )
++    except (RuntimeError, TypeError, ValueError):
++        return None
++
++    # Advance the stock counters exactly as update_and_fetch would; the
++    # buffers themselves are stale until write-back.
++    c.offset = offset + 1
++    if rotating:
++        c._idx = slot + 1
++    state.synced_offset = offset + 1  # our buffers are current for this offset
++    return out
++
++
++def _attn_mega_writeback(attn, c):
++    """Push the fused buffers back into the stock cache before leaving.
++
++    The stock buffers did not grow while the fused path ran, so they are
++    rebuilt outright from our slices; the counters were kept in lockstep
++    all along, so update_and_fetch continues seamlessly.
++    """
++    state = getattr(attn, "_mega_state", None)
++    if state is None or state.synced_offset < 0:
++        return
++    n = min(state.synced_offset, state.cap)
++    if n > 0:
++        c.keys = state.kbuf[..., :n, :]
++        c.values = state.vbuf[..., :n, :]
++        mx.eval(c.keys, c.values)
++    state.synced_offset = -1
++
++
 +_moe_exact_megakernel_cache = {}
 +
 +
@@ -2951,7 +3433,7 @@ index a0673f7..49864d0 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +3393,82 @@ class MapleModel(nn.Module):
+@@ -792,29 +3873,86 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -3012,10 +3494,15 @@ index a0673f7..49864d0 100644
              mask = full_mask if layer_type == "full_attention" else swa_mask
 -            ln = layer.input_layernorm
 -            h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
+-            r = layer.self_attn(hn, mask, c)
 +            if hn is None:
 +                ln = layer.input_layernorm
 +                h, hn = fuse(h, r, ln.weight, ln.eps)
-             r = layer.self_attn(hn, mask, c)
++            r = None
++            if _use_attention_megakernel:
++                r = _attn_mega_call(layer, hn, c)
++            if r is None:
++                r = layer.self_attn(hn, mask, c)
 +            hn = None
              ln = layer.post_attention_layernorm
 -            h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
@@ -3041,7 +3528,7 @@ index a0673f7..49864d0 100644
  
      def __call__(
          self,
-@@ -836,12 +3490,29 @@ class MapleModel(nn.Module):
+@@ -836,12 +3974,29 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
@@ -3073,7 +3560,7 @@ index a0673f7..49864d0 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -1021,6 +3692,32 @@ class Model(nn.Module):
+@@ -1021,6 +4176,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -3106,7 +3593,7 @@ index a0673f7..49864d0 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +3736,8 @@ class Model(nn.Module):
+@@ -1039,8 +4220,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.

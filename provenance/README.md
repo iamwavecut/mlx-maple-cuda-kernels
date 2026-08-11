@@ -3,10 +3,10 @@
 ## Current release: the fusion campaign
 
 The release source is [`../src/maple.py`](../src/maple.py), SHA-256
-`d602b7f6fd664cd06b0f904d90bed34f26ad1d331b50a8f1fce9f4675bdbee56`.
+`9f5f7c93d58fa3a516d85b1cd49ef37a2d5dde0dcee5183ea3b8dd80ed39019c`.
 The integration patch against DeepGrove base
 `eba96c16158f032821b0bf374ea1421cfddef0a9` is SHA-256
-`cbca82f605e380a61a459ff311c48c9b6fedff93112d1434a105b2cf9309aa27`.
+`e8d1606d9bd1ed99ade47d764970a350cade4c3c18c9a7a05a37b15e9f2a2430`.
 
 Both were checked the way a user gets them: clone `mlx-lm-deepgrove`, check out
 that base, `git apply`. The patch applies clean, reproduces the four checked-in
