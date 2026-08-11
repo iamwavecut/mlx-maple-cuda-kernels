@@ -23,6 +23,13 @@
   experts (M*B >= 8); gather_qmv is the B=1 kernel and was the wrong earlier
   reference. This makes an array-exact megakernel expert phase — a fast lane
   that keeps the strict lane's reproducible stream — constructively possible.
+- Pinned the bit-level semantics of the router chain an array-exact fast
+  lane must match (`benchmarks/maple_exact_lane_semantics.py`): the fp32
+  logits gemv order, an exact online-softmax port (100/100), argpartition's
+  tail being argsort's tail including ties (400/400), and the linear renorm
+  sum. Together with the qmm_naive reproduction this reduces the exact
+  megakernel to an assembly task; only the stock aggregation order is still
+  unpinned.
 - Added `benchmarks/maple_fast_lane_profile.py`: exclusive host time per
   sub-block with the megakernel on. On the shared-GPU dev host the step's
   remaining host budget is attention 681 us, KV-cache updates 334 us,
