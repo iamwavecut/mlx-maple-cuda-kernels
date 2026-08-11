@@ -28,6 +28,10 @@
 - Made the megakernel grid depend on the device instead of a fixed 32 blocks,
   which was tuned on a 3090 and left 18.3% on an RTX 4090 and 14.3% on a B200.
   Selected from compute capability and memory, overridable and clamped.
+- Made every lane selectable from the environment (`MAPLE_MOE_MEGAKERNEL`,
+  `MAPLE_COMPILED_ROUTER`, `MAPLE_FUSED_ADD_RMS`, `MAPLE_FUSED_QKV`). The fast
+  lane previously required importing the module and setting an attribute before
+  the model loaded, which is the wrong shape for a server.
 - Added `benchmarks/maple_quality_suite.py`: twelve documents scored one token
   at a time against a cache. The strict lane matches the reference mean NLL to
   the last digit with zero top-1 changes on all five architectures; the

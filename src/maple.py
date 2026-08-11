@@ -40,6 +40,21 @@ _kernel_backend_cache = _UNSET
 _cuda_capability_cache = _UNSET
 _cuda_profile_cache = _UNSET
 
+def _env_flag(name, default):
+    """Let a deployment choose a lane without importing and patching this module.
+
+    The flags below are module attributes because a test needs to flip them
+    mid-process.  That is the right shape for a test and the wrong shape for a
+    server, which has to make the choice before the model loads.  The
+    environment is consulted once, at import; the attribute stays authoritative
+    afterwards, so a test that sets it still wins.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # The hand-written fused router is numerically close but not array-exact: its
 # normalized scores can eventually change a greedy token.  It is therefore an
 # explicit semantic/experimental lane, never part of strict auto mode.  Same
@@ -55,21 +70,27 @@ _use_approximate_add_rms = False
 # measures ~0.003 ms, so wall clock is the sum of per-operation host costs and
 # the currency of optimization is operation count, not arithmetic.  These three
 # fusions exist to remove operations, not to make the GPU work less.
-_use_fused_add_rms = True      # residual add + RMSNorm in one dispatch
-_use_fused_qkv = True          # qkv split + Q/K norm + RoPE in one dispatch
+_use_fused_add_rms = _env_flag("MAPLE_FUSED_ADD_RMS", True)   # add + RMSNorm
+_use_fused_qkv = _env_flag("MAPLE_FUSED_QKV", True)           # split + norm + RoPE
 
 # The stock router chain under mx.compile.  Array-exact, and in isolation it
 # cuts the router's host cost from 96.5 us to 77.9 us per layer -- but paired
 # over ten fresh processes the end-to-end effect was 1.0062x with a 95%
 # interval of 0.9927-1.0198 and 6/10 wins, so it is not distinguishable from
 # zero on the measured host.  Exact but unproven stays opt-in.
-_use_compiled_router = False
+_use_compiled_router = _env_flag("MAPLE_COMPILED_ROUTER", False)
 
 # Opt-in fast lane: the whole MoE block (router, experts, activation,
 # score-weighted aggregation and the preceding add/RMSNorm) in one dispatch.
 # It is within ~1 ULP of bf16 rather than array-exact, because a software fp32
 # reduction cannot reproduce what qmm_naive gets from a tensor-core MMA.
-_use_moe_megakernel = False
+#
+# It is opt-in because this repository's contract is bit-exactness, not because
+# it is known to cost quality: a 846-token teacher-forced suite through the
+# decode path moves corpus perplexity by -0.8% to -1.3% on all five supported
+# architectures, which is unbiased last-bit noise in the favourable direction.
+# `MAPLE_MOE_MEGAKERNEL=1` buys 73-88% and gives up a reproducible token stream.
+_use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", False)
 
 
 def _kernel_backend():

@@ -169,18 +169,27 @@ together +7.0%.
 
 ### What is opt-in
 
-- `_use_moe_megakernel` — router, experts, activation, score-weighted
+- `MAPLE_MOE_MEGAKERNEL=1` — router, experts, activation, score-weighted
   aggregation and the preceding add/RMSNorm in **one dispatch**, with three
-  atomic-counter grid barriers. It is within ~1 ULP of bf16 rather than
-  array-exact: `qmm_naive` gets its accuracy from a tensor-core MMA, which a
-  software fp32 reduction cannot reproduce. Teacher-forced NLL through the
-  decode path moves by 0.5-0.8% **in both directions** (better on code, worse
-  on prose), which is unbiased rounding noise rather than degradation.
-- `_use_compiled_router` — the stock router chain under `mx.compile`.
+  atomic-counter grid barriers. Worth 73-88%. It is within ~1 ULP of bf16
+  rather than array-exact: `qmm_naive` gets its accuracy from a tensor-core
+  MMA, which a software fp32 reduction cannot reproduce.
+
+  It is off by default because this repository's contract is a reproducible
+  token stream, **not** because it is known to cost quality — the suite above
+  finds no regression on any supported architecture. If you are serving rather
+  than reproducing, this is the switch you want.
+- `MAPLE_COMPILED_ROUTER=1` — the stock router chain under `mx.compile`.
   Array-exact, and in isolation it cuts the router's host cost from 96.5 us to
   77.9 us per layer, but paired over ten fresh processes the end-to-end effect
   was 1.0062x with a 95% interval of 0.9927-1.0198 and 6/10 wins. Exact but
   not distinguishable from zero, so it ships off.
+
+Every lane is also a module attribute (`maple._use_moe_megakernel` and
+friends), which is what the tests flip; the environment only seeds them at
+import, so a server does not have to reach into the module before the model
+loads. `MAPLE_FUSED_ADD_RMS=0` and `MAPLE_FUSED_QKV=0` turn the defaults back
+off, which is how `off` is measured in every table here.
 
 ### Exactness protocol
 
@@ -317,6 +326,11 @@ python ../mlx-maple-cuda-kernels/examples/nvidia_generate.py \
   --prompt "Write a haiku about a maple grove." \
   --max-tokens 256
 ```
+
+That is the strict default: a token stream identical to stock, 7-17% faster.
+For the fastest lane, add `MAPLE_MOE_MEGAKERNEL=1` to the environment above —
+73-88% instead, at the cost of a reproducible token stream and nothing else
+that has been measurable. See [Quality](#quality).
 
 Pin `mlx==0.32.0` and the matching `mlx-cuda-12==0.32.0` wheel to reproduce the
 published version claim. The example passes

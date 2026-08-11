@@ -3,20 +3,28 @@
 ## Current release: the fusion campaign
 
 The release source is [`../src/maple.py`](../src/maple.py), SHA-256
-`fa600724669a6cf6b2191ed220900f71f3f671714ca45e5f364448fb13f36d8c`.
+`2fad29b38a48a584cb5b746306f25b6ecd2656211bcfa9dbd122c2d8f46c4421`.
 The integration patch against DeepGrove base
 `eba96c16158f032821b0bf374ea1421cfddef0a9` is SHA-256
-`e502db7407476530bf95f1bc7a9076c001a22db16e24a3968b2854b595f55067`;
-it applies clean to that base and reproduces the four checked-in files byte for
-byte, the fixture `tests/data/sm100_qk_rope_boundary.npz` included — without it
-the Blackwell boundary test fails in a clean clone.
+`862f0eadc1b06eb70f8f94688ba5a1943651bc7e4657bbbb9405acda14a727ed`.
+
+Both were checked the way a user gets them: clone `mlx-lm-deepgrove`, check out
+that base, `git apply`. The patch applies clean, reproduces the four checked-in
+files byte for byte — the fixture `tests/data/sm100_qk_rope_boundary.npz`
+included, without which the Blackwell boundary test fails in a clean clone —
+and `tests/test_maple_kernels.py` then passes from the patched tree (23 passed,
+9 skipped on a non-CUDA host, 38 subtests).
 
 Every number in the fusion tables was measured on rented instances, one process
-per data point, from a source that differs from the checked-in one only in the
-megakernel grid: the strict and `off` lanes are untouched by that constant, and
-the retuned grid was confirmed on a fresh RTX 4090 after the fact.
-`results/cuda/megakernel-grid-and-quality.jsonl` holds both the sweep and the
-confirmation.
+per data point, from a source that differs from the checked-in one in two ways,
+neither of which touches arithmetic. The megakernel grid was the pre-tuning
+constant 32, which leaves the strict and `off` lanes untouched and understates
+the fast lane; the retuned rule was confirmed afterwards on a fresh RTX 4090
+that had not been part of the sweep. And the lane flags are now seeded from the
+environment rather than being plain literals, which changes how a lane is
+selected, not what it computes — the defaults are the same values the
+measurements ran under. `results/cuda/megakernel-grid-and-quality.jsonl` holds
+both the sweep and the confirmation.
 
 ## Earlier multi-architecture campaign
 

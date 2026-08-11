@@ -755,11 +755,38 @@ assert maple._router_select_kernel_cache == {}
         self.assertTrue(mx.array_equal(rs, cs), "compiled router moved the weights")
 
     def test_moe_megakernel_is_opt_in(self):
-        """The approximate fast lane must stay off unless asked for."""
-        self.assertFalse(maple._use_moe_megakernel)
-        self.assertTrue(maple._use_fused_add_rms)
-        self.assertTrue(maple._use_fused_qkv)
-        self.assertFalse(maple._use_compiled_router)
+        """The approximate fast lane must stay off unless asked for.
+
+        Read the defaults rather than the module attributes: the attributes are
+        seeded from the environment, and a run that opted into the fast lane
+        should not fail this.
+        """
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(maple._env_flag("MAPLE_MOE_MEGAKERNEL", False))
+            self.assertFalse(maple._env_flag("MAPLE_COMPILED_ROUTER", False))
+            self.assertTrue(maple._env_flag("MAPLE_FUSED_ADD_RMS", True))
+            self.assertTrue(maple._env_flag("MAPLE_FUSED_QKV", True))
+
+    def test_env_flag_only_accepts_affirmative_spellings(self):
+        """A deployment sets these; a typo must not silently flip a lane."""
+        for raw in ("1", "true", "TRUE", "yes", "on", " on "):
+            with mock.patch.dict("os.environ", {"MAPLE_X": raw}):
+                self.assertTrue(maple._env_flag("MAPLE_X", False), raw)
+        for raw in ("0", "false", "no", "off", "", "maybe", "2"):
+            with mock.patch.dict("os.environ", {"MAPLE_X": raw}):
+                self.assertFalse(maple._env_flag("MAPLE_X", True), raw)
+
+    def test_megakernel_grid_is_clamped(self):
+        """The barrier deadlocks if the grid outgrows residency, so cap it."""
+        for raw, expected in (("1", 8), ("10000", 240), ("96", 96),
+                              ("not-a-number", None)):
+            with mock.patch.dict("os.environ",
+                                 {"MAPLE_MOE_MEGAKERNEL_GRID": raw}):
+                grid = maple._moe_megakernel_grid(default=64)
+                self.assertEqual(grid, 64 if expected is None else expected,
+                                 f"{raw!r} produced {grid}")
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(maple._moe_megakernel_grid(default=64), 64)
 
     def test_moe_megakernel_rejects_unsupported_layers(self):
         """An unquantized MoE block must fall back instead of dispatching."""
