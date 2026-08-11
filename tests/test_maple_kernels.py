@@ -800,6 +800,66 @@ assert maple._router_select_kernel_cache == {}
         plan = maple._moe_megakernel_plan(layer.mlp, ln, mx.bfloat16)
         self.assertFalse(plan, "unquantized experts must not build a plan")
 
+    def test_exact_megakernel_matches_the_stock_chain_bit_for_bit(self):
+        """The exact lane's whole point: post-norm, router, experts,
+        activation, aggregation and the next-layer fuse, one dispatch,
+        array-equal to the strict chain."""
+        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
+            self.skipTest("CUDA fast path unavailable")
+        import mlx.nn as nn
+
+        mx.random.seed(21)
+        args = _args(num_experts=256)
+        model = maple.Model(args)
+        moe = None
+        for layer in model.model.layers:
+            if getattr(layer.mlp, "switch_mlp", None) is not None:
+                moe = layer
+                break
+        self.assertIsNotNone(moe, "fixture has no MoE layer")
+        moe.mlp.gate.weight = (
+            mx.random.normal((args.num_experts, args.hidden_size)) * 0.05
+        )
+        model.set_dtype(mx.bfloat16)
+        nn.quantize(moe.mlp.switch_mlp, group_size=128, bits=2)
+        mx.eval(model.parameters())
+
+        ln = moe.post_attention_layernorm
+        next_w = model.model.norm.weight
+        h = (mx.random.normal((1, 1, args.hidden_size)) * 0.5).astype(
+            mx.bfloat16
+        )
+        r = (mx.random.normal((1, 1, args.hidden_size)) * 0.5).astype(
+            mx.bfloat16
+        )
+        mx.eval(h, r)
+
+        got = maple._moe_exact_megakernel_call(moe, h, r, ln, next_w)
+        if got is None:
+            self.skipTest("exact megakernel plan rejected the fixture")
+        hout, hn = got
+
+        s, x = maple._exact_add_rms_norm(h, r, ln.weight, ln.eps)
+        ref_moe = moe.mlp(x)
+        ref_h, ref_hn = maple._exact_add_rms_norm(s, ref_moe, next_w, ln.eps)
+        mx.eval(hout, hn, ref_h, ref_hn)
+
+        self.assertTrue(
+            mx.array_equal(hout, ref_h).item(),
+            "carrier differs from the stock chain",
+        )
+        self.assertTrue(
+            mx.array_equal(hn, ref_hn).item(),
+            "next attention input differs from the stock chain",
+        )
+
+    def test_exact_megakernel_is_opt_in_for_now(self):
+        """Until the full screen passes, the exact lane must not self-enable."""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(
+                maple._env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", False)
+            )
+
     def test_megakernel_tail_norm_is_exactly_the_fuse(self):
         """Phase E must be bit-identical to the standalone exact fuse.
 

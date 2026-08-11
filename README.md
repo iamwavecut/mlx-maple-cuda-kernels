@@ -146,13 +146,29 @@ inside the megakernel constructively possible.
 The rest of the block is pinned too (`benchmarks/maple_exact_lane_semantics.py`,
 all bitwise on hardware): the fp32 logits gemv order, an exact online-softmax
 port, argpartition's returned order (argsort's ascending tail, ties included —
-load-bearing because it feeds the aggregation sum), the linear renorm sum, and
+load-bearing because it feeds the aggregation sum), the renorm reduce, and
 the aggregation as `col_reduce_small`'s linear loop with the multiply rounded
 separately from the sum — `__fmul_rn` then `__fadd_rn`, where letting the
-compiler contract to fma is exactly what breaks equality. Every component of
-the stock MoE block now has a proven bit recipe: the exact megakernel —
-megakernel speed with the strict lane's reproducible stream — is an assembly
-task, and it is the next piece of work.
+compiler contract to fma is exactly what breaks equality.
+
+**The assembled kernel exists: `MAPLE_MOE_MEGAKERNEL_EXACT=1`.** One dispatch
+per MoE layer, five phases behind four grid barriers, every phase the proven
+recipe. On the real checkpoint it is array-equal to the stock chain on every
+MoE layer (72/72 random pairs), its decode stream is identical to the stock
+reference on **8/8** screened prompts — on the same screen the ~1 ULP
+megakernel matches 1/8 — and the 846-token quality suite reproduces the
+strict lane's corpus NLL to the last digit. Two humbling details made the
+difference between "proven in parts" and "identical in the stream": the
+router renorm's `sum(axis=-1)` over a (1,1,8) array dispatches to a different
+reduce kernel than a flat (8,) array — the shape picks the bits — and the
+one-element-per-column divergence that exposed it survived 72 random layer
+tests before live data caught it.
+
+It ships opt-in for now because it trades throughput for its stream: the host
+structure is the megakernel's (one dispatch per layer plus the tail), but the
+tensor-core phases do more GPU work than the ~1 ULP lane's SIMT loops. Where
+that trade lands per device is in the results file; closing the gap without
+touching the bits (loads and scheduling only) is the open line of work.
 
 ### Quality
 

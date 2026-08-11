@@ -92,12 +92,13 @@ DOCUMENTS = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--mode", choices=["off", "strict", "fast"], required=True)
+    ap.add_argument("--mode", choices=["off", "strict", "fast", "exact"], required=True)
     args = ap.parse_args()
 
     maple._use_fused_add_rms = args.mode != "off"
     maple._use_fused_qkv = args.mode != "off"
     maple._use_moe_megakernel = args.mode == "fast"
+    maple._use_moe_megakernel_exact = args.mode == "exact"
 
     model, tok, _ = load(
         args.model,

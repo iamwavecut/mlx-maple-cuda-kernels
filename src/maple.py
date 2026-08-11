@@ -99,6 +99,12 @@ _use_compiled_router = _env_flag("MAPLE_COMPILED_ROUTER", False)
 # block partition does not divide.
 _use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 
+# The array-exact megakernel: the same one-dispatch MoE block, but every
+# phase reproduces the stock chain's bits (see the recipes above its
+# source).  Off by default until it has survived the full screen; when it
+# does, it replaces the ~1 ULP lane outright.
+_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", False)
+
 
 def _kernel_backend():
     global _kernel_backend_cache
@@ -2524,6 +2530,583 @@ _MOE_MEGAKERNEL_SOURCE = r"""
 
 
 
+# The array-exact megakernel.  Same shape as the fast megakernel -- one
+# dispatch, grid barriers, three outputs -- but every phase reproduces the
+# stock chain's bits, each recipe proven in isolation on hardware first
+# (benchmarks/maple_qmm_naive_repro.py, maple_exact_lane_semantics.py, and
+# the exhaustive silu sweep recorded in results):
+#
+#   logits      fp32 gemv: four consecutive columns per lane, stride 128,
+#               fma-contracted, descending shuffle tree
+#   softmax     online single-pass port of softmax.cu (BLOCK_DIM=64,
+#               N_READS=4, xor-butterfly all-reduces, identity padding)
+#   top-8       argsort's ascending-(value, index) tail, ties included
+#   renorm      linear 8-term fp32 sum, + 1e-20, div.rn
+#   experts     qmm_naive's tensor-core atom: dequant bf16(bf16(q*s)+z),
+#               mma.sync m16n8k16 bf16 with row 0 of A populated, k-tiles
+#               of 128 accumulated in order, one bf16 epilogue rounding
+#   activation  the bf16-typed sigmoid chain with accurate expf (bit-equal
+#               on every finite bf16), silu multiply and up multiply each
+#               rounded once
+#   aggregate   col_reduce_small's linear loop with the multiply rounded
+#               separately from the sum: __fmul_rn then __fadd_rn, never fma
+#   tail        the proven phase E (residual fold + next layer's RMSNorm)
+_MOE_EXACT_MEGAKERNEL_HEADER = r"""
+__device__ __forceinline__ float bf16f(float v) {
+    return __bfloat162float(__nv_bfloat16(v));
+}
+
+// One m16n8k16 atom's worth of the qmm_naive reproduction: the caller walks
+// k-tiles in order and this accumulates one 16-wide step for the 8-column
+// octet at `col0`.  `xb` is the bf16 activation vector (row 0 of A), the
+// packed 2-bit weights/scales/biases are row-major per expert.
+__device__ __forceinline__ void qmm_atom(
+    const __nv_bfloat16* xb,
+    const unsigned int* wq,
+    const __nv_bfloat16* sc,
+    const __nv_bfloat16* bi,
+    long long wrow_stride_u32,
+    long long grow_stride,
+    int col0,
+    int kbase,
+    int gs,
+    int lane,
+    float& acc0,
+    float& acc1) {
+    const int akol = (lane & 3) * 2;
+    const bool arow0 = (lane >> 2) == 0;
+    const __nv_bfloat16 zero = __nv_bfloat16(0.0f);
+    const __nv_bfloat16 a0 = arow0 ? xb[kbase + akol] : zero;
+    const __nv_bfloat16 a1 = arow0 ? xb[kbase + akol + 1] : zero;
+    const __nv_bfloat16 a4 = arow0 ? xb[kbase + 8 + akol] : zero;
+    const __nv_bfloat16 a5 = arow0 ? xb[kbase + 8 + akol + 1] : zero;
+
+    const int col = col0 + (lane >> 2);
+    // One atom's 16 k-values of one column live in a single packed word,
+    // and group_size >= 16 means one scale/bias pair covers them all.
+    // Loading once per lane instead of once per fragment element does not
+    // change a single bit -- same data, fewer transactions.
+    const unsigned int word = wq[col * wrow_stride_u32 + (kbase >> 4)];
+    const __nv_bfloat16 s = sc[col * grow_stride + kbase / gs];
+    const __nv_bfloat16 z = bi[col * grow_stride + kbase / gs];
+    __nv_bfloat16 bfrag[4];
+    #pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        #pragma unroll
+        for (int piece = 0; piece < 2; ++piece) {
+            const int sub = half * 8 + (lane & 3) * 2 + piece;
+            const int q = (word >> (2 * sub)) & 3;
+            bfrag[half * 2 + piece] =
+                __hadd(__hmul(__nv_bfloat16(float(q)), s), z);
+        }
+    }
+    const unsigned azz = 0u;
+    const unsigned a01 = (unsigned(__bfloat16_as_ushort(a1)) << 16)
+                       | unsigned(__bfloat16_as_ushort(a0));
+    const unsigned a45 = (unsigned(__bfloat16_as_ushort(a5)) << 16)
+                       | unsigned(__bfloat16_as_ushort(a4));
+    const unsigned b01 = (unsigned(__bfloat16_as_ushort(bfrag[1])) << 16)
+                       | unsigned(__bfloat16_as_ushort(bfrag[0]));
+    const unsigned b23 = (unsigned(__bfloat16_as_ushort(bfrag[3])) << 16)
+                       | unsigned(__bfloat16_as_ushort(bfrag[2]));
+    float d2 = 0.0f, d3 = 0.0f;
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(acc0), "+f"(acc1), "+f"(d2), "+f"(d3)
+        : "r"(a01), "r"(azz), "r"(a45), "r"(azz), "r"(b01), "r"(b23));
+}
+
+// clamped_swiglu, bit-equal to the stock chain on every finite bf16 input:
+// silu's sigmoid is the bf16-typed chain with accurate expf, the silu
+// multiply and the up multiply each round once.
+__device__ __forceinline__ __nv_bfloat16 exact_swiglu(
+    float gate_f, float up_f) {
+    const float gm = fminf(gate_f, 7.0f);
+    const float a = fabsf(gm);
+    const float e = bf16f(expf(a));
+    const float d = bf16f(1.0f + e);
+    const float y = bf16f(__fdiv_rn(1.0f, d));
+    const float sig = (gm < 0.0f) ? y : 1.0f - y;
+    const float sb = bf16f(sig);
+    const float t = bf16f(gm * sb);
+    const float uc = fmaxf(-7.0f, fminf(up_f, 7.0f));
+    return __nv_bfloat16(__fmul_rn(t, uc));
+}
+"""
+
+_MOE_EXACT_MEGAKERNEL_SOURCE = r"""
+    constexpr int WARP = 32;
+    constexpr int WARPS = THREADS_ / WARP;
+    constexpr int GS = 128;
+    const int tid = threadIdx.x;
+    const int lane = tid & (WARP - 1);
+    const int warp = tid >> 5;
+    const int blk = blockIdx.x;
+    const int wglobal = blk * WARPS + warp;
+
+    // Scratch layout (floats): 16 barrier uints, then indices, scores,
+    // logits, softmax probabilities, bf16-rounded activations and the
+    // bf16-rounded per-expert down outputs.
+    constexpr int OFF_IDX = 16;
+    constexpr int OFF_SCO = OFF_IDX + 8;
+    constexpr int OFF_LOG = OFF_SCO + 8;
+    constexpr int OFF_PRB = OFF_LOG + NROUT_;
+    constexpr int OFF_ACT = OFF_PRB + NROUT_;
+    constexpr int OFF_DST = OFF_ACT + NEXP_ * KD_;
+    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
+    float* idxf = scratch + OFF_IDX;
+    float* scoref = scratch + OFF_SCO;
+    float* logits = scratch + OFF_LOG;
+    float* probs = scratch + OFF_PRB;
+    float* actf = scratch + OFF_ACT;
+    float* dstage = scratch + OFF_DST;
+
+    __shared__ float xs_lin[KH_];
+    __shared__ __nv_bfloat16 xbs[KH_];
+    __shared__ float red[WARPS];
+    __shared__ float gsum_s;
+
+    // ---- phase 0: residual add + RMSNorm, recomputed in every block ------
+    // Identical to the proven phase 0 of the fast megakernel; the normed
+    // vector is kept both as exact floats (for the fp32 router gemv) and as
+    // bf16 (the A operand of every expert atom).
+    {
+        constexpr int VEC = KH_ / THREADS_;
+        const int base = tid * VEC;
+        float hb[VEC];
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const T_ rounded = static_cast<T_>(
+                static_cast<float>(hin[base + i]) + static_cast<float>(rin[base + i]));
+            hb[i] = static_cast<float>(rounded);
+            ss += hb[i] * hb[i];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+        if (lane == 0) red[warp] = ss;
+        __syncthreads();
+        float tot = (lane < WARPS) ? red[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
+        if (tid == 0) gsum_s = tot;
+        __syncthreads();
+        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const int idx = base + i;
+            const float v = static_cast<float>(static_cast<T_>(
+                hb[i] * nscale * static_cast<float>(nw[idx])));
+            xs_lin[idx] = v;
+            xbs[idx] = __nv_bfloat16(v);
+        }
+    }
+    __syncthreads();
+
+    // ---- phase A: router logits, the stock fp32 gemv order ---------------
+    // One warp per expert row: four consecutive columns per lane, stride
+    // 128, fma, descending shuffle tree.  16/16 bitwise in isolation.
+    for (int row = wglobal; row < NROUT_; row += GRID_ * WARPS) {
+        // The stock chain materializes weight.astype(float32) first; reading
+        // the bf16 weight and widening per element is the same values.
+        const __nv_bfloat16* wrow = rw + (long long)row * KH_;
+        float sum = 0.0f;
+        for (int col = 4 * lane; col < KH_; col += 128) {
+            sum = fmaf(__bfloat162float(wrow[col]), xs_lin[col], sum);
+            sum = fmaf(__bfloat162float(wrow[col + 1]), xs_lin[col + 1], sum);
+            sum = fmaf(__bfloat162float(wrow[col + 2]), xs_lin[col + 2], sum);
+            sum = fmaf(__bfloat162float(wrow[col + 3]), xs_lin[col + 3], sum);
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, o);
+        if (lane == 0) logits[row] = sum;
+    }
+
+    // ---- barrier 1 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[0], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[8], 1u);
+        else while (atomicAdd(&ctr[8], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase B: softmax + top-8 + renorm, on block 0 --------------------
+    // The softmax is the online port (100/100 bitwise at 256 experts): the
+    // first 64 threads carry the data, every thread of the block reaches the
+    // same __syncthreads() calls.
+    __shared__ float local_max[2];
+    __shared__ float local_norm[2];
+    if (blk == 0) {
+        constexpr int N_READS = 4;
+        constexpr int SWARPS = 2;  // 64 active threads
+        const bool active = tid < 64;
+        const int slane = tid & 31;
+        const int swarp = tid >> 5;
+        float vals[N_READS];
+        float maxval = -INFINITY;
+        float normalizer = 0.0f;
+        float prevmax;
+        if (active) {
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                vals[i] = logits[tid * N_READS + i];
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                maxval = fmaxf(maxval, vals[i]);
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                normalizer = normalizer + __expf(vals[i] - maxval);
+            prevmax = maxval;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffffu, maxval, o));
+            normalizer = normalizer * __expf(prevmax - maxval);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
+            prevmax = maxval;
+            if (slane == 0) local_max[swarp] = maxval;
+        }
+        __syncthreads();
+        if (active) {
+            maxval = (slane < SWARPS) ? local_max[slane] : -INFINITY;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffffu, maxval, o));
+            normalizer = normalizer * __expf(prevmax - maxval);
+            if (slane == 0) local_norm[swarp] = normalizer;
+        }
+        __syncthreads();
+        if (active) {
+            normalizer = (slane < SWARPS) ? local_norm[slane] : 0.0f;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
+            normalizer = 1.0f / normalizer;
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                probs[tid * N_READS + i] =
+                    __expf(vals[i] - maxval) * normalizer;
+        }
+        __syncthreads();
+
+        // top-8 by ascending (value, index) -- argsort's tail -- then the
+        // linear renorm.  One thread; the work is 8 passes over 256 floats
+        // against an idle GPU.
+        if (tid < 32) {
+            int chosen[NEXP_];
+            #pragma unroll
+            for (int k = 0; k < NEXP_; ++k) {
+                float bestv = -INFINITY;
+                int besti = -1;
+                for (int i = lane; i < NROUT_; i += 32) {
+                    bool taken = false;
+                    #pragma unroll
+                    for (int t = 0; t < NEXP_; ++t)
+                        if (t < k && chosen[t] == i) taken = true;
+                    if (taken) continue;
+                    const float v = probs[i];
+                    if (v > bestv || (v == bestv && i > besti)) {
+                        bestv = v;
+                        besti = i;
+                    }
+                }
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    const float ov = __shfl_down_sync(0xffffffffu, bestv, o);
+                    const int oi = __shfl_down_sync(0xffffffffu, besti, o);
+                    if (ov > bestv || (ov == bestv && oi > besti)) {
+                        bestv = ov;
+                        besti = oi;
+                    }
+                }
+                besti = __shfl_sync(0xffffffffu, besti, 0);
+                chosen[k] = besti;
+            }
+            if (tid == 0) {
+            // descending pick order -> ascending storage order
+            #pragma unroll
+            for (int e = 0; e < NEXP_; ++e) {
+                const int src = NEXP_ - 1 - e;
+                idxf[e] = static_cast<float>(chosen[src]);
+                scoref[e] = probs[chosen[src]];
+            }
+            // The stock sum(axis=-1) over (1,1,8) dispatches to
+            // row_reduce_simple with N_READS=4: two four-term sequential
+            // partials, then one add.  300/300 bitwise on live routers;
+            // the naive linear order missed a third of them.
+            const float lo = __fadd_rn(__fadd_rn(__fadd_rn(
+                scoref[0], scoref[1]), scoref[2]), scoref[3]);
+            const float hi = __fadd_rn(__fadd_rn(__fadd_rn(
+                scoref[4], scoref[5]), scoref[6]), scoref[7]);
+            const float sum = __fadd_rn(lo, hi);
+            const float denom = sum + 1e-20f;
+            #pragma unroll
+            for (int e = 0; e < NEXP_; ++e)
+                scoref[e] = __fdiv_rn(scoref[e], denom);
+            }
+        }
+    }
+
+    // ---- barrier 2 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[1], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[9], 1u);
+        else while (atomicAdd(&ctr[9], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase C: up_gate experts on the qmm_naive atom -------------------
+    // One warp per (expert, intermediate octet); each task walks up and gate
+    // columns for its octet (stock layout: up = [0, KD), gate = [KD, 2*KD)),
+    // applies the exact activation and stages bf16-rounded activations.
+    {
+        constexpr int OCTS = KD_ / 8;
+        const long long wstride = (2LL * KD_) * (KH_ / 16);
+        const long long gstride = (2LL * KD_) * (KH_ / GS);
+        for (int task = wglobal; task < NEXP_ * OCTS; task += GRID_ * WARPS) {
+            const int e = task / OCTS;
+            const int oct = task - e * OCTS;
+            const int we = static_cast<int>(idxf[e]);
+            const unsigned int* wq =
+                reinterpret_cast<const unsigned int*>(ugw) + we * wstride;
+            const __nv_bfloat16* sc = ugs + we * gstride;
+            const __nv_bfloat16* bi = ugb + we * gstride;
+            float up0 = 0.0f, up1 = 0.0f, ga0 = 0.0f, ga1 = 0.0f;
+            for (int kt = 0; kt < KH_ / 128; ++kt) {
+                #pragma unroll
+                for (int ka = 0; ka < 128 / 16; ++ka) {
+                    const int kb = kt * 128 + ka * 16;
+                    qmm_atom(xbs, wq, sc, bi, KH_ / 16, KH_ / GS,
+                             oct * 8, kb, GS, lane, up0, up1);
+                    qmm_atom(xbs, wq, sc, bi, KH_ / 16, KH_ / GS,
+                             KD_ + oct * 8, kb, GS, lane, ga0, ga1);
+                }
+            }
+            if ((lane >> 2) == 0) {
+                const int c = oct * 8 + 2 * (lane & 3);
+                const float u0 = __bfloat162float(__nv_bfloat16(up0));
+                const float u1 = __bfloat162float(__nv_bfloat16(up1));
+                const float g0 = __bfloat162float(__nv_bfloat16(ga0));
+                const float g1 = __bfloat162float(__nv_bfloat16(ga1));
+                actf[e * KD_ + c] =
+                    __bfloat162float(exact_swiglu(g0, u0));
+                actf[e * KD_ + c + 1] =
+                    __bfloat162float(exact_swiglu(g1, u1));
+            }
+        }
+    }
+
+    // ---- barrier 3 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[2], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[10], 1u);
+        else while (atomicAdd(&ctr[10], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase D: down experts, staged per expert -------------------------
+    {
+        constexpr int OCTS = ND_ / 8;
+        const long long wstride = (long long)ND_ * (KD_ / 16);
+        const long long gstride = (long long)ND_ * (KD_ / GS);
+        __shared__ __nv_bfloat16 abs_[NEXP_ * KD_];
+        for (int i = tid; i < NEXP_ * KD_; i += THREADS_)
+            abs_[i] = __nv_bfloat16(actf[i]);
+        __syncthreads();
+        for (int task = wglobal; task < NEXP_ * OCTS; task += GRID_ * WARPS) {
+            const int e = task / OCTS;
+            const int oct = task - e * OCTS;
+            const int we = static_cast<int>(idxf[e]);
+            const unsigned int* wq =
+                reinterpret_cast<const unsigned int*>(dnw) + we * wstride;
+            const __nv_bfloat16* sc = dns + we * gstride;
+            const __nv_bfloat16* bi = dnb + we * gstride;
+            float a0 = 0.0f, a1 = 0.0f;
+            for (int kt = 0; kt < KD_ / 128; ++kt) {
+                #pragma unroll
+                for (int ka = 0; ka < 128 / 16; ++ka) {
+                    qmm_atom(abs_ + e * KD_, wq, sc, bi, KD_ / 16, KD_ / GS,
+                             oct * 8, kt * 128 + ka * 16, GS, lane, a0, a1);
+                }
+            }
+            if ((lane >> 2) == 0) {
+                const int c = oct * 8 + 2 * (lane & 3);
+                dstage[e * ND_ + c] = __bfloat162float(__nv_bfloat16(a0));
+                dstage[e * ND_ + c + 1] = __bfloat162float(__nv_bfloat16(a1));
+            }
+        }
+    }
+
+    // ---- barrier 4 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[3], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[11], 1u);
+        else while (atomicAdd(&ctr[11], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+    if (blk != 0) return;
+
+    // ---- phase E: aggregation + residual fold + next norm -----------------
+    // Aggregation is col_reduce_small's linear loop with the multiply
+    // rounded on its own (128/128 bitwise); the tail is the proven exact
+    // fuse.
+    {
+        constexpr int VEC = KH_ / THREADS_;
+        const int base = tid * VEC;
+        float sb[VEC];
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const int idx = base + i;
+            float agg = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < NEXP_; ++e)
+                agg = __fadd_rn(agg,
+                    __fmul_rn(dstage[e * ND_ + idx], scoref[e]));
+            const float aggb = __bfloat162float(__nv_bfloat16(agg));
+            const T_ s = static_cast<T_>(
+                static_cast<float>(hin[idx]) + static_cast<float>(rin[idx]));
+            const T_ s2 = static_cast<T_>(static_cast<float>(s) + aggb);
+            hout[idx] = s2;
+            sb[i] = static_cast<float>(s2);
+            ss += sb[i] * sb[i];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+        if (lane == 0) red[warp] = ss;
+        __syncthreads();
+        float tot = (lane < WARPS) ? red[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
+        if (tid == 0) gsum_s = tot;
+        __syncthreads();
+        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const int idx = base + i;
+            out[idx] = static_cast<T_>(
+                sb[i] * nscale * static_cast<float>(nw2[idx]));
+        }
+    }
+"""
+
+
+_moe_exact_megakernel_cache = {}
+
+
+def _moe_exact_megakernel(eps):
+    kernel = _moe_exact_megakernel_cache.get(eps)
+    if kernel is None:
+        kernel = _moe_exact_megakernel_cache[eps] = mx.fast.cuda_kernel(
+            name="maple_moe_exact_megakernel",
+            input_names=["hin", "rin", "nw", "rw", "ugw", "ugs", "ugb",
+                         "dnw", "dns", "dnb", "nw2"],
+            output_names=["out", "hout", "scratch"],
+            source=_MOE_EXACT_MEGAKERNEL_SOURCE.replace(
+                "EPS_", f"{eps:.10e}f"),
+            header=_MOE_EXACT_MEGAKERNEL_HEADER,
+        )
+    return kernel
+
+
+def _moe_exact_megakernel_plan(block, ln, dtype, grid=None, threads=512):
+    """Geometry gates for the exact lane; strictly narrower than the fast
+    lane's, because every proven bit recipe assumed its exact shape."""
+    grid = _moe_megakernel_grid() if grid is None else grid
+    mlp = getattr(block, "switch_mlp", None)
+    if mlp is None or _cuda_profile() is None:
+        return False
+    ug = getattr(mlp, "up_gate_proj", None)
+    dp = getattr(mlp, "down_proj", None)
+    if ug is None or dp is None:
+        return False
+    kh, kd, nd = ug.input_dims, dp.input_dims, dp.output_dims
+    if not (
+        getattr(ug, "bits", None) == 2 and getattr(dp, "bits", None) == 2
+        and getattr(ug, "group_size", None) == 128
+        and getattr(dp, "group_size", None) == 128
+        and getattr(ug, "mode", "affine") == "affine"
+        and getattr(dp, "mode", "affine") == "affine"
+        and getattr(ug, "biases", None) is not None
+        and getattr(dp, "biases", None) is not None
+        and "bias" not in ug and "bias" not in dp
+        and block.gate.top_k == 8
+        and block.gate.num_experts == 256  # the softmax port's shape
+        and block.gate.weight.dtype == mx.bfloat16  # astype(f32) is exact
+        and dtype == mx.bfloat16           # every recipe is bf16-specific
+        and ug.output_dims == 2 * kd
+        and nd == kh
+        and kh % threads == 0
+        and kh % 128 == 0 and kd % 128 == 0
+        and ug.scales.dtype == mx.bfloat16
+        and dp.scales.dtype == mx.bfloat16
+    ):
+        return False
+    return (
+        _moe_exact_megakernel(ln.eps),
+        {
+            "template": [
+                ("T_", dtype),
+                ("KH_", kh), ("KD_", kd), ("ND_", nd),
+                ("NROUT_", block.gate.num_experts),
+                ("NEXP_", block.gate.top_k),
+                ("THREADS_", threads), ("GRID_", grid),
+            ],
+            "grid": (grid * threads, 1, 1),
+            "threadgroup": (threads, 1, 1),
+            "output_shapes": [
+                (1, 1, nd), (1, 1, kh),
+                (16 + 8 + 8 + 2 * block.gate.num_experts
+                 + block.gate.top_k * kd + block.gate.top_k * nd,),
+            ],
+            "output_dtypes": [dtype, dtype, mx.float32],
+            "init_value": 0,
+        },
+    )
+
+
+def _moe_exact_megakernel_call(layer, h, r, ln, next_w):
+    """The array-exact fast lane; same contract as _moe_megakernel_call."""
+    block = layer.mlp
+    plan = getattr(block, "_exact_megakernel_plan", None)
+    if plan is None:
+        try:
+            plan = _moe_exact_megakernel_plan(block, ln, h.dtype)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            plan = False
+        block._exact_megakernel_plan = plan
+    if plan is False:
+        return None
+    kernel, kwargs = plan
+    mlp = block.switch_mlp
+    ug, dp = mlp.up_gate_proj, mlp.down_proj
+    try:
+        hn, hout, _ = kernel(
+            inputs=[h, r, ln.weight, block.gate.weight, ug.weight, ug.scales,
+                    ug.biases, dp.weight, dp.scales, dp.biases, next_w],
+            **kwargs,
+        )
+    except (RuntimeError, TypeError, ValueError):
+        block._exact_megakernel_plan = False
+        return None
+    return hout, hn
+
+
 _moe_megakernel_cache = {}
 
 
@@ -2787,7 +3370,11 @@ class MapleModel(nn.Module):
             mx.eval(self._zero)
         r = self._zero  # x + 0 is exact in bf16
         hn = None
-        mega_next = self._megakernel_next_norms() if _use_moe_megakernel else None
+        mega_next = (
+            self._megakernel_next_norms()
+            if (_use_moe_megakernel or _use_moe_megakernel_exact)
+            else None
+        )
         for i, (layer, c, layer_type) in enumerate(
             zip(self.layers, cache, self.layer_types)
         ):
@@ -2799,6 +3386,13 @@ class MapleModel(nn.Module):
             hn = None
             ln = layer.post_attention_layernorm
             if mega_next is not None:
+                if _use_moe_megakernel_exact:
+                    fused = _moe_exact_megakernel_call(
+                        layer, h, r, ln, mega_next[i]
+                    )
+                    if fused is not None:
+                        h, hn = fused
+                        continue
                 fused = _moe_megakernel_call(layer, h, r, ln, mega_next[i])
                 if fused is not None:
                     h, hn = fused

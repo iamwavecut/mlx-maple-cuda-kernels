@@ -25,12 +25,13 @@ ap.add_argument("--prompt-seed", type=int, default=20260806)
 a = ap.parse_args()
 
 parts = set(a.mode.split("+"))
-if "strict" in parts or "fast" in parts:
+if "strict" in parts or "fast" in parts or "exact" in parts:
     parts |= {"norm", "qkv"}
 maple._use_fused_add_rms = "norm" in parts
 maple._use_fused_qkv = "qkv" in parts
 maple._use_compiled_router = "router" in parts
 maple._use_moe_megakernel = "fast" in parts
+maple._use_moe_megakernel_exact = "exact" in parts
 if "fast" in parts:
     # the megakernel absorbs the router, so the compiled one never runs
     maple._use_compiled_router = False
@@ -71,5 +72,9 @@ print(json.dumps({
         "megakernel_layers": sum(
             1 for l in inner.layers
             if getattr(l.mlp, "_megakernel_plan", None) not in (None, False)),
+        "exact_megakernel_layers": sum(
+            1 for l in inner.layers
+            if getattr(l.mlp, "_exact_megakernel_plan", None)
+            not in (None, False)),
     },
 }), flush=True)

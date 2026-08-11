@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.0 — 2026-08-11
+
+- **Built the array-exact megakernel** (`MAPLE_MOE_MEGAKERNEL_EXACT=1`,
+  opt-in): the whole MoE block in one dispatch, five phases behind four grid
+  barriers, where every phase reproduces the stock chain's bits — the fp32
+  router gemv order, the online-softmax port, argsort-tail top-8 selection
+  via a warp argmax under a strict total order, the (1,1,8) row-reduce renorm
+  with `div.rn`, the qmm_naive tensor-core atoms for both expert projections,
+  the bf16-typed sigmoid chain for the activation, and the uncontracted
+  linear aggregation. On hardware: every MoE layer of the real checkpoint is
+  array-equal to the stock chain (72/72 random pairs), the decode stream is
+  identical to the stock reference on 8/8 screened prompts — the fast lane's
+  megakernel matches 1/8 on the same screen — and the 846-token quality suite
+  reproduces the strict lane's corpus NLL to the last digit.
+- Two semantics pins were corrected along the way, both caught by live-data
+  divergence and settled by measurement: `sum(axis=-1)` over the router's
+  (1,1,8) scores dispatches to `row_reduce_simple` (two sequential four-term
+  partials, then one add), not the flat-array `all_reduce` linear order the
+  first probe pinned — the shape picks the kernel and the bits; and the
+  renorm division is IEEE `div.rn`.
+- The exact lane currently trades throughput for its stream: same
+  one-dispatch host structure as the fast megakernel, more GPU work.
+
 ## 0.5.0 — 2026-08-11
 
 - Folded the next layer's residual add + RMSNorm into the megakernel as a

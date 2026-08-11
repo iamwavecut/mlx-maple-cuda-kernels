@@ -44,19 +44,23 @@ def configure(mode):
     maple._use_fused_qkv = mode != "off"
     maple._use_compiled_router = mode != "off"
     maple._use_moe_megakernel = mode == "fast"
+    maple._use_moe_megakernel_exact = mode == "exact"
     model.model._exact_add_norm = None
     for l in model.model.layers:
         l.self_attn._split_qkv = None
         l.mlp.gate._compiled_ok = None
         if hasattr(l.mlp, "_megakernel_plan"):
             del l.mlp._megakernel_plan
+        if hasattr(l.mlp, "_exact_megakernel_plan"):
+            del l.mlp._exact_megakernel_plan
 
 def gen(p):
     return [int(r.token) for r in
             stream_generate(model, tok, p, max_tokens=a.gen, prefill_step_size=2048)]
 
 summary = {"strict": {"prompts": 0, "identical": 0, "mismatches": []},
-           "fast": {"prompts": 0, "identical": 0, "mismatches": []}}
+           "fast": {"prompts": 0, "identical": 0, "mismatches": []},
+           "exact": {"prompts": 0, "identical": 0, "mismatches": []}}
 unstable = []
 for name, prompt in prompts:
     configure("off")
@@ -68,7 +72,7 @@ for name, prompt in prompts:
             stable = min(stable, m)
     if stable < a.gen:
         unstable.append({"prompt": name, "reference_stable_up_to": stable})
-    for mode in ("strict", "fast"):
+    for mode in ("strict", "fast", "exact"):
         configure(mode)
         cand = gen(prompt)
         s = summary[mode]
@@ -79,5 +83,5 @@ for name, prompt in prompts:
         else:
             s["mismatches"].append({"prompt": name, "index": m})
 print(json.dumps({"reference_unstable": unstable}), flush=True)
-for mode in ("strict", "fast"):
+for mode in ("strict", "fast", "exact"):
     print(json.dumps({"mode": mode, **summary[mode]}), flush=True)

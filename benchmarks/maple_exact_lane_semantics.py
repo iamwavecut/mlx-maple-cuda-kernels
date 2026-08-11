@@ -12,7 +12,9 @@ stock building block of the router / aggregation chain:
               level -- ported line for line below
   top-8       argpartition(kth=-8) tail order == argsort tail (ascending by
               value), including ties
-  renorm      scores.sum(-1): linear 8-element fp32 sum, then + 1e-20
+  renorm      scores.sum(-1) on (1,1,8): row_reduce_simple, two four-term
+              sequential partials then one add (the flat-(8,) all_reduce
+              route is linear -- shape picks the kernel and the bits)
   aggregate   (y32 * s).sum(axis=-2): col_reduce_small's linear loop with the
               multiply rounded separately -- __fmul_rn then __fadd_rn, NO fma
               contraction (contraction is exactly what broke the obvious
@@ -125,11 +127,14 @@ SOFTMAX_SRC = r"""
 """
 
 SUM8_SRC = r"""
+    // sum(axis=-1) over (1,1,8) dispatches to row_reduce_simple with
+    // N_READS=4: two sequential four-term partials, then one add.  The
+    // shape matters: a flat (8,) array takes all_reduce instead, whose
+    // order is plain linear -- pinning the wrong route cost a day.
     if (threadIdx.x != 0) return;
-    float s = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) s += x[i];
-    out[0] = s;
+    const float lo = __fadd_rn(__fadd_rn(__fadd_rn(x[0], x[1]), x[2]), x[3]);
+    const float hi = __fadd_rn(__fadd_rn(__fadd_rn(x[4], x[5]), x[6]), x[7]);
+    out[0] = __fadd_rn(lo, hi);
 """
 
 AGG_SRC = r"""
@@ -229,7 +234,7 @@ def main():
         mx.random.seed(3000 + i)
         v = mx.random.normal((8,)).astype(mx.float32)
         mx.eval(v)
-        ref = v.sum(keepdims=True)
+        ref = v.reshape(1, 1, 8).sum(axis=-1)  # the router's actual shape
         (got,) = kern(
             inputs=[v], template=[("D_", 0)],
             grid=(32, 1, 1), threadgroup=(32, 1, 1),
