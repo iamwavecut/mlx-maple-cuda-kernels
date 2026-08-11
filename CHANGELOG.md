@@ -20,8 +20,16 @@
   partials, then one add), not the flat-array `all_reduce` linear order the
   first probe pinned — the shape picks the kernel and the bits; and the
   renorm division is IEEE `div.rn`.
-- The exact lane currently trades throughput for its stream: same
-  one-dispatch host structure as the fast megakernel, more GPU work.
+- Closed the exact lane's throughput gap with bit-neutral load and
+  scheduling work: `qmm_tile` loads a full 128-k tile (two `uint4` reads and
+  one scale/bias pair) instead of eight per-atom triples, phase C runs all
+  2*KD projection columns as independent warp tasks with the activation
+  folded into phase D's shared load, and the router gemv reads bf16 pairs.
+  Same data, same order, same bits — re-verified 72/72 layer pairs, 8/8
+  stream, NLL to the last digit. On the shared sm86 dev host the exact lane
+  went 110 → 200 → 345 tok/s across the three optimization rounds and now
+  matches the ~1 ULP megakernel (341 median) while carrying the stock
+  stream.
 
 ## 0.5.0 — 2026-08-11
 

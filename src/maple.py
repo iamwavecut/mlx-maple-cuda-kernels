@@ -2556,10 +2556,73 @@ __device__ __forceinline__ float bf16f(float v) {
     return __bfloat162float(__nv_bfloat16(v));
 }
 
-// One m16n8k16 atom's worth of the qmm_naive reproduction: the caller walks
-// k-tiles in order and this accumulates one 16-wide step for the 8-column
-// octet at `col0`.  `xb` is the bf16 activation vector (row 0 of A), the
-// packed 2-bit weights/scales/biases are row-major per expert.
+// One full 128-k tile of the qmm_naive reproduction: eight m16n8k16 atoms
+// in k order for the 8-column octet at `col0`.  The tile's sixteen packed
+// words per column arrive as two uint4 loads and one scale/bias pair covers
+// the whole tile (group_size == 128) -- same data as loading per fragment
+// element, same bits, an eighth of the transactions.
+__device__ __forceinline__ void qmm_tile(
+    const __nv_bfloat16* xb,
+    const unsigned int* wq,
+    const __nv_bfloat16* sc,
+    const __nv_bfloat16* bi,
+    long long wrow_stride_u32,
+    long long grow_stride,
+    int col0,
+    int ktile,
+    int gs,
+    int lane,
+    float& acc0,
+    float& acc1) {
+    const int col = col0 + (lane >> 2);
+    const unsigned int* wrow = wq + col * wrow_stride_u32 + (ktile >> 4);
+    const uint4 wa = *reinterpret_cast<const uint4*>(wrow);
+    const uint4 wb = *reinterpret_cast<const uint4*>(wrow + 4);
+    const unsigned words[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+    const __nv_bfloat16 s = sc[col * grow_stride + ktile / gs];
+    const __nv_bfloat16 z = bi[col * grow_stride + ktile / gs];
+    float d2 = 0.0f, d3 = 0.0f;  // rows 8..15 of the atom: discarded
+
+    #pragma unroll
+    for (int ka = 0; ka < 8; ++ka) {
+        const int kbase = ktile + ka * 16;
+        const unsigned int word = words[ka];
+        const int akol = (lane & 3) * 2;
+        const bool arow0 = (lane >> 2) == 0;
+        const __nv_bfloat16 zero = __nv_bfloat16(0.0f);
+        const __nv_bfloat16 a0 = arow0 ? xb[kbase + akol] : zero;
+        const __nv_bfloat16 a1 = arow0 ? xb[kbase + akol + 1] : zero;
+        const __nv_bfloat16 a4 = arow0 ? xb[kbase + 8 + akol] : zero;
+        const __nv_bfloat16 a5 = arow0 ? xb[kbase + 8 + akol + 1] : zero;
+        __nv_bfloat16 bfrag[4];
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            #pragma unroll
+            for (int piece = 0; piece < 2; ++piece) {
+                const int sub = half * 8 + (lane & 3) * 2 + piece;
+                const int q = (word >> (2 * sub)) & 3;
+                bfrag[half * 2 + piece] =
+                    __hadd(__hmul(__nv_bfloat16(float(q)), s), z);
+            }
+        }
+        const unsigned azz = 0u;
+        const unsigned a01 = (unsigned(__bfloat16_as_ushort(a1)) << 16)
+                           | unsigned(__bfloat16_as_ushort(a0));
+        const unsigned a45 = (unsigned(__bfloat16_as_ushort(a5)) << 16)
+                           | unsigned(__bfloat16_as_ushort(a4));
+        const unsigned b01 = (unsigned(__bfloat16_as_ushort(bfrag[1])) << 16)
+                           | unsigned(__bfloat16_as_ushort(bfrag[0]));
+        const unsigned b23 = (unsigned(__bfloat16_as_ushort(bfrag[3])) << 16)
+                           | unsigned(__bfloat16_as_ushort(bfrag[2]));
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(acc0), "+f"(acc1), "+f"(d2), "+f"(d3)
+            : "r"(a01), "r"(azz), "r"(a45), "r"(azz), "r"(b01), "r"(b23));
+    }
+}
+
+// The original per-atom form, kept for reference paths.
 __device__ __forceinline__ void qmm_atom(
     const __nv_bfloat16* xb,
     const unsigned int* wq,
@@ -2652,14 +2715,14 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     constexpr int OFF_SCO = OFF_IDX + 8;
     constexpr int OFF_LOG = OFF_SCO + 8;
     constexpr int OFF_PRB = OFF_LOG + NROUT_;
-    constexpr int OFF_ACT = OFF_PRB + NROUT_;
-    constexpr int OFF_DST = OFF_ACT + NEXP_ * KD_;
+    constexpr int OFF_UGS = OFF_PRB + NROUT_;
+    constexpr int OFF_DST = OFF_UGS + NEXP_ * 2 * KD_;
     unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
     float* idxf = scratch + OFF_IDX;
     float* scoref = scratch + OFF_SCO;
     float* logits = scratch + OFF_LOG;
     float* probs = scratch + OFF_PRB;
-    float* actf = scratch + OFF_ACT;
+    float* ugstage = scratch + OFF_UGS;
     float* dstage = scratch + OFF_DST;
 
     __shared__ float xs_lin[KH_];
@@ -2713,10 +2776,14 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
         const __nv_bfloat16* wrow = rw + (long long)row * KH_;
         float sum = 0.0f;
         for (int col = 4 * lane; col < KH_; col += 128) {
-            sum = fmaf(__bfloat162float(wrow[col]), xs_lin[col], sum);
-            sum = fmaf(__bfloat162float(wrow[col + 1]), xs_lin[col + 1], sum);
-            sum = fmaf(__bfloat162float(wrow[col + 2]), xs_lin[col + 2], sum);
-            sum = fmaf(__bfloat162float(wrow[col + 3]), xs_lin[col + 3], sum);
+            const __nv_bfloat162 wab =
+                *reinterpret_cast<const __nv_bfloat162*>(wrow + col);
+            const __nv_bfloat162 wcd =
+                *reinterpret_cast<const __nv_bfloat162*>(wrow + col + 2);
+            sum = fmaf(__bfloat162float(wab.x), xs_lin[col], sum);
+            sum = fmaf(__bfloat162float(wab.y), xs_lin[col + 1], sum);
+            sum = fmaf(__bfloat162float(wcd.x), xs_lin[col + 2], sum);
+            sum = fmaf(__bfloat162float(wcd.y), xs_lin[col + 3], sum);
         }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1)
@@ -2864,12 +2931,14 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     __syncthreads();
     __threadfence();
 
-    // ---- phase C: up_gate experts on the qmm_naive atom -------------------
-    // One warp per (expert, intermediate octet); each task walks up and gate
-    // columns for its octet (stock layout: up = [0, KD), gate = [KD, 2*KD)),
-    // applies the exact activation and stages bf16-rounded activations.
+    // ---- phase C: up_gate experts on the qmm_naive tile -------------------
+    // One warp per (expert, up_gate octet): all 2*KD columns as independent
+    // tasks, which fills the grid twice as densely as pairing up with gate
+    // did.  Raw bf16-rounded projection outputs are staged; the activation
+    // moves to phase D's shared-load, where both halves are visible -- same
+    // formula, same inputs, same bits.
     {
-        constexpr int OCTS = KD_ / 8;
+        constexpr int OCTS = 2 * KD_ / 8;
         const long long wstride = (2LL * KD_) * (KH_ / 16);
         const long long gstride = (2LL * KD_) * (KH_ / GS);
         for (int task = wglobal; task < NEXP_ * OCTS; task += GRID_ * WARPS) {
@@ -2880,27 +2949,17 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
                 reinterpret_cast<const unsigned int*>(ugw) + we * wstride;
             const __nv_bfloat16* sc = ugs + we * gstride;
             const __nv_bfloat16* bi = ugb + we * gstride;
-            float up0 = 0.0f, up1 = 0.0f, ga0 = 0.0f, ga1 = 0.0f;
+            float o0 = 0.0f, o1 = 0.0f;
             for (int kt = 0; kt < KH_ / 128; ++kt) {
-                #pragma unroll
-                for (int ka = 0; ka < 128 / 16; ++ka) {
-                    const int kb = kt * 128 + ka * 16;
-                    qmm_atom(xbs, wq, sc, bi, KH_ / 16, KH_ / GS,
-                             oct * 8, kb, GS, lane, up0, up1);
-                    qmm_atom(xbs, wq, sc, bi, KH_ / 16, KH_ / GS,
-                             KD_ + oct * 8, kb, GS, lane, ga0, ga1);
-                }
+                qmm_tile(xbs, wq, sc, bi, KH_ / 16, KH_ / GS,
+                         oct * 8, kt * 128, GS, lane, o0, o1);
             }
             if ((lane >> 2) == 0) {
                 const int c = oct * 8 + 2 * (lane & 3);
-                const float u0 = __bfloat162float(__nv_bfloat16(up0));
-                const float u1 = __bfloat162float(__nv_bfloat16(up1));
-                const float g0 = __bfloat162float(__nv_bfloat16(ga0));
-                const float g1 = __bfloat162float(__nv_bfloat16(ga1));
-                actf[e * KD_ + c] =
-                    __bfloat162float(exact_swiglu(g0, u0));
-                actf[e * KD_ + c + 1] =
-                    __bfloat162float(exact_swiglu(g1, u1));
+                ugstage[e * 2 * KD_ + c] =
+                    __bfloat162float(__nv_bfloat16(o0));
+                ugstage[e * 2 * KD_ + c + 1] =
+                    __bfloat162float(__nv_bfloat16(o1));
             }
         }
     }
@@ -2922,8 +2981,14 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
         const long long wstride = (long long)ND_ * (KD_ / 16);
         const long long gstride = (long long)ND_ * (KD_ / GS);
         __shared__ __nv_bfloat16 abs_[NEXP_ * KD_];
-        for (int i = tid; i < NEXP_ * KD_; i += THREADS_)
-            abs_[i] = __nv_bfloat16(actf[i]);
+        for (int i = tid; i < NEXP_ * KD_; i += THREADS_) {
+            const int e = i / KD_;
+            const int c = i - e * KD_;
+            // stock layout: up = cols [0, KD), gate = cols [KD, 2*KD)
+            abs_[i] = exact_swiglu(
+                ugstage[e * 2 * KD_ + KD_ + c],
+                ugstage[e * 2 * KD_ + c]);
+        }
         __syncthreads();
         for (int task = wglobal; task < NEXP_ * OCTS; task += GRID_ * WARPS) {
             const int e = task / OCTS;
@@ -2935,11 +3000,8 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
             const __nv_bfloat16* bi = dnb + we * gstride;
             float a0 = 0.0f, a1 = 0.0f;
             for (int kt = 0; kt < KD_ / 128; ++kt) {
-                #pragma unroll
-                for (int ka = 0; ka < 128 / 16; ++ka) {
-                    qmm_atom(abs_ + e * KD_, wq, sc, bi, KD_ / 16, KD_ / GS,
-                             oct * 8, kt * 128 + ka * 16, GS, lane, a0, a1);
-                }
+                qmm_tile(abs_ + e * KD_, wq, sc, bi, KD_ / 16, KD_ / GS,
+                         oct * 8, kt * 128, GS, lane, a0, a1);
             }
             if ((lane >> 2) == 0) {
                 const int c = oct * 8 + 2 * (lane & 3);
@@ -3053,6 +3115,7 @@ def _moe_exact_megakernel_plan(block, ln, dtype, grid=None, threads=512):
         and nd == kh
         and kh % threads == 0
         and kh % 128 == 0 and kd % 128 == 0
+        and (kh // 16) % 4 == 0 and (kd // 16) % 4 == 0  # uint4 tile loads
         and ug.scales.dtype == mx.bfloat16
         and dp.scales.dtype == mx.bfloat16
     ):
@@ -3072,7 +3135,7 @@ def _moe_exact_megakernel_plan(block, ln, dtype, grid=None, threads=512):
             "output_shapes": [
                 (1, 1, nd), (1, 1, kh),
                 (16 + 8 + 8 + 2 * block.gate.num_experts
-                 + block.gate.top_k * kd + block.gate.top_k * nd,),
+                 + block.gate.top_k * 2 * kd + block.gate.top_k * nd,),
             ],
             "output_dtypes": [dtype, dtype, mx.float32],
             "init_value": 0,

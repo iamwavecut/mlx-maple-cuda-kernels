@@ -164,11 +164,13 @@ reduce kernel than a flat (8,) array — the shape picks the bits — and the
 one-element-per-column divergence that exposed it survived 72 random layer
 tests before live data caught it.
 
-It ships opt-in for now because it trades throughput for its stream: the host
-structure is the megakernel's (one dispatch per layer plus the tail), but the
-tensor-core phases do more GPU work than the ~1 ULP lane's SIMT loops. Where
-that trade lands per device is in the results file; closing the gap without
-touching the bits (loads and scheduling only) is the open line of work.
+After three rounds of bit-neutral load and scheduling work — tile-wide
+`uint4` weight reads, single-projection warp tasks with the activation folded
+into the next phase's shared load, paired router reads — the trade is gone on
+the dev host: **exact 345 vs ~1 ULP 341 median tok/s** (strict 176), with the
+stream and quality checks re-verified after every optimization. It ships
+opt-in pending multi-architecture confirmation, after which it is the natural
+default: the fast lane's speed with the strict lane's stream.
 
 ### Quality
 
