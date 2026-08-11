@@ -23,6 +23,13 @@ of optimization is operation count, not arithmetic.
 | --- | ---: | ---: | ---: | ---: |
 | RTX 3090, EPYC 7452 | 2.40 ms | 3.96 ms | **0.0025 ms** | 6.36 ms |
 | RTX 3090, AI Farm | 2.02 ms | 2.76 ms | **0.0028 ms** | 4.78 ms |
+| RTX 4090 | 2.43 ms | 3.31 ms | **0.0029 ms** | 5.76 ms |
+| H100 80GB HBM3 | — | — | **0.0040 ms** | — |
+| B200 | — | — | **0.0030 ms** | — |
+| RTX 5090 | — | — | **0.0022 ms** | — |
+
+The GPU wait stays at the same few microseconds from a 3090 to a B200, which
+is why the fusion gains do not track GPU class.
 
 Two consequences shaped the release. Kernels that make the GPU faster without
 removing operations do nothing: a hand-written 2-bit expert GEMV measured
@@ -44,20 +51,45 @@ Related measurements, all on RTX 3090:
 
 Full write-up: [`docs/host-bound-decode.md`](docs/host-bound-decode.md).
 
-## Fusion release (RTX 3090, `sm86`)
+## Fusion release
 
-Eight fresh processes per mode, interleaved order, warm `B=1`, `L=1` BF16
-decode, 128-token prompt / 512-token generation. `off` disables every new
-fusion and reproduces the previous release path.
+Fresh processes per mode, interleaved order, warm `B=1`, `L=1` BF16 decode,
+128-token prompt / 512-token generation. `off` disables every new fusion and
+reproduces the previous release path. Ratios are paired geometric means over
+the processes of one device instance.
 
-| Mode | Median tok/s | Paired gain (95% CI) | Wins | Token stream |
-| --- | ---: | ---: | ---: | --- |
-| off | 152.29 | — | — | — |
-| **strict** (default) | **164.94** | **+6.68%** (+4.33%–+9.09%) | 8/8 | identical, 8/8 prompts |
-| **megakernel** (opt-in) | **272.80** | **+79.51%** (+76.18%–+82.91%) | 8/8 | within ~1 ULP, 1/8 prompts |
+| GPU | CC | off | strict (default) | Paired gain (95% CI) | Wins |
+| --- | --- | ---: | ---: | ---: | ---: |
+| RTX 3090 | `sm86` | 152.29 | **164.94** | **+6.68%** (+4.33%–+9.09%) | 8/8 |
+| RTX 4090 | `sm89` | 157.66 | **184.25** | **+16.91%** (+15.27%–+18.56%) | 6/6 |
+| H100 80GB HBM3 | `sm90` | 206.75 | **226.88** | **+9.32%** (+2.70%–+16.36%) | 5/6 |
+| B200 | `sm100` | 141.87 | **165.19** | +11.77% (−4.35%–+30.61%) | 5/6 |
+| RTX 5090 | `sm120` | 242.61 | **269.34** | **+10.63%** (+8.84%–+12.46%) | 6/6 |
 
-At 2048 generated tokens the same ordering holds and neither mode grows peak
-memory: 154.75 / 163.51 / 274.72 tok/s at 6.478 GB.
+The opt-in megakernel on the same runs:
+
+| GPU | CC | megakernel | Paired gain (95% CI) | Wins | Token stream |
+| --- | --- | ---: | ---: | ---: | --- |
+| RTX 3090 | `sm86` | **272.80** | **+79.51%** (+76.18%–+82.91%) | 8/8 | 1/8 prompts |
+| RTX 4090 | `sm89` | **292.15** | **+87.04%** (+81.01%–+93.26%) | 6/6 | 0/8 |
+| H100 80GB HBM3 | `sm90` | **361.72** | **+76.11%** (+67.86%–+84.77%) | 6/6 | 1/8 |
+| B200 | `sm100` | **254.37** | **+73.86%** (+47.35%–+105.14%) | 6/6 | 3/8 |
+| RTX 5090 | `sm120` | **426.66** | **+75.35%** (+71.10%–+79.70%) | 6/6 | 0/8 |
+
+**The strict lane reproduced the stock token stream on 8/8 screened prompts on
+every architecture.** The megakernel does not, as designed.
+
+The `sm100` strict interval crosses zero and its megakernel interval is wide:
+that host had the lowest absolute throughput of the five despite the largest
+GPU, which is what a host-bound workload on a contended CPU looks like. The
+B200 numbers are a single-instance observation and should be read as such.
+
+At 2048 generated tokens the ordering holds on every target and peak memory
+does not grow; on `sm86` that is 154.75 / 163.51 / 274.72 tok/s at 6.478 GB.
+
+Absolute rates are not a cross-GPU ranking: each row is one device instance on
+one host, and for this workload the host CPU moves the number more than the
+GPU does.
 
 ### What is on by default
 
@@ -264,11 +296,11 @@ This is deliberately narrower than claiming whole-module equivalence.
 - Five `tests/test_generate.py` failures remain baseline-compatible on the
   tested checkout and are not claimed as fixed.
 - Approximate router/add-RMS/ternary paths remain research-only.
-- The fusion release is measured on `sm86` only. Attempts to validate `sm89`
-  on community cloud failed: RTX 4090 capacity was unavailable and the L40S
-  offered carried driver 550.163.01, on which MLX CUDA 0.32.0 cannot start at
-  all (`cudaMallocManaged failed: unknown error`). **MLX CUDA 0.32.0 needs a
-  driver newer than 550.163**; the working hosts here ran 580.
+- The fusion release is validated on all five targets, but each row is a single
+  device instance measured once, not a fleet claim.
+- **MLX CUDA 0.32.0 needs a driver newer than 550.163.** An L40S offered with
+  driver 550.163.01 could not start MLX at all
+  (`cudaMallocManaged failed: unknown error`). Working hosts here ran 575-580.
 - The megakernel's grid barrier assumes every block is resident. MLX does not
   expose the multiprocessor count, so the grid is fixed at 32 blocks, which
   every CUDA GPU of this era holds at once. Throughput is flat from 32 to 160

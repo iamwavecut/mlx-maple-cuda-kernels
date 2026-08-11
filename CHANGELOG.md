@@ -19,9 +19,12 @@
 - Added an opt-in compiled router: the stock chain under `mx.compile`,
   array-exact, but its end-to-end effect measured 1.0062x with a 95% interval
   of 0.9927-1.0198, so it ships off.
-- RTX 3090 fusion release, eight fresh processes per mode: strict +6.68%
-  (+4.33%-+9.09%, 8/8 wins) with an identical token stream on 8/8 screened
-  prompts; megakernel +79.51% (+76.18%-+82.91%, 8/8 wins) within ~1 ULP.
+- Validated on all five targets. Strict lane: RTX 3090 +6.68%, RTX 4090
+  +16.91%, H100 80GB +9.32%, B200 +11.77%, RTX 5090 +10.63%, and an identical
+  token stream on 8/8 screened prompts on every one. Megakernel: +79.51%,
+  +87.04%, +76.11%, +73.86%, +75.35%.
+- The GPU wait per step measures 0.002-0.004 ms from a 3090 to a B200, so the
+  host-bound finding is not specific to a small GPU.
 - Adopted a screened equivalence protocol after finding that the stock path is
   not always reproducible run to run. Verdicts are now taken only inside the
   region where three reference runs agree.
