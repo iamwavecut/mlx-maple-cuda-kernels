@@ -3,10 +3,10 @@
 ## Current release: the fusion campaign
 
 The release source is [`../src/maple.py`](../src/maple.py), SHA-256
-`195d0e741eb15bf4387c6eadcbc3574a9676149d27cb6e1d9ecb2fde52e2a4b8`.
+`2089c3164d42d1c8d0c3f8f181c674c48f0233eab55753963f178e61d406048d`.
 The integration patch against DeepGrove base
 `eba96c16158f032821b0bf374ea1421cfddef0a9` is SHA-256
-`830d44f10298c4e83d17a7461f1b8fec378cc94e2e442ea646359401f53f29ca`.
+`426c1f67d5a33787384dfb0bd4cdfcc15848336bccc9f242871e8516913e5321`.
 
 Both were checked the way a user gets them: clone `mlx-lm-deepgrove`, check out
 that base, `git apply`. The patch applies clean, reproduces the four checked-in
@@ -29,6 +29,11 @@ sets the flags directly, so each column measures the same code before and after.
 3. The megakernel's default flipped from off to on. The column labelled
    `megakernel` was always measured with it on, and the column labelled
    `strict` with it off.
+4. The megakernel gained the tail phase (0.5.0), which folds the next layer's
+   add+RMSNorm into the dispatch. Its fast-lane token stream is bit-identical
+   to the pre-tail build — verified on hardware by stream hash over 512
+   generated tokens on two devices and by the 846-token quality suite
+   reproducing the corpus NLL to the last digit — so the tables transfer.
 
 `results/cuda/megakernel-grid-and-quality.jsonl` holds both the sweep and the
 confirmation.

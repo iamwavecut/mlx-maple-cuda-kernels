@@ -800,6 +800,70 @@ assert maple._router_select_kernel_cache == {}
         plan = maple._moe_megakernel_plan(layer.mlp, ln, mx.bfloat16)
         self.assertFalse(plan, "unquantized experts must not build a plan")
 
+    def test_megakernel_tail_norm_is_exactly_the_fuse(self):
+        """Phase E must be bit-identical to the standalone exact fuse.
+
+        The megakernel now emits the next layer's attention input itself.  The
+        lane's inexactness budget lives in the MoE math alone, so the tail's
+        add+norm of its own carrier has to reproduce `_exact_add_rms_norm` to
+        the last bit -- otherwise the fusion quietly widened the error story.
+        """
+        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
+            self.skipTest("CUDA fast path unavailable")
+        import mlx.nn as nn
+
+        mx.random.seed(7)
+        args = _args()
+        model = maple.Model(args)
+        moe = None
+        for layer in model.model.layers:
+            if getattr(layer.mlp, "switch_mlp", None) is not None:
+                moe = layer
+                break
+        self.assertIsNotNone(moe, "fixture has no MoE layer")
+        moe.mlp.gate.weight = (
+            mx.random.normal((args.num_experts, args.hidden_size)) * 0.05
+        )
+        model.set_dtype(mx.bfloat16)
+        nn.quantize(moe.mlp.switch_mlp, group_size=128, bits=2)
+        mx.eval(model.parameters())
+
+        h = mx.random.normal((1, 1, args.hidden_size)).astype(mx.bfloat16)
+        r = mx.random.normal((1, 1, args.hidden_size)).astype(mx.bfloat16)
+        next_w = model.model.norm.weight
+        ln = moe.post_attention_layernorm
+        mx.eval(h, r)
+
+        fused = maple._moe_megakernel_call(moe, h, r, ln, next_w)
+        if fused is None:
+            self.skipTest("megakernel plan rejected the quantized fixture")
+        hout, hn = fused
+        mx.eval(hout, hn)
+
+        # The tail normed its own carrier; the fuse over (carrier, 0) must
+        # agree exactly, because adding bf16 zero is exact.
+        zero = mx.zeros_like(hout)
+        ref_h, ref_hn = maple._exact_add_rms_norm(hout, zero, next_w, ln.eps)
+        mx.eval(ref_h, ref_hn)
+        self.assertTrue(
+            mx.array_equal(ref_h, hout).item(), "carrier changed under a zero add"
+        )
+        self.assertTrue(
+            mx.array_equal(ref_hn, hn).item(),
+            "tail norm is not bit-identical to the exact fuse",
+        )
+
+        # And the carrier itself must be the residual chain, loosely: the MoE
+        # values differ from stock by design, but a staging bug would miss by
+        # far more than 1 ULP of bf16.
+        s = (h.astype(mx.float32) + r.astype(mx.float32)).astype(mx.bfloat16)
+        x = mx.fast.rms_norm(s, ln.weight, ln.eps)
+        s2 = s.astype(mx.float32) + moe.mlp(x).astype(mx.float32)
+        close = mx.allclose(
+            hout.astype(mx.float32), s2, rtol=5e-2, atol=5e-2
+        ).item()
+        self.assertTrue(close, "carrier is not the residual chain")
+
 
 if __name__ == "__main__":
     unittest.main()

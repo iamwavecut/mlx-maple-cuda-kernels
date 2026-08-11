@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 — 2026-08-11
+
+- Folded the next layer's residual add + RMSNorm into the megakernel as a
+  tail phase. The Python decode loop issued one standalone fuse dispatch per
+  MoE layer per step purely to prepare the next attention input; the tail
+  moves that to the GPU behind a fourth grid barrier, and the loop now issues
+  **one** fuse per step (the first layer) instead of twenty-five. The tail
+  mirrors `_EXACT_ADD_RMS_SOURCE` line for line, and a CUDA test asserts its
+  output is bit-identical to the standalone fuse — the lane's ~1 ULP story
+  stays confined to the MoE math. The 846-token quality suite reproduces the
+  previous build's corpus NLL to the last digit in all three lanes.
+- Added `benchmarks/maple_fast_lane_profile.py`: exclusive host time per
+  sub-block with the megakernel on. On the shared-GPU dev host the step's
+  remaining host budget is attention 681 us, KV-cache updates 334 us,
+  megakernel dispatches 410 us, fuse 20 us — the fuse column used to be ~330,
+  which is the tail's savings measured directly.
+
 ## 0.4.0 — 2026-08-11
 
 - Established that Maple decode on CUDA is host-bound: with a warm cache the

@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..d1a103a 100644
+index a0673f7..d554c5b 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,7 @@
@@ -206,16 +206,16 @@ index a0673f7..d1a103a 100644
  
 -def _matches(fast, reference, tol=2e-2):
 -    """One-time self-check for a hand-written Metal kernel.
-+def _matches(fast, reference):
-+    """Fail closed unless a hand-written kernel is array-exact.
- 
+-
 -    Every fast path below has a portable equivalent, and each is used only
 -    after its outputs have been compared against that equivalent once, on the
 -    live weights. This file ships inside checkpoints and runs on whatever mlx
 -    and GPU the user has, so a kernel that fails to compile, silently mismatches
 -    the config it was templated for, or drifts from a future mlx must degrade to
 -    the portable path rather than corrupt the token stream.
--
++def _matches(fast, reference):
++    """Fail closed unless a hand-written kernel is array-exact.
+ 
 -    Both callables return a tuple of arrays. The kernels stay in bounds for any
 -    config (loop counts are integer-divided from the templated dims), so a
 -    config they cannot handle shows up here as wrong values, not as a fault.
@@ -1683,7 +1683,7 @@ index a0673f7..d1a103a 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,16 +2067,540 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2067,615 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -1711,23 +1711,31 @@ index a0673f7..d1a103a 100644
  
 +# Opt-in fast lane: the whole MoE block in one dispatch.
 +#
-+# Four phases separated by three atomic-counter grid barriers -- there is no
++# Five phases separated by four atomic-counter grid barriers -- there is no
 +# cooperative launch, so ordering across blocks has to be built by hand, and a
 +# barrier is only safe while every block is resident.  MLX does not expose the
-+# multiprocessor count, so the grid is fixed at 32 blocks, which every CUDA GPU
-+# of this era holds simultaneously.  Measured on RTX 3090 the throughput is
-+# flat from 32 to 160 blocks and only falls off past 192, so the conservative
-+# choice costs nothing while a larger grid would risk a deadlock on a smaller
-+# device.
++# multiprocessor count, so the grid is chosen by `_moe_megakernel_grid` from
++# compute capability and memory (see its docstring for the measured sweep).
 +#
 +# Phase 0 recomputes the residual add and RMSNorm redundantly in every block.
 +# That is 2048 elements against an otherwise idle GPU, and doing it everywhere
-+# removes the need for a fourth barrier.
++# removes the need for an extra barrier before the router.
++#
++# Phase E is the tail: it folds the *next* layer's residual add + RMSNorm into
++# this dispatch, so the Python loop never issues the standalone fuse between
++# one layer's MoE and the next layer's attention.  Decode is host-bound, and
++# that fuse costs ~13 us of host time per MoE layer per step; the tail replaces
++# it with one extra barrier and 2048 elements of work on an idle GPU.  Its
++# arithmetic mirrors _EXACT_ADD_RMS_SOURCE line for line, so the tail adds no
++# inexactness of its own -- the lane's ~1 ULP story is confined to the MoE
++# math, exactly as before.
 +#
 +# The single scratch buffer is deliberate: each additional kernel output costs
 +# ~5-7 us of host time (measured), which is the same order as a whole extra
-+# dispatch, so barrier counters, logits, indices, weights and activations all
-+# live at offsets in one array.
++# dispatch, so barrier counters, logits, indices, weights, activations and the
++# staged MoE output all live at offsets in one array.  The three outputs are
++# `out` (the next layer's normed attention input), `hout` (the new residual
++# carrier h+attn+moe) and the scratch itself.
 +_MOE_MEGAKERNEL_SOURCE = r"""
 +    constexpr int WARP = 32;
 +    constexpr int WARPS = THREADS_ / WARP;
@@ -1753,11 +1761,13 @@ index a0673f7..d1a103a 100644
 +    constexpr int OFF_SCO = 24;
 +    constexpr int OFF_LOG = 64;
 +    constexpr int OFF_ACT = 512;
++    constexpr int OFF_STG = OFF_ACT + NEXP_ * KD_;
 +    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
 +    float* idxf = scratch + OFF_IDX;
 +    float* scoref = scratch + OFF_SCO;
 +    float* logits = scratch + OFF_LOG;
 +    float* actf = scratch + OFF_ACT;
++    float* stagef = scratch + OFF_STG;
 +
 +    __shared__ float xs_lin[KH_];
 +    __shared__ float xs_t[KH_];
@@ -1770,9 +1780,11 @@ index a0673f7..d1a103a 100644
 +
 +    // ---- phase 0: residual add + RMSNorm, recomputed in every block --------
 +    // The normalized vector is consumed only inside this kernel, so it never
-+    // has to be materialized; only the residual stream leaves.  Thread t owns
-+    // x[4t..4t+3] and the reduction is a descending __shfl_down tree, which is
-+    // what mx.fast.rms_norm does for a 2048-wide row.
++    // has to be materialized; nothing leaves this phase (the residual stream
++    // is re-derived in phase E, where the MoE output can be folded in at the
++    // same time).  Thread t owns x[4t..4t+3] and the reduction is a descending
++    // __shfl_down tree, which is what mx.fast.rms_norm does for a 2048-wide
++    // row.
 +    {
 +        constexpr int VEC = KH_ / THREADS_;
 +        const int base = tid * VEC;
@@ -1782,7 +1794,6 @@ index a0673f7..d1a103a 100644
 +        for (int i = 0; i < VEC; ++i) {
 +            const T_ rounded = static_cast<T_>(
 +                static_cast<float>(hin[base + i]) + static_cast<float>(rin[base + i]));
-+            if (blk == 0) hout[base + i] = rounded;
 +            hb[i] = static_cast<float>(rounded);
 +            ss += hb[i] * hb[i];
 +        }
@@ -2071,7 +2082,64 @@ index a0673f7..d1a103a 100644
 +                total = fmaf(static_cast<float>(static_cast<T_>(acc)),
 +                             scoref[e], total);
 +            }
-+            if (slane == 0) out[row] = static_cast<T_>(total);
++            // Staged as the bf16-rounded value: phase E must see exactly what
++            // the standalone MoE output array used to hold.
++            if (slane == 0)
++                stagef[row] = static_cast<float>(static_cast<T_>(total));
++        }
++    }
++
++    // ---- barrier 4 ---------------------------------------------------------
++    // Every block must arrive (a waiter spins on the release flag), but only
++    // block 0 has work left.
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[6], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[7], 1u);
++        else while (atomicAdd(&ctr[7], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++    if (blk != 0) return;
++
++    // ---- phase E: next layer's residual add + RMSNorm ----------------------
++    // Mirrors _EXACT_ADD_RMS_SOURCE exactly: one bf16 rounding per add, the
++    // norm sees the rounded stream, descending __shfl_down tree, warp-leader
++    // array, T_(x * scale * float(w)).  `hout` becomes the residual carrier
++    // h + attn + moe; `out` becomes the next attention input, already normed
++    // with the next layer's weight.
++    {
++        constexpr int VEC = KH_ / THREADS_;
++        const int base = tid * VEC;
++        float sb[VEC];
++        float ss = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const int idx = base + i;
++            const T_ s = static_cast<T_>(
++                static_cast<float>(hin[idx]) + static_cast<float>(rin[idx]));
++            const T_ s2 = static_cast<T_>(
++                static_cast<float>(s) + stagef[idx]);
++            hout[idx] = s2;
++            sb[i] = static_cast<float>(s2);
++            ss += sb[i] * sb[i];
++        }
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
++        if (lane == 0) red[warp] = ss;
++        __syncthreads();
++        float tot = (lane < WARPS) ? red[lane] : 0.0f;
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
++        if (tid == 0) gsum_s = tot;
++        __syncthreads();
++        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const int idx = base + i;
++            out[idx] = static_cast<T_>(
++                sb[i] * nscale * static_cast<float>(nw2[idx]));
 +        }
 +    }
 +"""
@@ -2087,7 +2155,7 @@ index a0673f7..d1a103a 100644
 +        kernel = _moe_megakernel_cache[eps] = mx.fast.cuda_kernel(
 +            name="maple_moe_megakernel",
 +            input_names=["hin", "rin", "nw", "rw", "ugw", "ugs", "ugb",
-+                         "dnw", "dns", "dnb"],
++                         "dnw", "dns", "dnb", "nw2"],
 +            output_names=["out", "hout", "scratch"],
 +            source=_MOE_MEGAKERNEL_SOURCE.replace("EPS_", f"{eps:.10e}f"),
 +        )
@@ -2173,6 +2241,7 @@ index a0673f7..d1a103a 100644
 +        and block.gate.top_k == 8
 +        and ug.output_dims == 2 * nout
 +        and kh % threads == 0
++        and nd == kh  # phase E folds the MoE output back into the residual
 +        and _moe_megakernel_lpr(kd) is not None
 +    ):
 +        return False
@@ -2190,15 +2259,21 @@ index a0673f7..d1a103a 100644
 +            "grid": (grid * threads, 1, 1),
 +            "threadgroup": (threads, 1, 1),
 +            "output_shapes": [(1, 1, nd), (1, 1, kh),
-+                              (512 + block.gate.top_k * nout,)],
++                              (512 + block.gate.top_k * nout + nd,)],
 +            "output_dtypes": [dtype, dtype, mx.float32],
 +            "init_value": 0,
 +        },
 +    )
 +
 +
-+def _moe_megakernel_call(layer, h, r, ln):
-+    """Returns (moe_output, new_residual) or None when unsupported."""
++def _moe_megakernel_call(layer, h, r, ln, next_w):
++    """Returns (new_residual_carrier, next_attention_input) or None.
++
++    The carrier is h + attn + moe rounded once per add, exactly as the chain
++    of exact fuses produced it; the second array is that carrier already
++    normed with the *next* layer's input weight (or the final norm), so the
++    caller skips the standalone fuse dispatch entirely.
++    """
 +    block = layer.mlp
 +    plan = getattr(block, "_megakernel_plan", None)
 +    if plan is None:
@@ -2213,53 +2288,99 @@ index a0673f7..d1a103a 100644
 +    mlp = block.switch_mlp
 +    ug, dp = mlp.up_gate_proj, mlp.down_proj
 +    try:
-+        out, hout, _ = kernel(
++        hn, hout, _ = kernel(
 +            inputs=[h, r, ln.weight, block.gate.weight, ug.weight, ug.scales,
-+                    ug.biases, dp.weight, dp.scales, dp.biases],
++                    ug.biases, dp.weight, dp.scales, dp.biases, next_w],
 +            **kwargs,
 +        )
 +    except (RuntimeError, TypeError, ValueError):
 +        block._megakernel_plan = False
 +        return None
-+    return out, hout
++    return hout, hn
 +
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,9 +2668,10 @@ class MapleModel(nn.Module):
+@@ -792,29 +2743,71 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
 +        self._exact_add_norm = None  # None = unprobed, then True/False
          self._zero = None
++        self._mega_next = None  # None = unbuilt, False = eps mismatch, or list
++
++    def _megakernel_next_norms(self):
++        """Per-layer (next input norm weight | final norm weight) for the tail.
  
 -    def _decode_fused(self, h, cache, full_mask, swa_mask):
++        The megakernel's phase E norms with the *next* layer's weight, and the
++        kernel bakes a single eps, so a model whose norms disagree on eps must
++        not take the megakernel at all.  Built once; weights are fixed.
++        """
++        nxt = self._mega_next
++        if nxt is None:
++            eps = self.norm.eps
++            if all(
++                layer.input_layernorm.eps == eps
++                and layer.post_attention_layernorm.eps == eps
++                for layer in self.layers
++            ):
++                nxt = [layer.input_layernorm.weight for layer in self.layers[1:]]
++                nxt.append(self.norm.weight)
++            else:
++                nxt = False
++            self._mega_next = nxt
++        return nxt if nxt is not False else None
++
 +    def _decode_fused(self, h, cache, full_mask, swa_mask, fuse):
          """Decode loop with residual adds folded into the norms.
  
          Carries (h, r) instead of adding r back each step, so every
-@@ -809,12 +2686,17 @@ class MapleModel(nn.Module):
-         for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+         add+norm pair is one dispatch. Identical arithmetic: the kernel
+         rounds the sum once (as the bf16 add did) and norms the rounded
+         stream with an fp32 weight multiply.
++
++        When a layer takes the megakernel, its tail has already produced the
++        next attention input (`hn`), so the loop skips the standalone fuse for
++        that boundary; after the last layer the tail has already applied the
++        final norm.
+         """
+         if self._zero is None:
+             self._zero = mx.zeros(h.shape, h.dtype)
+             mx.eval(self._zero)
+         r = self._zero  # x + 0 is exact in bf16
+-        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
++        hn = None
++        mega_next = self._megakernel_next_norms() if _use_moe_megakernel else None
++        for i, (layer, c, layer_type) in enumerate(
++            zip(self.layers, cache, self.layer_types)
++        ):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-             ln = layer.input_layernorm
+-            ln = layer.input_layernorm
 -            h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
-+            h, hn = fuse(h, r, ln.weight, ln.eps)
++            if hn is None:
++                ln = layer.input_layernorm
++                h, hn = fuse(h, r, ln.weight, ln.eps)
              r = layer.self_attn(hn, mask, c)
++            hn = None
              ln = layer.post_attention_layernorm
 -            h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
-+            if _use_moe_megakernel:
-+                fused = _moe_megakernel_call(layer, h, r, ln)
-+                if fused is not None:
-+                    r, h = fused
-+                    continue
-+            h, hn = fuse(h, r, ln.weight, ln.eps)
-             r = layer.mlp(hn)
+-            r = layer.mlp(hn)
 -        return _add_rms_norm(h, r, self.norm.weight, self.norm.eps)[1]
++            if mega_next is not None:
++                fused = _moe_megakernel_call(layer, h, r, ln, mega_next[i])
++                if fused is not None:
++                    h, hn = fused
++                    continue
++            h, hn2 = fuse(h, r, ln.weight, ln.eps)
++            r = layer.mlp(hn2)
++        if hn is not None:
++            return hn
 +        return fuse(h, r, self.norm.weight, self.norm.eps)[1]
  
      def __call__(
          self,
-@@ -836,12 +2718,29 @@ class MapleModel(nn.Module):
+@@ -836,12 +2829,29 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
@@ -2291,7 +2412,7 @@ index a0673f7..d1a103a 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -1021,6 +2920,32 @@ class Model(nn.Module):
+@@ -1021,6 +3031,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -2324,7 +2445,7 @@ index a0673f7..d1a103a 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +2964,8 @@ class Model(nn.Module):
+@@ -1039,8 +3075,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
@@ -2515,7 +2636,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/tests/test_maple_kernels.py b/tests/test_maple_kernels.py
-index 6e232ba..c3fbc56 100644
+index 6e232ba..36ae27b 100644
 --- a/tests/test_maple_kernels.py
 +++ b/tests/test_maple_kernels.py
 @@ -9,7 +9,14 @@ is off on this machine", not "the model is broken". A precision failure does
@@ -3074,7 +3195,7 @@ index 6e232ba..c3fbc56 100644
          slow = decode(False)
          self.assertEqual(int(fast.argmax()), int(slow.argmax()), "argmax differs")
          self.assertTrue(
-@@ -270,5 +680,126 @@ class TestMapleKernels(unittest.TestCase):
+@@ -270,5 +680,190 @@ class TestMapleKernels(unittest.TestCase):
          self.assertTrue(mx.array_equal(grouped[f"{prefix}.scales"], scales))
  
  
@@ -3197,6 +3318,70 @@ index 6e232ba..c3fbc56 100644
 +        ln = layer.post_attention_layernorm
 +        plan = maple._moe_megakernel_plan(layer.mlp, ln, mx.bfloat16)
 +        self.assertFalse(plan, "unquantized experts must not build a plan")
++
++    def test_megakernel_tail_norm_is_exactly_the_fuse(self):
++        """Phase E must be bit-identical to the standalone exact fuse.
++
++        The megakernel now emits the next layer's attention input itself.  The
++        lane's inexactness budget lives in the MoE math alone, so the tail's
++        add+norm of its own carrier has to reproduce `_exact_add_rms_norm` to
++        the last bit -- otherwise the fusion quietly widened the error story.
++        """
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        import mlx.nn as nn
++
++        mx.random.seed(7)
++        args = _args()
++        model = maple.Model(args)
++        moe = None
++        for layer in model.model.layers:
++            if getattr(layer.mlp, "switch_mlp", None) is not None:
++                moe = layer
++                break
++        self.assertIsNotNone(moe, "fixture has no MoE layer")
++        moe.mlp.gate.weight = (
++            mx.random.normal((args.num_experts, args.hidden_size)) * 0.05
++        )
++        model.set_dtype(mx.bfloat16)
++        nn.quantize(moe.mlp.switch_mlp, group_size=128, bits=2)
++        mx.eval(model.parameters())
++
++        h = mx.random.normal((1, 1, args.hidden_size)).astype(mx.bfloat16)
++        r = mx.random.normal((1, 1, args.hidden_size)).astype(mx.bfloat16)
++        next_w = model.model.norm.weight
++        ln = moe.post_attention_layernorm
++        mx.eval(h, r)
++
++        fused = maple._moe_megakernel_call(moe, h, r, ln, next_w)
++        if fused is None:
++            self.skipTest("megakernel plan rejected the quantized fixture")
++        hout, hn = fused
++        mx.eval(hout, hn)
++
++        # The tail normed its own carrier; the fuse over (carrier, 0) must
++        # agree exactly, because adding bf16 zero is exact.
++        zero = mx.zeros_like(hout)
++        ref_h, ref_hn = maple._exact_add_rms_norm(hout, zero, next_w, ln.eps)
++        mx.eval(ref_h, ref_hn)
++        self.assertTrue(
++            mx.array_equal(ref_h, hout).item(), "carrier changed under a zero add"
++        )
++        self.assertTrue(
++            mx.array_equal(ref_hn, hn).item(),
++            "tail norm is not bit-identical to the exact fuse",
++        )
++
++        # And the carrier itself must be the residual chain, loosely: the MoE
++        # values differ from stock by design, but a staging bug would miss by
++        # far more than 1 ULP of bf16.
++        s = (h.astype(mx.float32) + r.astype(mx.float32)).astype(mx.bfloat16)
++        x = mx.fast.rms_norm(s, ln.weight, ln.eps)
++        s2 = s.astype(mx.float32) + moe.mlp(x).astype(mx.float32)
++        close = mx.allclose(
++            hout.astype(mx.float32), s2, rtol=5e-2, atol=5e-2
++        ).item()
++        self.assertTrue(close, "carrier is not the residual chain")
 +
 +
  if __name__ == "__main__":

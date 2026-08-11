@@ -156,9 +156,15 @@ out is a quality *regression*.
 ### What is on by default
 
 - **The MoE megakernel** — router, experts, activation, score-weighted
-  aggregation and the preceding add/RMSNorm in **one dispatch**, with three
-  atomic-counter grid barriers. Worth 73-88%, and the reason the default
-  throughput is what it is.
+  aggregation, the preceding add/RMSNorm **and the next layer's add/RMSNorm**
+  in **one dispatch**, with four atomic-counter grid barriers. Worth 73-88%,
+  and the reason the default throughput is what it is.
+
+  The tail phase is what removes the last standalone dispatch between layers:
+  the decode loop now issues one fuse per step instead of one per layer
+  (measured: 1 against 25 on the shipped checkpoint). The tail reproduces the
+  exact fuse bit for bit — a CUDA test asserts it — so it adds nothing to the
+  lane's error story.
 
   It is within ~1 ULP of bf16 rather than array-exact: `qmm_naive` gets its
   accuracy from a tensor-core MMA, which a software fp32 reduction cannot

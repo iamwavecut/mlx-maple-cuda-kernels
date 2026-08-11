@@ -32,9 +32,12 @@ throughput moved by roughly nothing.
 The corollary is more useful: because the GPU has milliseconds of slack per
 step, it is worth *spending* GPU time to buy back host operations. The MoE
 megakernel recomputes the residual add and RMSNorm redundantly in every block
-purely to avoid needing a fourth grid barrier, and that trade is free — free
-enough that raising the grid from 32 to 96 blocks, which triples the redundant
-work, is worth up to 18% because it finishes the expert pass sooner.
+purely to avoid needing an extra grid barrier before the router, and that
+trade is free — free enough that raising the grid from 32 to 96 blocks, which
+triples the redundant work, is worth up to 18% because it finishes the expert
+pass sooner. The same logic later paid for a genuine fourth barrier: the tail
+phase runs the *next* layer's add+RMSNorm on one block behind it, which costs
+GPU microseconds nobody was using and removes a whole host dispatch per layer.
 
 ## The cost model
 
@@ -79,7 +82,7 @@ what recovered the win.
 
 With the release fusions active, Python graph construction is the larger half
 of the step. Exclusive Python time per decode step, measured by instrumenting
-the sub-blocks:
+the sub-blocks (strict lane, before the megakernel became the default):
 
 | Block | us/step | share |
 | --- | ---: | ---: |
@@ -88,6 +91,21 @@ the sub-blocks:
 | add + RMSNorm | 299.0 | 13.9% |
 | router | 146.4 | 6.8% |
 | rest | 130.2 | 6.0% |
+
+With the megakernel on and its tail phase folding the inter-layer add+RMSNorm
+(`benchmarks/maple_fast_lane_profile.py`), the same host's step keeps:
+
+| Block | us/step |
+| --- | ---: |
+| attention, excluding cache updates | 681.1 |
+| megakernel dispatches (24) | 410.0 |
+| KV-cache updates (48 scatter assignments) | 333.7 |
+| fuse (1 per step, was 25) | 20.0 |
+
+Attention and its cache writes are now two thirds of the remaining host
+budget, which is what the next round of work has to attack. The KV row is
+pure `self.keys[..., i:i+1, :] = k` bookkeeping — two scatter assignments per
+layer per step at ~7 us each.
 
 Attention is the obvious next target, and it resists. Fusing SDPA with the
 output projection *regressed*: `RotatingKVCache` returns non-contiguous views,
