@@ -11,6 +11,100 @@ off by default.
 > exact GPUs, drivers, MLX 0.32.0, CUDA 12.9, checkpoint revision, and source
 > hashes recorded below.
 
+## Decode on CUDA is host-bound
+
+The measurement that reframed this work: with a warm cache and MLX's
+double-buffered `async_eval`, the **GPU wait per decode step is ~0.003 ms**.
+The GPU finishes before Python has finished building the next step, on every
+host tested. Wall clock is the sum of per-operation host costs, so the currency
+of optimization is operation count, not arithmetic.
+
+| Host | graph build | submission | GPU wait | step |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 3090, EPYC 7452 | 2.40 ms | 3.96 ms | **0.0025 ms** | 6.36 ms |
+| RTX 3090, AI Farm | 2.02 ms | 2.76 ms | **0.0028 ms** | 4.78 ms |
+
+Two consequences shaped the release. Kernels that make the GPU faster without
+removing operations do nothing: a hand-written 2-bit expert GEMV measured
+1.88x-1.98x against stock in isolation and moved end-to-end throughput by
+roughly nothing. And it is worth spending GPU time to buy back host operations,
+which is what the megakernel does.
+
+Related measurements, all on RTX 3090:
+
+- Streaming-read bandwidth reaches 743 GB/s; the stock expert projections run
+  at 203 GB/s, and the exact 4-bit lm_head at 589 GB/s.
+- A forward pass costs 5.08 ms at one token and 26.35 ms at 32, so a marginal
+  token costs 0.686 ms — a 7.4x leverage that makes speculative decoding
+  break even at ~2.4 accepted tokens per pass.
+- Aggregate throughput peaks near batch 4 (523 tok/s against 256 at batch 1);
+  past that the MoE weight traffic dominates.
+- `stream_generate`'s detokenizer and response objects cost 0.23 ms per token,
+  7.6% at this speed.
+
+Full write-up: [`docs/host-bound-decode.md`](docs/host-bound-decode.md).
+
+## Fusion release (RTX 3090, `sm86`)
+
+Eight fresh processes per mode, interleaved order, warm `B=1`, `L=1` BF16
+decode, 128-token prompt / 512-token generation. `off` disables every new
+fusion and reproduces the previous release path.
+
+| Mode | Median tok/s | Paired gain (95% CI) | Wins | Token stream |
+| --- | ---: | ---: | ---: | --- |
+| off | 152.29 | — | — | — |
+| **strict** (default) | **164.94** | **+6.68%** (+4.33%–+9.09%) | 8/8 | identical, 8/8 prompts |
+| **megakernel** (opt-in) | **272.80** | **+79.51%** (+76.18%–+82.91%) | 8/8 | within ~1 ULP, 1/8 prompts |
+
+At 2048 generated tokens the same ordering holds and neither mode grows peak
+memory: 154.75 / 163.51 / 274.72 tok/s at 6.478 GB.
+
+### What is on by default
+
+- `_use_fused_add_rms` — residual add + RMSNorm in one dispatch. The shipped
+  kernel before this release used the elementwise thread count and two chunks
+  per thread; `mx.fast.rms_norm` uses 512 threads with four contiguous
+  elements each. Reproducing that partition is what makes the fusion
+  array-exact, and it is why the path could be promoted out of the
+  experimental lane.
+- `_use_fused_qkv` — the Q/K norm + RoPE kernel widened to consume the fused
+  qkv projection and emit queries, keys and values in their final shapes,
+  removing the slice-and-reshape chain around it. Bit-identical by
+  construction: the per-head arithmetic is unchanged.
+
+Component medians on the same host: add+RMSNorm +3.3%, QKV split +2.2%,
+together +7.0%.
+
+### What is opt-in
+
+- `_use_moe_megakernel` — router, experts, activation, score-weighted
+  aggregation and the preceding add/RMSNorm in **one dispatch**, with three
+  atomic-counter grid barriers. It is within ~1 ULP of bf16 rather than
+  array-exact: `qmm_naive` gets its accuracy from a tensor-core MMA, which a
+  software fp32 reduction cannot reproduce. Teacher-forced NLL through the
+  decode path moves by 0.5-0.8% **in both directions** (better on code, worse
+  on prose), which is unbiased rounding noise rather than degradation.
+- `_use_compiled_router` — the stock router chain under `mx.compile`.
+  Array-exact, and in isolation it cuts the router's host cost from 96.5 us to
+  77.9 us per layer, but paired over ten fresh processes the end-to-end effect
+  was 1.0062x with a 95% interval of 0.9927-1.0198 and 6/10 wins. Exact but
+  not distinguishable from zero, so it ships off.
+
+### Exactness protocol
+
+The stock path is **not always reproducible run to run**: on some hosts six
+identical runs produced two different token streams, always diverging at the
+same position, with or without CUDA graphs. Forty-repeat probes of the prefill
+forward, a single decode step, the router, the MoE block, attention and
+RMSNorm found zero differences, so it is not a race inside any one operation
+and the source is not localized.
+
+Every equivalence verdict here therefore screens first: each prompt is
+generated three times with the fusions off, and a candidate counts as
+divergent only inside the region where those three runs agree. Under that
+protocol the reference was stable on all eight prompts, `strict` matched on
+8/8 and the megakernel on 1/8.
+
 ## Strict multi-architecture result
 
 All five fresh NVIDIA targets passed the deterministic strict methodology under
@@ -88,9 +182,13 @@ performance gates; H100 retained its stock tile.
 | Path | Default | Strict status |
 | --- | --- | --- |
 | Q/K norm + partial RoPE/NoPE | auto-probed | array-exact on the listed SKUs/toolchains |
+| Fused QKV split (`_use_fused_qkv`) | **on** | array-exact by construction; probed live |
+| Residual add + RMSNorm (`_use_fused_add_rms`) | **on** | array-exact once the thread mapping matches `mx.fast.rms_norm` |
+| MoE megakernel (`_use_moe_megakernel`) | off | within ~1 ULP of bf16; not array-exact |
+| Compiled router (`_use_compiled_router`) | off | array-exact; end-to-end effect not distinguishable from zero |
 | Cached flat decode LHS | off | exact in campaign; lifecycle-limited opt-in |
 | Router GEMV/softmax/top-8 | off | normalized scores not array-exact |
-| Residual add + RMSNorm | off | changed deterministic long decode |
+| Residual add + RMSNorm, original kernel | off | thread mapping differs from `mx.fast.rms_norm` |
 | Ternary up/gate GEMV | off | projection values not array-exact |
 | FlashHead / KV quantization | off | approximate; excluded |
 
@@ -166,6 +264,21 @@ This is deliberately narrower than claiming whole-module equivalence.
 - Five `tests/test_generate.py` failures remain baseline-compatible on the
   tested checkout and are not claimed as fixed.
 - Approximate router/add-RMS/ternary paths remain research-only.
+- The fusion release is measured on `sm86` only. Attempts to validate `sm89`
+  on community cloud failed: RTX 4090 capacity was unavailable and the L40S
+  offered carried driver 550.163.01, on which MLX CUDA 0.32.0 cannot start at
+  all (`cudaMallocManaged failed: unknown error`). **MLX CUDA 0.32.0 needs a
+  driver newer than 550.163**; the working hosts here ran 580.
+- The megakernel's grid barrier assumes every block is resident. MLX does not
+  expose the multiprocessor count, so the grid is fixed at 32 blocks, which
+  every CUDA GPU of this era holds at once. Throughput is flat from 32 to 160
+  blocks on RTX 3090 and only falls off past 192, so the conservative choice
+  costs nothing; raising it on a smaller device would risk a deadlock.
+- Community-cloud hosts share the CPU even when the GPU is dedicated, and this
+  workload is host-bound. One host with an idle GPU and a load average of 4-9
+  returned between 104.7 and 325.8 tok/s for the same configuration. Check
+  `/proc/loadavg` before trusting a measurement and report medians over many
+  fresh processes.
 - The accepted RTX 5090 W2 tile requires the separately built experimental MLX
   backend and is not enabled by this patch alone.
 

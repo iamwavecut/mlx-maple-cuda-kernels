@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.0 — 2026-08-11
+
+- Established that Maple decode on CUDA is host-bound: with a warm cache the
+  GPU wait per step is ~0.003 ms on every host measured, so wall clock is the
+  sum of per-operation host costs and the lever is operation count.
+- Promoted the fused residual add + RMSNorm to a strict default. The kernel now
+  reproduces `mx.fast.rms_norm`'s thread mapping (512 threads, four contiguous
+  elements each) instead of the elementwise thread count with two chunks; that
+  partition was the whole reason the path was array-inexact and demoted.
+- Added a strict-default fused QKV split: the Q/K norm + RoPE kernel widened to
+  consume the fused qkv projection and emit queries, keys and values in their
+  final shapes, removing the slice-and-reshape chain. Bit-identical by
+  construction.
+- Added an opt-in MoE megakernel that runs the router, experts, activation,
+  score-weighted aggregation and the preceding add/RMSNorm in one dispatch,
+  using atomic-counter grid barriers with a co-residency-safe 32-block grid.
+- Added an opt-in compiled router: the stock chain under `mx.compile`,
+  array-exact, but its end-to-end effect measured 1.0062x with a 95% interval
+  of 0.9927-1.0198, so it ships off.
+- RTX 3090 fusion release, eight fresh processes per mode: strict +6.68%
+  (+4.33%-+9.09%, 8/8 wins) with an identical token stream on 8/8 screened
+  prompts; megakernel +79.51% (+76.18%-+82.91%, 8/8 wins) within ~1 ULP.
+- Adopted a screened equivalence protocol after finding that the stock path is
+  not always reproducible run to run. Verdicts are now taken only inside the
+  region where three reference runs agree.
+- Strengthened the add/RMSNorm probe to inject outliers: on Gaussian vectors a
+  wrong reduction passes 300/300 trials, and only a realistic dynamic range
+  separates the candidates.
+
 ## 0.3.1 — 2026-08-07
 
 - Re-ran RTX 3090 (`sm86`) with the current release source and the same

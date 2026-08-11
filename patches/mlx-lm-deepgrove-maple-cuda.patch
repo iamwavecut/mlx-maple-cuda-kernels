@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..61c765f 100644
+index a0673f7..db1340d 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,6 @@
@@ -9,7 +9,7 @@ index a0673f7..61c765f 100644
  from dataclasses import dataclass
  from functools import partial
  from typing import Any, List, Optional
-@@ -17,32 +18,151 @@ from mlx_lm.models.base import (
+@@ -17,32 +18,176 @@ from mlx_lm.models.base import (
  )
  from mlx_lm.models.cache import KVCache, RotatingKVCache
  from mlx_lm.models.rope_utils import initialize_rope
@@ -35,11 +35,36 @@ index a0673f7..61c765f 100644
 +_cuda_capability_cache = _UNSET
 +_cuda_profile_cache = _UNSET
 +
-+# The fused router is numerically close but not array-exact: its normalized
-+# scores can eventually change a greedy token.  It is therefore an explicit
-+# semantic/experimental lane, never part of strict auto mode.
++# The hand-written fused router is numerically close but not array-exact: its
++# normalized scores can eventually change a greedy token.  It is therefore an
++# explicit semantic/experimental lane, never part of strict auto mode.  Same
++# for the original fused add/RMSNorm carrier, whose thread mapping did not
++# match mx.fast.rms_norm; the corrected kernel below replaces it.
 +_use_approximate_router = False
 +_use_approximate_add_rms = False
++
++# Strict-lane fusions.  Each is array-exact against the stock chain and is on
++# by default; each falls back the moment its live probe fails.
++#
++# Decode on CUDA is host-bound: with a warm cache the GPU wait per step
++# measures ~0.003 ms, so wall clock is the sum of per-operation host costs and
++# the currency of optimization is operation count, not arithmetic.  These three
++# fusions exist to remove operations, not to make the GPU work less.
++_use_fused_add_rms = True      # residual add + RMSNorm in one dispatch
++_use_fused_qkv = True          # qkv split + Q/K norm + RoPE in one dispatch
++
++# The stock router chain under mx.compile.  Array-exact, and in isolation it
++# cuts the router's host cost from 96.5 us to 77.9 us per layer -- but paired
++# over ten fresh processes the end-to-end effect was 1.0062x with a 95%
++# interval of 0.9927-1.0198 and 6/10 wins, so it is not distinguishable from
++# zero on the measured host.  Exact but unproven stays opt-in.
++_use_compiled_router = False
++
++# Opt-in fast lane: the whole MoE block (router, experts, activation,
++# score-weighted aggregation and the preceding add/RMSNorm) in one dispatch.
++# It is within ~1 ULP of bf16 rather than array-exact, because a software fp32
++# reduction cannot reproduce what qmm_naive gets from a tensor-core MMA.
++_use_moe_megakernel = False
 +
 +
 +def _kernel_backend():
@@ -174,7 +199,7 @@ index a0673f7..61c765f 100644
      """
      try:
          got, want = fast(), reference()
-@@ -51,9 +171,8 @@ def _matches(fast, reference, tol=2e-2):
+@@ -51,9 +196,8 @@ def _matches(fast, reference, tol=2e-2):
          return False
      return len(got) == len(want) and all(
          g.shape == w.shape
@@ -186,7 +211,7 @@ index a0673f7..61c765f 100644
          for g, w in zip(got, want)
      )
  
-@@ -123,24 +242,129 @@ def _make_add_rms_norm_kernel(eps):
+@@ -123,24 +267,129 @@ def _make_add_rms_norm_kernel(eps):
      )
  
  
@@ -323,7 +348,137 @@ index a0673f7..61c765f 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -226,7 +450,7 @@ def _make_qk_norm_rope_kernel():
+@@ -154,6 +403,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
+     )
+ 
+ 
++# Residual add + RMSNorm in one dispatch, array-exact against the stock chain.
++#
++# MLX picks `rms_norm_small<float, 512, 32, 4>` for a 2048-wide row: 512
++# threads, thread t owning exactly x[4t .. 4t+3], reduced by a descending
++# __shfl_down tree inside the warp and then across the 16 warp results.  The
++# earlier fused kernel used the elementwise thread count (256 on sm86) and two
++# chunks per thread, so a thread summed 4t..4t+3 together with 4(t+256)..  --
++# a different partition of the same 2048 squares, and therefore a different
++# rounding.  Reproducing the partition is what makes this exact; the reduction
++# tree was already right.
++_EXACT_ADD_RMS_SOURCE = r"""
++    constexpr int VEC = 4;
++    constexpr int WARPS = THREADS_ / 32;
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int base = tid * VEC;
++
++    float hb[VEC];
++    float ss = 0.0f;
++    #pragma unroll
++    for (int i = 0; i < VEC; ++i) {
++        const T_ rounded = static_cast<T_>(
++            static_cast<float>(x[base + i]) + static_cast<float>(r[base + i]));
++        h_out[base + i] = rounded;      // one rounding, exactly like a bf16 add
++        hb[i] = static_cast<float>(rounded);
++        ss += hb[i] * hb[i];            // the norm sees the rounded stream
++    }
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
++
++    __shared__ float temp[WARPS];
++    if (lane == 0) temp[warp] = ss;
++    __syncthreads();
++    float tot = (lane < WARPS) ? temp[lane] : 0.0f;
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
++    __shared__ float total_s;
++    if (tid == 0) total_s = tot;
++    __syncthreads();
++
++    const float scale = rsqrtf(total_s / static_cast<float>(DIM_) + EPS_);
++    #pragma unroll
++    for (int i = 0; i < VEC; ++i) {
++        hn_out[base + i] = static_cast<T_>(
++            hb[i] * scale * static_cast<float>(w[base + i]));
++    }
++"""
++
++_exact_add_rms_kernels = {}
++_exact_add_rms_plans = {}
++
++
++def _exact_add_rms_kernel(eps):
++    kernel = _exact_add_rms_kernels.get(eps)
++    if kernel is None:
++        tag = f"{eps:.3e}".replace(".", "_").replace("-", "m").replace("+", "p")
++        kernel = _exact_add_rms_kernels[eps] = mx.fast.cuda_kernel(
++            name=f"maple_exact_add_rms_{tag}",
++            input_names=["x", "r", "w"],
++            output_names=["h_out", "hn_out"],
++            source=_EXACT_ADD_RMS_SOURCE.replace("EPS_", f"{eps:.10e}f"),
++        )
++    return kernel
++
++
++def _exact_add_rms_supported(dim):
++    if _kernel_backend() != "cuda" or _cuda_profile() is None:
++        return False
++    threads = dim // 4
++    return dim % 4 == 0 and threads % 32 == 0 and 32 <= threads <= 1024
++
++
++def _exact_add_rms_norm(h, r, w, eps):
++    """(h + r, rmsnorm(h + r) * w) in a single dispatch."""
++    dim = h.shape[-1]
++    key = (dim, h.dtype, w.dtype, eps, h.shape)
++    plan = _exact_add_rms_plans.get(key)
++    if plan is None:
++        threads = dim // 4
++        plan = _exact_add_rms_plans[key] = (
++            _exact_add_rms_kernel(eps),
++            {
++                "template": [
++                    ("T_", h.dtype), ("W_", w.dtype), ("DIM_", dim),
++                    ("THREADS_", threads),
++                ],
++                "grid": (threads, 1, 1),
++                "threadgroup": (threads, 1, 1),
++                "output_shapes": [h.shape, h.shape],
++                "output_dtypes": [h.dtype, h.dtype],
++            },
++        )
++    kernel, kwargs = plan
++    return kernel(inputs=[h, r, w], **kwargs)
++
++
++def _exact_add_rms_ok(dim, dtype, w, eps):
++    """Probe on a wide-dynamic-range vector, not on Gaussian noise.
++
++    Measured: on N(0, 1) test vectors a butterfly reduction and a __shfl_down
++    reduction agree on 300/300 trials, so a Gaussian probe cannot tell a wrong
++    reduction from a right one.  It takes the outliers of a real residual
++    stream to separate them, so the probe injects them.
++    """
++    if not _exact_add_rms_supported(dim):
++        return False
++    x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
++    r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
++    spikes = mx.random.normal((1, 1, dim), key=mx.random.key(2))
++    x = (x + mx.where(spikes > 2.5, spikes * 24.0, 0.0)).astype(dtype)
++    r = (r + mx.where(spikes < -2.5, spikes * 24.0, 0.0)).astype(dtype)
++    return _matches(
++        lambda: _exact_add_rms_norm(x, r, w, eps),
++        lambda: (
++            x + r,
++            mx.fast.rms_norm(
++                (x + r).astype(mx.float32), w.astype(mx.float32), eps
++            ).astype(dtype),
++        ),
++    )
++
++
+ # Inlined rather than imported from switch_layers: those helpers are private
+ # (underscore-prefixed), and this file must keep loading against whatever
+ # mlx-lm a user has installed when it ships inside a checkpoint.
+@@ -226,7 +598,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -332,7 +487,7 @@ index a0673f7..61c765f 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +487,117 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +635,244 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -448,10 +603,137 @@ index a0673f7..61c765f 100644
 +    if kernel is None:
 +        kernel = _qk_kernel_cache[key] = make_kernel()
 +    return kernel
++
++
++# The Q/K norm + RoPE kernel, widened so it also splits the fused qkv
++# projection.  The decode path used to slice that projection three ways with a
++# reshape around each piece:
++#
++#     qk      = qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, head_dim)
++#     out     = qk_norm_rope(qk, offset)
++#     queries = out[:n_q].reshape(1, n_q, 1, head_dim)
++#     keys    = out[n_q:].reshape(1, n_kv, 1, head_dim)
++#     values  = qkv.reshape(-1)[qk_size:].reshape(1, n_kv, 1, head_dim)
++#
++# Decode is host-bound, so those slices cost wall clock even though they move
++# almost no data.  This kernel takes the whole qkv vector and emits the three
++# tensors already in their final shapes.  The per-head arithmetic is unchanged
++# -- same reduction, same rope expression, same rounding -- so q and k are
++# bit-identical by construction and v is an exact copy; only the plumbing goes.
++def _make_cuda_qkv_split_kernel(profile, use_rope):
++    if use_rope:
++        second_half = (
++            "__fmaf_rn(value, rope_cos[p], "
++            "__fmul_rn(paired, rope_sin[p]))"
++            if profile.name in ("sm100", "sm120")
++            else "paired * rope_sin[p] + value * rope_cos[p]"
++        )
++        transform = """
++        __shared__ float rope_sin[ROPE_DIM / 2];
++        __shared__ float rope_cos[ROPE_DIM / 2];
++        for (int p = lane; p < ROPE_DIM / 2; p += 32) {
++            float fraction = static_cast<float>(p)
++                / static_cast<float>(ROPE_DIM / 2);
++            float frequency = exp2f(-fraction * pos_eps[2]);
++            float angle = pos_eps[0] * frequency;
++            rope_cos[p] = cosf(angle);
++            rope_sin[p] = sinf(angle);
++        }
++        __syncwarp();
++
++        #pragma unroll
++        for (int i = 0; i < VALUES_PER_LANE; ++i) {
++            int j = lane * VALUES_PER_LANE + i;
++            T_ normalized = static_cast<T_>(
++                static_cast<float>(xh[j]) * scale * static_cast<float>(wh[j]));
++            float value = static_cast<float>(normalized);
++            if (j < ROPE_DIM) {
++                constexpr int HALF = ROPE_DIM / 2;
++                int p = j < HALF ? j : j - HALF;
++                int pair = j < HALF ? j + HALF : j - HALF;
++                T_ paired_normalized = static_cast<T_>(
++                    static_cast<float>(xh[pair]) * scale
++                    * static_cast<float>(wh[pair]));
++                float paired = static_cast<float>(paired_normalized);
++                value = j < HALF
++                    ? value * rope_cos[p] - paired * rope_sin[p]
++                    : MAPLE_SECOND_HALF;
++            }
++            oh[j] = static_cast<T_>(value);
++        }
++        """.replace("MAPLE_SECOND_HALF", second_half)
++    else:
++        transform = """
++        #pragma unroll
++        for (int i = 0; i < VALUES_PER_LANE; ++i) {
++            int j = lane * VALUES_PER_LANE + i;
++            oh[j] = static_cast<T_>(
++                static_cast<float>(xh[j]) * scale * static_cast<float>(wh[j]));
++        }
++        """
++
++    source = (
++        """
++        const int head = blockIdx.y;
++        const int lane = threadIdx.x;
++        constexpr int VALUES_PER_LANE = HEAD_DIM / 32;
++        const T_* xh = x + head * HEAD_DIM;
++
++        if (head >= NQ_ + NKV_) {
++            T_* vh = values_out + (head - NQ_ - NKV_) * HEAD_DIM;
++            #pragma unroll
++            for (int i = 0; i < VALUES_PER_LANE; ++i) {
++                const int j = lane * VALUES_PER_LANE + i;
++                vh[j] = xh[j];
++            }
++            return;
++        }
++
++        const W_* wh = w + head * HEAD_DIM;
++        T_* oh = (head < NQ_) ? (queries_out + head * HEAD_DIM)
++                              : (keys_out + (head - NQ_) * HEAD_DIM);
++
++        float sum_sq = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < VALUES_PER_LANE; ++i) {
++            float value = static_cast<float>(xh[lane * VALUES_PER_LANE + i]);
++            sum_sq += value * value;
++        }
++        #pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
++        }
++        sum_sq = __shfl_sync(0xffffffff, sum_sq, 0);
++        float scale = rsqrtf(sum_sq / static_cast<float>(HEAD_DIM) + pos_eps[1]);
++    """
++        + transform
++    )
++    return mx.fast.cuda_kernel(
++        name=f"maple_qkv_split_{'rope' if use_rope else 'nope'}_{profile.name}",
++        input_names=["x", "w", "inv_freq", "pos_eps"],
++        output_names=["queries_out", "keys_out", "values_out"],
++        source=source,
++    )
++
++
++_qkv_split_cache = {}
++
++
++def _get_qkv_split_kernel(use_rope):
++    profile = _cuda_profile()
++    if _kernel_backend() != "cuda" or profile is None:
++        raise RuntimeError("no fused QKV split kernel for this backend")
++    key = (profile.name, use_rope)
++    kernel = _qkv_split_cache.get(key)
++    if kernel is None:
++        kernel = _qkv_split_cache[key] = _make_cuda_qkv_split_kernel(
++            profile, use_rope
++        )
++    return kernel
  
  
  class MapleAttention(nn.Module):
-@@ -293,13 +627,19 @@ class MapleAttention(nn.Module):
+@@ -293,13 +902,20 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -460,6 +742,7 @@ index a0673f7..61c765f 100644
          self._inv_freq = None
          self._fused_qk = None  # None = unprobed, then True/False
 +        self._fused_qk_backend = None
++        self._split_qkv = None  # None = unprobed, then True/False
  
          # Maple applies RoPE only on sliding-window layers; full-attention
          # layers use no positional encoding (NoPE).
@@ -471,16 +754,63 @@ index a0673f7..61c765f 100644
          if self.use_rope:
              rope_dim = int(self.head_dim * args.partial_rotary_factor)
              self.rope = initialize_rope(
-@@ -312,6 +652,8 @@ class MapleAttention(nn.Module):
+@@ -310,45 +926,61 @@ class MapleAttention(nn.Module):
+                 max_position_embeddings=args.max_position_embeddings,
+             )
  
++    def _ensure_qk_constants(self):
++        """Per-head norm weights and rope frequencies, built once.
++
++        Both the Q/K kernel and the widened QKV kernel need these, so neither
++        may depend on the other having run first.
++        """
++        if self._qk_w is not None:
++            return
++        n_q = self.num_attention_heads
++        n_kv = self.num_key_value_heads
++        self._qk_w = mx.contiguous(
++            mx.concatenate(
++                [
++                    mx.broadcast_to(self.q_norm.weight[None], (n_q, self.head_dim)),
++                    mx.broadcast_to(self.k_norm.weight[None], (n_kv, self.head_dim)),
++                ]
++            )
++        )
++        if self.use_rope:
++            half = self.rope.dims // 2
++            self._inv_freq = self._rope_base ** (
++                -mx.arange(half, dtype=mx.float32) / half
++            )
++        else:
++            self._inv_freq = mx.ones((1,), dtype=mx.float32)
++        mx.eval(self._qk_w, self._inv_freq)
++
      def _qk_fused(self, qk, offset):
          """Both norms and both rope applications in one dispatch."""
+-        if self._qk_w is None:
+-            n_q = self.num_attention_heads
+-            n_kv = self.num_key_value_heads
+-            self._qk_w = mx.contiguous(
+-                mx.concatenate(
+-                    [
+-                        mx.broadcast_to(self.q_norm.weight[None], (n_q, self.head_dim)),
+-                        mx.broadcast_to(
+-                            self.k_norm.weight[None], (n_kv, self.head_dim)
+-                        ),
+-                    ]
+-                )
+-            )
+-            if self.use_rope:
+-                half = self.rope.dims // 2
+-                self._inv_freq = self._rope_base ** (
+-                    -mx.arange(half, dtype=mx.float32) / half
+-                )
+-            else:
+-                self._inv_freq = mx.ones((1,), dtype=mx.float32)
+-            mx.eval(self._qk_w, self._inv_freq)
 +        if not self._can_fuse_qk:
 +            raise ValueError("scaled RoPE is unsupported by the fused Q/K kernel")
-         if self._qk_w is None:
-             n_q = self.num_attention_heads
-             n_kv = self.num_key_value_heads
-@@ -336,19 +678,26 @@ class MapleAttention(nn.Module):
++        self._ensure_qk_constants()
  
          # cache.offset is a Python int for a plain cache but an mx.array for
          # the batched caches; coerce so the pos/eps pair is always uniform.
@@ -514,16 +844,100 @@ index a0673f7..61c765f 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -378,7 +727,7 @@ class MapleAttention(nn.Module):
-             qk = qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, self.head_dim)
+@@ -375,14 +1007,30 @@ class MapleAttention(nn.Module):
+             n_q = self.num_attention_heads
+             n_kv = self.num_key_value_heads
+             qk_size = (n_q + n_kv) * self.head_dim
+-            qk = qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, self.head_dim)
++            offset = cache.offset if cache is not None else 0
++
++            def slice_qk():
++                return qkv.reshape(-1)[:qk_size].reshape(n_q + n_kv, self.head_dim)
++
              if self._fused_qk is None:
++                qk = slice_qk()
                  # A nonzero position, so a broken rotation cannot pass.
 -                self._fused_qk = _matches(
 +                self._fused_qk = self._can_fuse_qk and _matches(
                      lambda: (self._qk_fused(qk, 7),),
                      lambda: (self._qk_reference(qk, 7),),
                  )
-@@ -618,7 +967,312 @@ def _make_fused_router_kernel():
+-            offset = cache.offset if cache is not None else 0
++            # The widened kernel consumes qkv directly, so the slice stays out
++            # of the hot path entirely; it is only built for the probe and for
++            # the fallback.
++            if _use_fused_qkv and self._fused_qk:
++                if self._split_qkv is None:
++                    self._split_qkv = self._probe_qkv_split(qkv, slice_qk())
++                if self._split_qkv:
++                    queries, keys, values = self._qkv_split(qkv, offset)
++                    return self._attend(
++                        queries, keys, values, mask, cache, B, L
++                    )
++            qk = slice_qk()
+             out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
+             queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
+             keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
+@@ -409,6 +1057,9 @@ class MapleAttention(nn.Module):
+                 queries = self.rope(queries, offset=offset)
+                 keys = self.rope(keys, offset=offset)
+ 
++        return self._attend(queries, keys, values, mask, cache, B, L)
++
++    def _attend(self, queries, keys, values, mask, cache, B, L):
+         if cache is not None:
+             keys, values = cache.update_and_fetch(keys, values)
+ 
+@@ -419,6 +1070,48 @@ class MapleAttention(nn.Module):
+         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+         return self.o_proj(output)
+ 
++    def _qkv_split(self, qkv, offset):
++        """queries, keys and values straight out of the fused projection."""
++        self._ensure_qk_constants()
++        n_q = self.num_attention_heads
++        n_kv = self.num_key_value_heads
++        hd = self.head_dim
++        pos_eps = mx.array(
++            [float(offset), self._eps, self._rope_log2_base], dtype=mx.float32
++        )
++        return _get_qkv_split_kernel(self.use_rope)(
++            # qkv is passed unreshaped: the kernel indexes it linearly, and a
++            # reshape is a real operation on a host-bound path.
++            inputs=[qkv, self._qk_w, self._inv_freq, pos_eps],
++            template=[
++                ("T_", qkv.dtype), ("W_", self._qk_w.dtype),
++                ("HEAD_DIM", hd), ("ROPE_DIM", self.rope.dims if self.use_rope else 0),
++                ("NQ_", n_q), ("NKV_", n_kv),
++            ],
++            grid=(32, n_q + 2 * n_kv, 1),
++            threadgroup=(32, 1, 1),
++            output_shapes=[(1, n_q, 1, hd), (1, n_kv, 1, hd), (1, n_kv, 1, hd)],
++            output_dtypes=[qkv.dtype] * 3,
++        )
++
++    def _probe_qkv_split(self, qkv, qk):
++        """Fail closed unless the widened kernel matches the sliced path."""
++        n_q = self.num_attention_heads
++        n_kv = self.num_key_value_heads
++        hd = self.head_dim
++        qk_size = (n_q + n_kv) * hd
++        try:
++            return _matches(
++                lambda: self._qkv_split(qkv, 7),
++                lambda: (
++                    self._qk_fused(qk, 7)[:n_q].reshape(1, n_q, 1, hd),
++                    self._qk_fused(qk, 7)[n_q:].reshape(1, n_kv, 1, hd),
++                    qkv.reshape(-1)[qk_size:].reshape(1, n_kv, 1, hd),
++                ),
++            )
++        except (AttributeError, RuntimeError, TypeError, ValueError):
++            return False
++
+ 
+ class MapleMLP(nn.Module):
+     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
+@@ -618,7 +1311,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -834,13 +1248,37 @@ index a0673f7..61c765f 100644
 +    if kernel is None:
 +        kernel = _router_kernel_cache[key] = make_kernel()
 +    return kernel
++
++
++_compiled_router_cache = {}
++
++
++def _compiled_router(top_k):
++    """mx.compile over the stock router chain, cached once per top-k.
++
++    One shared closure, not one per layer: 24 separate compiled closures
++    measured slower than a single shared one (20.75 us against 15.63 us of
++    host time per call), because each carries its own cache.
++    """
++    fn = _compiled_router_cache.get(top_k)
++    if fn is None:
++        def router(x, w):
++            gates = x.astype(mx.float32) @ w.astype(mx.float32).T
++            scores = mx.softmax(gates, axis=-1)
++            inds = mx.argpartition(scores, kth=-top_k, axis=-1)[..., -top_k:]
++            scores = mx.take_along_axis(scores, inds, axis=-1)
++            scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
++            return inds, scores
++        fn = _compiled_router_cache[top_k] = mx.compile(router)
++    return fn
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1287,83 @@ class MapleGate(nn.Module):
+@@ -633,23 +1654,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
++        self._compiled_ok = None  # None = unprobed, then True/False
 +        self._fused_backend = None
  
      def _fused_call(self, x):
@@ -891,7 +1329,7 @@ index a0673f7..61c765f 100644
 +            (self.num_experts // 32) * 256
 +            if backend == "metal"
 +            else _cuda_router_grid_size(self.num_experts, profile)
-+        )
+         )
 +        template = [
 +            ("T_", self.weight.dtype),
 +            ("NEXP", self.num_experts),
@@ -903,7 +1341,7 @@ index a0673f7..61c765f 100644
 +            mx.uint32
 +            if backend == "cuda" and _cuda_router_indices_uint32
 +            else mx.int32
-         )
++        )
 +        if backend == "cuda":
 +            # The multi-block completion counter is a zero-initialized output,
 +            # not hidden mutable input state.  This makes graph dependencies
@@ -935,7 +1373,27 @@ index a0673f7..61c765f 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -670,13 +1384,27 @@ class MapleGate(nn.Module):
+@@ -659,6 +1741,19 @@ class MapleGate(nn.Module):
+         gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+         return group_expert_select(gates, self.top_k)
+ 
++    def _compiled(self, x):
++        """The same chain under mx.compile: array-exact, fewer dispatches.
++
++        The hand-written fused router is cheaper still but differs by ~1 ULP in
++        the normalized weights, which flips greedy decisions.  Compiling the
++        stock chain is exact by construction -- indices and scores both compare
++        array-equal -- and removes most of the per-layer dispatch cost.
++
++        shapeless=True cannot be used: it fails to infer shapes through the
++        top-k slice.
++        """
++        return _compiled_router(self.top_k)(x, self.weight)
++
+     def _probe(self, x):
+         # Not _matches(): the two paths may order the selected experts
+         # differently, and an exact tie at the top-k boundary may legitimately
+@@ -670,13 +1765,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -962,11 +1420,18 @@ index a0673f7..61c765f 100644
      def __call__(self, x):
 +        if not _use_approximate_router:
 +            self._fused = False
++            if _use_compiled_router and x.size == self.hidden_size:
++                if self._compiled_ok is None:
++                    self._compiled_ok = _matches(
++                        lambda: self._compiled(x), lambda: self._reference(x)
++                    )
++                if self._compiled_ok:
++                    return self._compiled(x)
 +            return self._reference(x)
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1423,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,6 +1811,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -1110,7 +1575,7 @@ index a0673f7..61c765f 100644
  class MapleSwitchGLU(nn.Module):
      """SwitchGLU with the up and gate projections fused into one gather
      matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +1570,78 @@ class MapleSwitchGLU(nn.Module):
+@@ -705,8 +1958,78 @@ class MapleSwitchGLU(nn.Module):
              input_dims, 2 * hidden_dims, num_experts, bias=bias
          )
          self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
@@ -1189,7 +1654,7 @@ index a0673f7..61c765f 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,17 +1650,26 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2038,495 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -1215,26 +1680,544 @@ index a0673f7..61c765f 100644
  
          return x.squeeze(-2)
  
--
++# Opt-in fast lane: the whole MoE block in one dispatch.
++#
++# Four phases separated by three atomic-counter grid barriers -- there is no
++# cooperative launch, so ordering across blocks has to be built by hand, and a
++# barrier is only safe while every block is resident.  MLX does not expose the
++# multiprocessor count, so the grid is fixed at 32 blocks, which every CUDA GPU
++# of this era holds simultaneously.  Measured on RTX 3090 the throughput is
++# flat from 32 to 160 blocks and only falls off past 192, so the conservative
++# choice costs nothing while a larger grid would risk a deadlock on a smaller
++# device.
++#
++# Phase 0 recomputes the residual add and RMSNorm redundantly in every block.
++# That is 2048 elements against an otherwise idle GPU, and doing it everywhere
++# removes the need for a fourth barrier.
++#
++# The single scratch buffer is deliberate: each additional kernel output costs
++# ~5-7 us of host time (measured), which is the same order as a whole extra
++# dispatch, so barrier counters, logits, indices, weights and activations all
++# live at offsets in one array.
++_MOE_MEGAKERNEL_SOURCE = r"""
++    constexpr int WARP = 32;
++    constexpr int WARPS = THREADS_ / WARP;
++
++    // up/gate geometry
++    constexpr int VPL_A = KH_ / LPRA_;
++    constexpr int U32_A = VPL_A / 16;
++    constexpr int U32ROW_A = KH_ / 16;
++    // down geometry
++    constexpr int VPL_B = KD_ / LPRB_;
++    constexpr int U32_B = VPL_B / 16;
++    constexpr int U32ROW_B = KD_ / 16;
++    constexpr int SUBROWS_B = WARP / LPRB_;
++
++    const int tid = threadIdx.x;
++    const int lane = tid & (WARP - 1);
++    const int warp = tid >> 5;
++    const int blk = blockIdx.x;
++
++    // Every extra kernel output costs host time (measured ~5-7 us each), so
++    // all of the block's working state lives in one buffer.
++    constexpr int OFF_IDX = 8;
++    constexpr int OFF_SCO = 24;
++    constexpr int OFF_LOG = 64;
++    constexpr int OFF_ACT = 512;
++    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
++    float* idxf = scratch + OFF_IDX;
++    float* scoref = scratch + OFF_SCO;
++    float* logits = scratch + OFF_LOG;
++    float* actf = scratch + OFF_ACT;
++
++    __shared__ float xs_lin[KH_];
++    __shared__ float xs_t[KH_];
++    __shared__ float acts[NEXP_ * KD_];
++    __shared__ float red[WARPS];
++    __shared__ float gmax_s;
++    __shared__ float gsum_s;
++    __shared__ int sel[NEXP_];
++    __shared__ float selv[NEXP_];
++
++    // ---- phase 0: residual add + RMSNorm, recomputed in every block --------
++    // The normalized vector is consumed only inside this kernel, so it never
++    // has to be materialized; only the residual stream leaves.  Thread t owns
++    // x[4t..4t+3] and the reduction is a descending __shfl_down tree, which is
++    // what mx.fast.rms_norm does for a 2048-wide row.
++    {
++        constexpr int VEC = KH_ / THREADS_;
++        const int base = tid * VEC;
++        float hb[VEC];
++        float ss = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const T_ rounded = static_cast<T_>(
++                static_cast<float>(hin[base + i]) + static_cast<float>(rin[base + i]));
++            if (blk == 0) hout[base + i] = rounded;
++            hb[i] = static_cast<float>(rounded);
++            ss += hb[i] * hb[i];
++        }
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
++        if (lane == 0) red[warp] = ss;
++        __syncthreads();
++        float tot = (lane < WARPS) ? red[lane] : 0.0f;
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
++        if (tid == 0) gsum_s = tot;
++        __syncthreads();
++        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const int idx = base + i;
++            const float v = static_cast<float>(static_cast<T_>(
++                hb[i] * nscale * static_cast<float>(nw[idx])));
++            xs_lin[idx] = v;
++            const int l = idx / VPL_A;
++            const int j = idx - l * VPL_A;
++            xs_t[j * LPRA_ + l] = v;
++        }
++    }
++    __syncthreads();
++
++    // ---- phase A: router logits, one warp per expert row -------------------
++    for (int e = blk * WARPS + warp; e < NROUT_; e += GRID_ * WARPS) {
++        const RW_* wrow = rw + static_cast<long long>(e) * KH_;
++        float acc = 0.0f;
++        for (int k = lane; k < KH_; k += WARP) {
++            acc = fmaf(static_cast<float>(wrow[k]), xs_lin[k], acc);
++        }
++        #pragma unroll
++        for (int off = 16; off > 0; off >>= 1) {
++            acc += __shfl_down_sync(0xffffffffu, acc, off);
++        }
++        if (lane == 0) logits[e] = acc;
++    }
++
++    // ---- barrier 1 ---------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[0], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[3], 1u);
++        else while (atomicAdd(&ctr[3], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase B: softmax + top-K + renormalize, on block 0 ----------------
++    if (blk == 0) {
++        float m = -INFINITY;
++        for (int e = tid; e < NROUT_; e += THREADS_) m = fmaxf(m, logits[e]);
++        #pragma unroll
++        for (int off = 16; off > 0; off >>= 1)
++            m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
++        if (lane == 0) red[warp] = m;
++        __syncthreads();
++        if (tid == 0) {
++            float g = red[0];
++            for (int i = 1; i < WARPS; ++i) g = fmaxf(g, red[i]);
++            gmax_s = g;
++        }
++        __syncthreads();
++        const float gmax = gmax_s;
++        float s = 0.0f;
++        for (int e = tid; e < NROUT_; e += THREADS_) s += expf(logits[e] - gmax);
++        #pragma unroll
++        for (int off = 16; off > 0; off >>= 1)
++            s += __shfl_down_sync(0xffffffffu, s, off);
++        if (lane == 0) red[warp] = s;
++        __syncthreads();
++        if (tid == 0) {
++            float g = 0.0f;
++            for (int i = 0; i < WARPS; ++i) g += red[i];
++            gsum_s = g;
++        }
++        __syncthreads();
++
++        if (warp == 0) {
++            for (int t = 0; t < NEXP_; ++t) {
++                float best = -INFINITY;
++                int bi = NROUT_;
++                for (int e = lane; e < NROUT_; e += WARP) {
++                    const float v = logits[e];
++                    if (v > best || (v == best && e < bi)) { best = v; bi = e; }
++                }
++                #pragma unroll
++                for (int off = 16; off > 0; off >>= 1) {
++                    const float ov = __shfl_down_sync(0xffffffffu, best, off);
++                    const int oi = __shfl_down_sync(0xffffffffu, bi, off);
++                    if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
++                }
++                if (lane == 0) { sel[t] = bi; selv[t] = best; logits[bi] = -INFINITY; }
++                __syncwarp();
++            }
++        }
++        __syncthreads();
++        if (tid == 0) {
++            const float inv = 1.0f / gsum_s;
++            float den = 0.0f;
++            float sc[NEXP_];
++            #pragma unroll
++            for (int t = 0; t < NEXP_; ++t) {
++                sc[t] = expf(selv[t] - gmax_s) * inv;
++                den += sc[t];
++            }
++            den += 1e-20f;
++            #pragma unroll
++            for (int t = 0; t < NEXP_; ++t) {
++                idxf[NEXP_ - 1 - t] = static_cast<float>(sel[t]);
++                scoref[NEXP_ - 1 - t] = sc[t] / den;
++            }
++        }
++    }
++
++    // ---- barrier 2 ---------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[1], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[4], 1u);
++        else while (atomicAdd(&ctr[4], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase C: up/gate projection + clamped SwiGLU ----------------------
++    {
++        const int rows_per_iter = WARPS;
++        for (int base_row = blk * rows_per_iter; base_row < NOUT_ * NEXP_;
++             base_row += GRID_ * rows_per_iter) {
++            const int flat = base_row + warp;
++            if (flat >= NOUT_ * NEXP_) break;
++            const int expert = flat / NOUT_;
++            const int r = flat - expert * NOUT_;
++            const int w_e = static_cast<int>(idxf[expert]);
++            const int half = lane / LPRA_;
++            const int slane = lane % LPRA_;
++            const int row = r + half * NOUT_;
++
++            const long long wbase =
++                (static_cast<long long>(w_e) * (2 * NOUT_) + row) * U32ROW_A
++                + static_cast<long long>(slane) * U32_A;
++            uint32_t wv[U32_A];
++            if (U32_A == 8) {
++                const uint4 t0 = *reinterpret_cast<const uint4*>(ugw + wbase);
++                const uint4 t1 = *reinterpret_cast<const uint4*>(ugw + wbase + 4);
++                wv[0]=t0.x; wv[1]=t0.y; wv[2]=t0.z; wv[3]=t0.w;
++                wv[4]=t1.x; wv[5]=t1.y; wv[6]=t1.z; wv[7]=t1.w;
++            } else {
++                #pragma unroll
++                for (int i = 0; i < U32_A; ++i) wv[i] = ugw[wbase + i];
++            }
++            const int g = (slane * VPL_A) / GS_;
++            const long long sbase =
++                (static_cast<long long>(w_e) * (2 * NOUT_) + row) * GRPA_ + g;
++            const float sc = static_cast<float>(ugs[sbase]);
++            const float bs = static_cast<float>(ugb[sbase]);
++            const float s2 = sc + sc;
++            const float b2 = fmaf(-4.0f, sc, bs);
++
++            float part[U32_A];
++            #pragma unroll
++            for (int i = 0; i < U32_A; ++i) {
++                const uint32_t v = wv[i];
++                const int off = i * 16;
++                float a = 0.0f;
++                #pragma unroll
++                for (int j = 0; j < 11; ++j) {
++                    const float f = __uint_as_float(
++                        ((v << (21 - 2 * j)) & 0x00600000u) | 0x40000000u);
++                    a = fmaf(fmaf(f, s2, b2), xs_t[(off + j) * LPRA_ + slane], a);
++                }
++                #pragma unroll
++                for (int j = 11; j < 16; ++j) {
++                    const float f = __uint_as_float(
++                        ((v >> (2 * j - 21)) & 0x00600000u) | 0x40000000u);
++                    a = fmaf(fmaf(f, s2, b2), xs_t[(off + j) * LPRA_ + slane], a);
++                }
++                part[i] = a;
++            }
++            #pragma unroll
++            for (int stride = U32_A / 2; stride > 0; stride >>= 1) {
++                #pragma unroll
++                for (int i = 0; i < stride; ++i) part[i] += part[i + stride];
++            }
++            float acc = part[0];
++            #pragma unroll
++            for (int off = LPRA_ / 2; off > 0; off >>= 1)
++                acc += __shfl_down_sync(0xffffffffu, acc, off);
++            acc = static_cast<float>(static_cast<T_>(acc));
++            const float other = __shfl_sync(0xffffffffu, acc, lane + LPRA_);
++            if (lane == 0) {
++                const float up = fminf(fmaxf(acc, -7.0f), 7.0f);
++                const float gate = fminf(other, 7.0f);
++                // round through bf16 so the value matches the separate
++                // kernel's stored activation exactly
++                actf[expert * NOUT_ + r] = static_cast<float>(static_cast<T_>(
++                    (gate / (1.0f + expf(-gate))) * up));
++            }
++        }
++    }
++
++    // ---- barrier 3 ---------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[2], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[5], 1u);
++        else while (atomicAdd(&ctr[5], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase D: down projection + score-weighted aggregation -------------
++    for (int i = tid; i < NEXP_ * KD_; i += THREADS_) {
++        const int e = i / KD_;
++        const int k = i - e * KD_;
++        const int l = k / VPL_B;
++        const int j = k - l * VPL_B;
++        acts[e * KD_ + j * LPRB_ + l] = actf[i];
++    }
++    __syncthreads();
++    {
++        const int sub = lane / LPRB_;
++        const int slane = lane % LPRB_;
++        const int g = (slane * VPL_B) / GS_;
++        const int rows_per_iter = WARPS * SUBROWS_B;
++        for (int base = blk * rows_per_iter; base < ND_;
++             base += GRID_ * rows_per_iter) {
++            const int row = base + warp * SUBROWS_B + sub;
++            if (row >= ND_) break;
++            float total = 0.0f;
++            for (int e = 0; e < NEXP_; ++e) {
++                const int w_e = static_cast<int>(idxf[e]);
++                const long long wbase =
++                    (static_cast<long long>(w_e) * ND_ + row) * U32ROW_B
++                    + static_cast<long long>(slane) * U32_B;
++                uint32_t wv[U32_B];
++                if (U32_B == 4) {
++                    const uint4 t = *reinterpret_cast<const uint4*>(dnw + wbase);
++                    wv[0]=t.x; wv[1]=t.y; wv[2]=t.z; wv[3]=t.w;
++                } else {
++                    #pragma unroll
++                    for (int i = 0; i < U32_B; ++i) wv[i] = dnw[wbase + i];
++                }
++                const long long sbase =
++                    (static_cast<long long>(w_e) * ND_ + row) * GRPB_ + g;
++                const float sc = static_cast<float>(dns[sbase]);
++                const float bs = static_cast<float>(dnb[sbase]);
++                const float s2 = sc + sc;
++                const float b2 = fmaf(-4.0f, sc, bs);
++                const float* xe = acts + e * KD_;
++                float part[U32_B];
++                #pragma unroll
++                for (int i = 0; i < U32_B; ++i) {
++                    const uint32_t v = wv[i];
++                    const int off = i * 16;
++                    float a = 0.0f;
++                    #pragma unroll
++                    for (int j = 0; j < 11; ++j) {
++                        const float f = __uint_as_float(
++                            ((v << (21 - 2 * j)) & 0x00600000u) | 0x40000000u);
++                        a = fmaf(fmaf(f, s2, b2), xe[(off + j) * LPRB_ + slane], a);
++                    }
++                    #pragma unroll
++                    for (int j = 11; j < 16; ++j) {
++                        const float f = __uint_as_float(
++                            ((v >> (2 * j - 21)) & 0x00600000u) | 0x40000000u);
++                        a = fmaf(fmaf(f, s2, b2), xe[(off + j) * LPRB_ + slane], a);
++                    }
++                    part[i] = a;
++                }
++                #pragma unroll
++                for (int stride = U32_B / 2; stride > 0; stride >>= 1) {
++                    #pragma unroll
++                    for (int i = 0; i < stride; ++i) part[i] += part[i + stride];
++                }
++                float acc = part[0];
++                #pragma unroll
++                for (int off = LPRB_ / 2; off > 0; off >>= 1)
++                    acc += __shfl_down_sync(0xffffffffu, acc, off);
++                total = fmaf(static_cast<float>(static_cast<T_>(acc)),
++                             scoref[e], total);
++            }
++            if (slane == 0) out[row] = static_cast<T_>(total);
++        }
++    }
++"""
++
++
++
++_moe_megakernel_cache = {}
++
++
++def _moe_megakernel(eps):
++    kernel = _moe_megakernel_cache.get(eps)
++    if kernel is None:
++        kernel = _moe_megakernel_cache[eps] = mx.fast.cuda_kernel(
++            name="maple_moe_megakernel",
++            input_names=["hin", "rin", "nw", "rw", "ugw", "ugs", "ugb",
++                         "dnw", "dns", "dnb"],
++            output_names=["out", "hout", "scratch"],
++            source=_MOE_MEGAKERNEL_SOURCE.replace("EPS_", f"{eps:.10e}f"),
++        )
++    return kernel
++
++
++def _moe_megakernel_lpr(k):
++    """Lanes per row, preferring 64 or 128 values per lane so the packed
++    weights arrive as one or two 16-byte uint4 loads."""
++    for want in (64, 128, 32, 16):
++        lpr = k // want
++        if lpr in (4, 8, 16, 32):
++            vals = k // lpr
++            if 16 <= vals <= 128 and 128 % vals == 0 and (k // 16) % lpr == 0:
++                return lpr
++    return None
++
++
++def _moe_megakernel_plan(block, ln, dtype, grid=32, threads=512):
++    mlp = getattr(block, "switch_mlp", None)
++    if mlp is None or _cuda_profile() is None:
++        return False
++    ug = getattr(mlp, "up_gate_proj", None)
++    dp = getattr(mlp, "down_proj", None)
++    if ug is None or dp is None:
++        return False
++    kh, nout, kd, nd = (ug.input_dims, dp.input_dims, dp.input_dims,
++                        dp.output_dims)
++    if not (
++        getattr(ug, "bits", None) == 2 and getattr(dp, "bits", None) == 2
++        and getattr(ug, "group_size", None) == 128
++        and getattr(dp, "group_size", None) == 128
++        and getattr(ug, "mode", "affine") == "affine"
++        and getattr(dp, "mode", "affine") == "affine"
++        and getattr(ug, "biases", None) is not None
++        and getattr(dp, "biases", None) is not None
++        and "bias" not in ug and "bias" not in dp
++        and block.gate.top_k == 8
++        and ug.output_dims == 2 * nout
++        and kh % threads == 0
++        and _moe_megakernel_lpr(kd) is not None
++    ):
++        return False
++    return (
++        _moe_megakernel(ln.eps),
++        {
++            "template": [
++                ("T_", dtype), ("RW_", block.gate.weight.dtype),
++                ("KH_", kh), ("NOUT_", nout), ("KD_", kd), ("ND_", nd),
++                ("NROUT_", block.gate.num_experts), ("NEXP_", block.gate.top_k),
++                ("GRPA_", ug.scales.shape[-1]), ("GRPB_", dp.scales.shape[-1]),
++                ("GS_", 128), ("LPRA_", 16), ("LPRB_", _moe_megakernel_lpr(kd)),
++                ("THREADS_", threads), ("GRID_", grid),
++            ],
++            "grid": (grid * threads, 1, 1),
++            "threadgroup": (threads, 1, 1),
++            "output_shapes": [(1, 1, nd), (1, 1, kh),
++                              (512 + block.gate.top_k * nout,)],
++            "output_dtypes": [dtype, dtype, mx.float32],
++            "init_value": 0,
++        },
++    )
++
++
++def _moe_megakernel_call(layer, h, r, ln):
++    """Returns (moe_output, new_residual) or None when unsupported."""
++    block = layer.mlp
++    plan = getattr(block, "_megakernel_plan", None)
++    if plan is None:
++        try:
++            plan = _moe_megakernel_plan(block, ln, h.dtype)
++        except (AttributeError, RuntimeError, TypeError, ValueError):
++            plan = False
++        block._megakernel_plan = plan
++    if plan is False:
++        return None
++    kernel, kwargs = plan
++    mlp = block.switch_mlp
++    ug, dp = mlp.up_gate_proj, mlp.down_proj
++    try:
++        out, hout, _ = kernel(
++            inputs=[h, r, ln.weight, block.gate.weight, ug.weight, ug.scales,
++                    ug.biases, dp.weight, dp.scales, dp.biases],
++            **kwargs,
++        )
++    except (RuntimeError, TypeError, ValueError):
++        block._megakernel_plan = False
++        return None
++    return out, hout
++
+ 
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-         super().__init__()
-@@ -836,7 +1780,13 @@ class MapleModel(nn.Module):
+@@ -792,9 +2594,10 @@ class MapleModel(nn.Module):
+             else None
+         )
+         self._fused_add_norm = None  # None = unprobed, then True/False
++        self._exact_add_norm = None  # None = unprobed, then True/False
+         self._zero = None
+ 
+-    def _decode_fused(self, h, cache, full_mask, swa_mask):
++    def _decode_fused(self, h, cache, full_mask, swa_mask, fuse):
+         """Decode loop with residual adds folded into the norms.
+ 
+         Carries (h, r) instead of adding r back each step, so every
+@@ -809,12 +2612,17 @@ class MapleModel(nn.Module):
+         for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+             mask = full_mask if layer_type == "full_attention" else swa_mask
+             ln = layer.input_layernorm
+-            h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
++            h, hn = fuse(h, r, ln.weight, ln.eps)
+             r = layer.self_attn(hn, mask, c)
+             ln = layer.post_attention_layernorm
+-            h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
++            if _use_moe_megakernel:
++                fused = _moe_megakernel_call(layer, h, r, ln)
++                if fused is not None:
++                    r, h = fused
++                    continue
++            h, hn = fuse(h, r, ln.weight, ln.eps)
+             r = layer.mlp(hn)
+-        return _add_rms_norm(h, r, self.norm.weight, self.norm.eps)[1]
++        return fuse(h, r, self.norm.weight, self.norm.eps)[1]
+ 
+     def __call__(
+         self,
+@@ -836,12 +2644,29 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
 -            if self._fused_add_norm is None:
++            # Strict lane first: the corrected kernel reproduces
++            # mx.fast.rms_norm's thread mapping and is array-exact.
++            if _use_fused_add_rms:
++                if self._exact_add_norm is None:
++                    self._exact_add_norm = _exact_add_rms_ok(
++                        h.shape[-1], h.dtype, self.norm.weight, self.norm.eps
++                    )
++                if self._exact_add_norm:
++                    return self._decode_fused(
++                        h, cache, full_mask, swa_mask, _exact_add_rms_norm
++                    )
++            # Historical approximate carrier: its thread mapping differs from
++            # mx.fast.rms_norm, so it stays an explicit semantic lane.
 +            if not _use_approximate_add_rms:
-+                # The fused residual carrier passes local array-equality probes
-+                # but diverged on a deterministic long-generation regression.
-+                # Keep it in the explicit semantic lane until its full 49-norm
-+                # chain is exact for every decode activation.
 +                self._fused_add_norm = False
 +            elif self._fused_add_norm is None:
                  self._fused_add_norm = _add_rms_norm_ok(
                      h.shape[-1], h.dtype, self.norm.weight, self.norm.eps
                  )
-@@ -1021,6 +1971,32 @@ class Model(nn.Module):
+             if self._fused_add_norm:
+-                return self._decode_fused(h, cache, full_mask, swa_mask)
++                return self._decode_fused(
++                    h, cache, full_mask, swa_mask, _add_rms_norm
++                )
+ 
+         for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+             mask = full_mask if layer_type == "full_attention" else swa_mask
+@@ -1021,6 +2846,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -1267,7 +2250,7 @@ index a0673f7..61c765f 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +2015,8 @@ class Model(nn.Module):
+@@ -1039,8 +2890,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
@@ -1458,7 +2441,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/tests/test_maple_kernels.py b/tests/test_maple_kernels.py
-index 6e232ba..8de83d7 100644
+index 6e232ba..06c5112 100644
 --- a/tests/test_maple_kernels.py
 +++ b/tests/test_maple_kernels.py
 @@ -9,7 +9,14 @@ is off on this machine", not "the model is broken". A precision failure does
@@ -2017,3 +3000,100 @@ index 6e232ba..8de83d7 100644
          slow = decode(False)
          self.assertEqual(int(fast.argmax()), int(slow.argmax()), "argmax differs")
          self.assertTrue(
+@@ -270,5 +680,96 @@ class TestMapleKernels(unittest.TestCase):
+         self.assertTrue(mx.array_equal(grouped[f"{prefix}.scales"], scales))
+ 
+ 
++    def test_exact_add_rms_needs_outliers_to_be_validated(self):
++        """The corrected fused add+RMSNorm is exact, including on outliers.
++
++        A Gaussian probe cannot validate this kernel: on N(0, 1) inputs a
++        butterfly reduction and a __shfl_down reduction agree on every trial,
++        so a wrong reduction passes.  Only the wide dynamic range of a real
++        residual stream separates them, which is why the shipped probe injects
++        outliers.
++        """
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        args = _args()
++        dim, eps = args.hidden_size, args.rms_norm_eps
++        w = (mx.random.normal((dim,)) * 0.1 + 1.0).astype(mx.bfloat16)
++        self.assertTrue(maple._exact_add_rms_ok(dim, mx.bfloat16, w, eps))
++
++        spikes = mx.random.normal((1, 1, dim))
++        x = (mx.random.normal((1, 1, dim))
++             + mx.where(spikes > 2.0, spikes * 30.0, 0.0)).astype(mx.bfloat16)
++        r = (mx.random.normal((1, 1, dim))
++             + mx.where(spikes < -2.0, spikes * 30.0, 0.0)).astype(mx.bfloat16)
++        h, hn = maple._exact_add_rms_norm(x, r, w, eps)
++        ref = mx.fast.rms_norm(
++            (x + r).astype(mx.float32), w.astype(mx.float32), eps
++        ).astype(mx.bfloat16)
++        mx.eval(h, hn, ref)
++        self.assertTrue(mx.array_equal(h, x + r), "residual add is not bit-exact")
++        self.assertTrue(mx.array_equal(hn, ref), "norm is not array-exact")
++
++    def test_exact_add_rms_rejects_unsupported_dimension(self):
++        """A width that cannot be split four-per-thread must fail closed."""
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        self.assertFalse(maple._exact_add_rms_supported(1537))
++        self.assertFalse(maple._exact_add_rms_supported(2048 * 4))
++
++    def test_qkv_split_matches_the_sliced_path(self):
++        """The widened kernel must reproduce the slice-and-reshape chain."""
++        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
++            self.skipTest("CUDA fast path unavailable")
++        args = _args()
++        model = maple.Model(args)
++        attn = model.model.layers[0].self_attn
++        n_q, n_kv, hd = (attn.num_attention_heads, attn.num_key_value_heads,
++                         attn.head_dim)
++        qkv = mx.random.normal((1, 1, (n_q + 2 * n_kv) * hd)).astype(mx.bfloat16)
++        qk = qkv.reshape(-1)[: (n_q + n_kv) * hd].reshape(n_q + n_kv, hd)
++        mx.eval(qkv)
++        self.assertTrue(attn._probe_qkv_split(qkv, qk))
++
++        queries, keys, values = attn._qkv_split(qkv, 7)
++        out = attn._qk_fused(qk, 7)
++        mx.eval(queries, keys, values, out)
++        self.assertTrue(mx.array_equal(
++            queries, out[:n_q].reshape(1, n_q, 1, hd)))
++        self.assertTrue(mx.array_equal(
++            keys, out[n_q:].reshape(1, n_kv, 1, hd)))
++        self.assertTrue(mx.array_equal(
++            values,
++            qkv.reshape(-1)[(n_q + n_kv) * hd:].reshape(1, n_kv, 1, hd)))
++
++    def test_compiled_router_is_array_exact(self):
++        """mx.compile over the stock chain must not move a single bit."""
++        args = _args()
++        model = maple.Model(args)
++        gate = model.model.layers[0].mlp.gate
++        x = mx.random.normal((1, gate.hidden_size)).astype(mx.bfloat16)
++        mx.eval(x)
++        ri, rs = gate._reference(x)
++        ci, cs = gate._compiled(x)
++        mx.eval(ri, rs, ci, cs)
++        self.assertTrue(mx.array_equal(ri, ci), "compiled router reordered experts")
++        self.assertTrue(mx.array_equal(rs, cs), "compiled router moved the weights")
++
++    def test_moe_megakernel_is_opt_in(self):
++        """The approximate fast lane must stay off unless asked for."""
++        self.assertFalse(maple._use_moe_megakernel)
++        self.assertTrue(maple._use_fused_add_rms)
++        self.assertTrue(maple._use_fused_qkv)
++        self.assertFalse(maple._use_compiled_router)
++
++    def test_moe_megakernel_rejects_unsupported_layers(self):
++        """An unquantized MoE block must fall back instead of dispatching."""
++        args = _args()
++        model = maple.Model(args)
++        layer = model.model.layers[0]
++        ln = layer.post_attention_layernorm
++        plan = maple._moe_megakernel_plan(layer.mlp, ln, mx.bfloat16)
++        self.assertFalse(plan, "unquantized experts must not build a plan")
++
++
+ if __name__ == "__main__":
+     unittest.main()

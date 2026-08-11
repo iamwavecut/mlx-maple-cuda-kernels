@@ -1,0 +1,36 @@
+{"backend": "cuda", "base_git_sha": "eba96c16158f032821b0bf374ea1421cfddef0a9", "checkpoint_revision_asserted": "361db5da5e74ff6fcdd852d478e1f266ce11013a", "compute_capability": "sm_86", "condition": "fresh_process_per_run_single_device_community_cloud", "deterministic_environment": {"MLX_CUDA_GRAPH_CACHE_SIZE": "400", "MLX_CUDA_USE_CUDNN_SDPA": "0", "MLX_MAX_MB_PER_BUFFER": "100", "MLX_MAX_OPS_PER_BUFFER": "100", "MLX_USE_CUDA_GRAPHS": "1"}, "device_name": "NVIDIA GeForce RTX 3090", "driver": "580.159.03", "mlx": "0.32.0", "mlx_cuda": "0.32.0", "modes": {"fast": "strict plus the opt-in _use_moe_megakernel", "off": "every new fusion disabled; reproduces the previous release path", "strict": "_use_fused_add_rms and _use_fused_qkv, the new defaults"}, "published_source_sha256": "9c6dc97bc13dee20d803b87a3919b8d3a7e9b6c9af866e0fd6d6c7e0678993bd", "python": "3.12", "seed": 20260806, "switch_layers_sha256": "3b51288a9350946c8615d2d2ebe231766bf54c6a676c5bfd492da1bd3b657020", "type": "environment", "workload": "warm single-stream B=1 L=1 BF16 decode, 128 prompt / 512 generation"}
+{"fast_identical": 1, "generation_tokens": 512, "note": "the megakernel is within ~1 ULP of bf16, not array-exact", "prompts": 8, "protocol": "each prompt generated three times with the fusions off; a candidate counts as divergent only inside the region where those three agree", "reference_unstable_prompts": 0, "strict_identical": 8, "type": "equivalence"}
+{"generation_tokens": 512, "generation_tps": 150.8535009264243, "mode": "off", "trial": 0, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 152.0895122113093, "mode": "off", "trial": 1, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 152.2699297925246, "mode": "off", "trial": 2, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 152.306709296736, "mode": "off", "trial": 3, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 155.77758370294106, "mode": "off", "trial": 4, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 150.4497123501567, "mode": "off", "trial": 5, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 153.40034644217667, "mode": "off", "trial": 6, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 154.7474959810329, "mode": "off", "trial": 7, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 165.0796463492031, "mode": "strict", "trial": 0, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 161.1168660428762, "mode": "strict", "trial": 1, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 165.99831266381162, "mode": "strict", "trial": 2, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 165.1333304797428, "mode": "strict", "trial": 3, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 161.29123340084175, "mode": "strict", "trial": 4, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 164.79286588932294, "mode": "strict", "trial": 5, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 165.529570817309, "mode": "strict", "trial": 6, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 154.8494773045249, "mode": "strict", "trial": 7, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 276.3584836981707, "mode": "fast", "trial": 0, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 271.0156226031241, "mode": "fast", "trial": 1, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 281.14838201970315, "mode": "fast", "trial": 2, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 270.2141517658631, "mode": "fast", "trial": 3, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 268.324739705959, "mode": "fast", "trial": 4, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 274.58978648192556, "mode": "fast", "trial": 5, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 266.75669329862257, "mode": "fast", "trial": 6, "type": "trial"}
+{"generation_tokens": 512, "generation_tps": 285.47030530148936, "mode": "fast", "trial": 7, "type": "trial"}
+{"generation_tokens": 512, "max_generation_tps": 155.77758370294106, "mean_generation_tps": 152.7368488379127, "median_generation_tps": 152.2883195446303, "min_generation_tps": 150.4497123501567, "mode": "off", "processes": 8, "type": "summary"}
+{"generation_tokens": 512, "max_generation_tps": 165.99831266381162, "mean_generation_tps": 162.97391286845405, "median_generation_tps": 164.93625611926302, "min_generation_tps": 154.8494773045249, "mode": "strict", "processes": 8, "type": "summary"}
+{"generation_tokens": 512, "max_generation_tps": 285.47030530148936, "mean_generation_tps": 274.2347706093572, "median_generation_tps": 272.8027045425248, "min_generation_tps": 266.75669329862257, "mode": "fast", "processes": 8, "type": "summary"}
+{"ci95": [1.043312433158929, 1.090884937658759], "geometric_mean": 1.066833547750157, "pairs": 8, "ratio": "strict/off", "ratios": [1.0943043769976364, 1.0593555314913794, 1.0901582005717914, 1.0842157331232005, 1.0353943716858192, 1.0953352008130397, 1.079069080718826, 1.0006590176005465], "type": "paired_statistics", "wins": 8}
+{"ci95": [1.7617748124867614, 1.8291491116026686], "geometric_mean": 1.7951459085835106, "pairs": 8, "ratio": "fast/off", "ratios": [1.831965993503584, 1.7819481347706727, 1.846381504232529, 1.7741447702045121, 1.7224862096823825, 1.8251266964395734, 1.7389575674731275, 1.8447491088093528], "type": "paired_statistics", "wins": 8}
+{"generation_tokens": 2048, "generation_tps": 154.75223292443732, "mode": "off", "peak_memory": 6.478, "token_sha256": "9d967cf16de230e075e53519fc035094330cae0981ab3435713d5d2b7a71b218", "type": "long_run"}
+{"generation_tokens": 2048, "generation_tps": 163.5146273577862, "mode": "strict", "peak_memory": 6.478, "token_sha256": "9d967cf16de230e075e53519fc035094330cae0981ab3435713d5d2b7a71b218", "type": "long_run"}
+{"generation_tokens": 2048, "generation_tps": 274.715115596011, "mode": "fast", "peak_memory": 6.478, "token_sha256": "9d967cf16de230e075e53519fc035094330cae0981ab3435713d5d2b7a71b218", "type": "long_run"}
+{"generation_tokens": 512, "median_generation_tps": {"add_rms_plus_qkv": 164.2, "compiled_router": 150.15, "fast": 277.6, "fused_add_rms": 158.54, "fused_qkv": 156.8, "off": 153.44, "strict": 166.35}, "note": "single-component medians on the same host; the compiled router alone measured negative and is therefore opt-in", "processes": 5, "type": "component_factorial"}
+{"ci95": [0.9927, 1.0198], "decision": "interval crosses 1; array-exact but shipped opt-in", "geometric_mean": 1.0062, "pairs": 10, "ratio": "compiled_router_on/off_within_strict", "type": "paired_statistics", "wins": 6}

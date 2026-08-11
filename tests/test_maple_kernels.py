@@ -680,5 +680,96 @@ assert maple._router_select_kernel_cache == {}
         self.assertTrue(mx.array_equal(grouped[f"{prefix}.scales"], scales))
 
 
+    def test_exact_add_rms_needs_outliers_to_be_validated(self):
+        """The corrected fused add+RMSNorm is exact, including on outliers.
+
+        A Gaussian probe cannot validate this kernel: on N(0, 1) inputs a
+        butterfly reduction and a __shfl_down reduction agree on every trial,
+        so a wrong reduction passes.  Only the wide dynamic range of a real
+        residual stream separates them, which is why the shipped probe injects
+        outliers.
+        """
+        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
+            self.skipTest("CUDA fast path unavailable")
+        args = _args()
+        dim, eps = args.hidden_size, args.rms_norm_eps
+        w = (mx.random.normal((dim,)) * 0.1 + 1.0).astype(mx.bfloat16)
+        self.assertTrue(maple._exact_add_rms_ok(dim, mx.bfloat16, w, eps))
+
+        spikes = mx.random.normal((1, 1, dim))
+        x = (mx.random.normal((1, 1, dim))
+             + mx.where(spikes > 2.0, spikes * 30.0, 0.0)).astype(mx.bfloat16)
+        r = (mx.random.normal((1, 1, dim))
+             + mx.where(spikes < -2.0, spikes * 30.0, 0.0)).astype(mx.bfloat16)
+        h, hn = maple._exact_add_rms_norm(x, r, w, eps)
+        ref = mx.fast.rms_norm(
+            (x + r).astype(mx.float32), w.astype(mx.float32), eps
+        ).astype(mx.bfloat16)
+        mx.eval(h, hn, ref)
+        self.assertTrue(mx.array_equal(h, x + r), "residual add is not bit-exact")
+        self.assertTrue(mx.array_equal(hn, ref), "norm is not array-exact")
+
+    def test_exact_add_rms_rejects_unsupported_dimension(self):
+        """A width that cannot be split four-per-thread must fail closed."""
+        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
+            self.skipTest("CUDA fast path unavailable")
+        self.assertFalse(maple._exact_add_rms_supported(1537))
+        self.assertFalse(maple._exact_add_rms_supported(2048 * 4))
+
+    def test_qkv_split_matches_the_sliced_path(self):
+        """The widened kernel must reproduce the slice-and-reshape chain."""
+        if maple._kernel_backend() != "cuda" or maple._cuda_profile() is None:
+            self.skipTest("CUDA fast path unavailable")
+        args = _args()
+        model = maple.Model(args)
+        attn = model.model.layers[0].self_attn
+        n_q, n_kv, hd = (attn.num_attention_heads, attn.num_key_value_heads,
+                         attn.head_dim)
+        qkv = mx.random.normal((1, 1, (n_q + 2 * n_kv) * hd)).astype(mx.bfloat16)
+        qk = qkv.reshape(-1)[: (n_q + n_kv) * hd].reshape(n_q + n_kv, hd)
+        mx.eval(qkv)
+        self.assertTrue(attn._probe_qkv_split(qkv, qk))
+
+        queries, keys, values = attn._qkv_split(qkv, 7)
+        out = attn._qk_fused(qk, 7)
+        mx.eval(queries, keys, values, out)
+        self.assertTrue(mx.array_equal(
+            queries, out[:n_q].reshape(1, n_q, 1, hd)))
+        self.assertTrue(mx.array_equal(
+            keys, out[n_q:].reshape(1, n_kv, 1, hd)))
+        self.assertTrue(mx.array_equal(
+            values,
+            qkv.reshape(-1)[(n_q + n_kv) * hd:].reshape(1, n_kv, 1, hd)))
+
+    def test_compiled_router_is_array_exact(self):
+        """mx.compile over the stock chain must not move a single bit."""
+        args = _args()
+        model = maple.Model(args)
+        gate = model.model.layers[0].mlp.gate
+        x = mx.random.normal((1, gate.hidden_size)).astype(mx.bfloat16)
+        mx.eval(x)
+        ri, rs = gate._reference(x)
+        ci, cs = gate._compiled(x)
+        mx.eval(ri, rs, ci, cs)
+        self.assertTrue(mx.array_equal(ri, ci), "compiled router reordered experts")
+        self.assertTrue(mx.array_equal(rs, cs), "compiled router moved the weights")
+
+    def test_moe_megakernel_is_opt_in(self):
+        """The approximate fast lane must stay off unless asked for."""
+        self.assertFalse(maple._use_moe_megakernel)
+        self.assertTrue(maple._use_fused_add_rms)
+        self.assertTrue(maple._use_fused_qkv)
+        self.assertFalse(maple._use_compiled_router)
+
+    def test_moe_megakernel_rejects_unsupported_layers(self):
+        """An unquantized MoE block must fall back instead of dispatching."""
+        args = _args()
+        model = maple.Model(args)
+        layer = model.model.layers[0]
+        ln = layer.post_attention_layernorm
+        plan = maple._moe_megakernel_plan(layer.mlp, ln, mx.bfloat16)
+        self.assertFalse(plan, "unquantized experts must not build a plan")
+
+
 if __name__ == "__main__":
     unittest.main()
