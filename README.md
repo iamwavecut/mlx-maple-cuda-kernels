@@ -170,17 +170,23 @@ After three rounds of bit-neutral load and scheduling work — tile-wide
 `uint4` weight reads, single-projection warp tasks with the activation folded
 into the next phase's shared load, paired router reads — the trade is gone:
 
-| Host | strict | ~1 ULP megakernel | exact megakernel | exact stream |
-| --- | ---: | ---: | ---: | --- |
-| RTX 3090 (shared dev) | 176.3 | 341.1 | **345.2** | 8/8 identical |
-| RTX 4090 (secure) | 175.8 | 318.9 | **320.3** | 8/8 identical |
+| GPU | CC | strict | ~1 ULP megakernel | exact megakernel | exact stream |
+| --- | --- | ---: | ---: | ---: | --- |
+| RTX 3090 | `sm86` | 176.3 | 341.1 | **345.2** | 8/8 identical |
+| RTX 4090 | `sm89` | 175.8 | 318.9 | **320.3** | 8/8 identical |
+| H100 80GB HBM3 | `sm90` | 233.5 | 395.3 | 388.6 | 8/8 identical |
+| B200 | `sm100` | 322.1 | 389.3 | 358.0 | 8/8 identical |
+| RTX 5090 | `sm120` | 217.7 | 399.3 | 381.6 | 8/8 identical |
 
-Medians over fresh interleaved processes; quality NLL bit-identical to strict
-on both. **The exact lane is now the default**: the fast lane's speed with
-the strict lane's stream. The ~1 ULP megakernel stays enabled as the fallback
-for geometries the exact plan declines (it gates on 256 experts, top-8,
-bf16, 2-bit affine gs=128, 128-divisible dims), and sm90/sm100/sm120
-confirmation runs are the outstanding follow-up.
+Medians over five fresh interleaved processes per mode; the 846-token quality
+suite reproduces the strict lane's corpus NLL to the last digit on every row.
+**The exact lane is the default**: the stock token stream at megakernel
+speed — parity with the ~1 ULP lane on consumer Ampere/Ada, within 1.7% on
+H100, 4.4% on RTX 5090 and 8.0% on B200, and +64% to +96% over the strict
+lane everywhere. The ~1 ULP megakernel stays enabled as the fallback for
+geometries the exact plan declines (256 experts, top-8, bf16, 2-bit affine
+gs=128, 128-divisible dims); closing the remaining gap on the biggest parts
+is GPU-side and bit-neutral.
 
 ### Quality
 
