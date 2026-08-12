@@ -418,3 +418,15 @@ deadlock-spins on the grid barrier. So the sm90 regression is CPU-class,
 not grid starvation: the auto default stays off, `MAPLE_ATTENTION_MEGAKERNEL=1`
 is the documented lever for CPU-poor deployments, and the grid override is
 clamped to 112 above sm86.
+
+### 16. 2026-08-12 — the MMA row-independence proof
+
+The make-or-break probe for free-MMA-row speculation
+(`benchmarks/maple_mma_row_independence.py`, sm89): filling rows 1..15 of
+the `m16n8k16` bf16 atom does not move row 0's bits, and every filled row
+is bit-equal to the same activation run alone (16/16). A verify pass over
+L ≤ 16 draft tokens through the expert MMA IS the L sequential M=1 passes
+bit for bit — speculation can keep the project's exactness invariant. The
+design and break-even arithmetic live in `SPECULATION-DESIGN.md`; the
+first step of the next cycle is measuring prompt-lookup acceptance on
+real service streams, no kernels required.
