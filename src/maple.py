@@ -3791,6 +3791,7 @@ def _attn_mega_call(layer, hn, c):
         float(attn._eps), float(attn._rope_log2_base),
     )
     kh = hn.shape[-1]
+    grid = _attn_megakernel_grid()
     try:
         out, _ = kernel(
             inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
@@ -3802,9 +3803,9 @@ def _attn_mega_call(layer, hn, c):
                 ("NKV_", attn.num_key_value_heads),
                 ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
                 ("RD_", getattr(attn, "_rope_dim", 0) if attn.use_rope else 0),
-                ("THREADS_", 1024), ("GRID_", 64),
+                ("THREADS_", 1024), ("GRID_", grid),
             ],
-            grid=(64 * 1024, 1, 1), threadgroup=(1024, 1, 1),
+            grid=(grid * 1024, 1, 1), threadgroup=(1024, 1, 1),
             output_shapes=[
                 (1, 1, kh),
                 (16 + (attn.num_attention_heads
@@ -3973,6 +3974,34 @@ def _moe_megakernel_lpr(k):
             if 16 <= vals <= 128 and 128 % vals == 0 and (k // 16) % lpr == 0:
                 return lpr
     return None
+
+
+def _attn_megakernel_grid():
+    """Blocks for the attention megakernel (1024 threads each).
+
+    Residency bounds the choice and the parts differ sharply at this block
+    size: consumer Ampere/Blackwell run 1536 threads per SM, so they hold
+    ONE 1024-thread block per SM (RTX 3090: 82 SMs, RTX 4090: 128), while
+    Hopper/B200 run 2048 and hold two (H100: 264).  The default stays at
+    the validated 64 everywhere -- the sm86/sm89 wins were measured there
+    -- and MAPLE_ATTENTION_MEGAKERNEL_GRID exists to scan bigger parts
+    (the H100 story turned out to be CPU-class, not grid: on a starved
+    8-vcpu host the lane WINS +13-14% at any grid, on a healthy CPU it
+    loses ~12% — and grids 64/96/128 tie within noise while 128 already
+    grazes the residency edge and 192 spins).  The override is clamped to
+    a conservative per-capability ceiling so a typo becomes a slowdown
+    rather than a deadlock: the kernel's register weight holds one
+    1024-thread block per SM even on Hopper in practice.
+    """
+    raw = os.environ.get("MAPLE_ATTENTION_MEGAKERNEL_GRID")
+    if raw:
+        ceiling = {(8, 6): 64, (8, 9): 112, (9, 0): 112,
+                   (10, 0): 112, (12, 0): 112}.get(_cuda_capability(), 64)
+        try:
+            return max(16, min(int(raw), ceiling))
+        except ValueError:
+            pass
+    return 64
 
 
 def _moe_megakernel_grid(default=None):

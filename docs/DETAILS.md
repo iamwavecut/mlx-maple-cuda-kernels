@@ -403,3 +403,18 @@ the wall is GPU time, and host-side batching is exhausted.
   candidates were array-exact but failed their performance gates, H100
   retained its stock tile.
 
+
+### 15. 2026-08-12 — the grid-scan postscript on sm90
+
+An H100 grid scan (64/96/128/192 blocks, `MAPLE_ATTENTION_MEGAKERNEL_GRID`)
+landed on a severely CPU-starved host (loadavg 16 on 8 vcpu; the stock
+baseline itself collapsed 260 → 73 tok/s) and inverted the picture: on a
+starved CPU the attention lane WINS +13-14% at every grid — it removes
+host work, which is exactly what a poor host lacks — while the healthy-CPU
+H100 the day before measured it ~12% slower. Grids 64/96/128 tie within
+noise, 128 already grazes the residency edge (the kernel's register weight
+holds about one 1024-thread block per SM even on Hopper), and 192
+deadlock-spins on the grid barrier. So the sm90 regression is CPU-class,
+not grid starvation: the auto default stays off, `MAPLE_ATTENTION_MEGAKERNEL=1`
+is the documented lever for CPU-poor deployments, and the grid override is
+clamped to 112 above sm86.
