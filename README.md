@@ -11,7 +11,7 @@ bit** while decoding 2-3x faster than portable MLX.
 
 > **Status:** independent community research, not an MLX or DeepGrove release
 > and not a claim of official model-author support. Releases are cut from
-> `main` with pinned hashes ([latest: v0.8.0](https://github.com/iamwavecut/mlx-maple-cuda-kernels/releases)).
+> `main` with pinned hashes ([latest: v0.8.1](https://github.com/iamwavecut/mlx-maple-cuda-kernels/releases)).
 > Evidence is scoped to the exact GPUs, drivers, MLX 0.32.0, CUDA 12.9,
 > checkpoint revision, and source hashes recorded in `results/`.
 
@@ -456,11 +456,11 @@ workload described above.
 ## Evidence and provenance
 
 - [`src/maple.py`](src/maple.py), SHA-256
-  `88c9e7965130ffbf833e770841092eb3a72f15cf62f6d16ca4f63437d057444e`;
+  `9f8f933fc454570fabf5bd8076987fe633b560d994fb528bf838a7579fbf211d`;
 - integration patch against DeepGrove `eba96c1`
   ([`patches/mlx-lm-deepgrove-maple-cuda.patch`](patches/mlx-lm-deepgrove-maple-cuda.patch)),
   SHA-256
-  `26767c564d17452c16a18019c265b3a0a42c24c31e8187f8b7d14e3b519fe8e8`
+  `2f900fae98789fdc8639f295281278064e2d1cd81f490a0983cc3a12135fe06f`
   (touches `mlx_lm/models/maple.py`, `mlx_lm/models/switch_layers.py`,
   the kernel tests and the frozen `sm100` fixture);
 - frozen fixture SHA-256
