@@ -374,6 +374,7 @@ non-array-exact default off and leaves a fully array-exact configuration.
 | Fused QKV split (`_use_fused_qkv`) | **on** | array-exact by construction; probed live |
 | Residual add + RMSNorm (`_use_fused_add_rms`) | **on** | array-exact once the thread mapping matches `mx.fast.rms_norm` |
 | Exact MoE megakernel (`MAPLE_MOE_MEGAKERNEL_EXACT`) | **on** | array-exact; stock stream on 8/8 screened prompts (sm86, sm89) |
+| Attention megakernel (`MAPLE_ATTENTION_MEGAKERNEL`) | **on** | array-exact; whole decode attention block in one dispatch (qkv, norm+RoPE, cache append, SDPA, o_proj); kL <= 1024 runs the 1-pass SDPA port, longer contexts the 2-pass port with full-layer buffers growing 1024->8192; all (re)seeding is kernel-side so the persistent buffers never move |
 | MoE megakernel (`MAPLE_MOE_MEGAKERNEL`) | **on** (fallback) | within ~1 ULP of bf16; runs only where the exact plan declines |
 | Compiled router (`MAPLE_COMPILED_ROUTER`) | off | array-exact; end-to-end effect not distinguishable from zero |
 | Cached flat decode LHS | off | exact in campaign; lifecycle-limited opt-in |

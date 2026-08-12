@@ -3100,9 +3100,11 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
 #   qkv / o_proj   the dense bf16 gemv order (maple_attention_semantics.py,
 #                  12/12 at both shapes)
 #   split+norm+rope  a line-for-line port of the shipped exact split kernel
-#   sdpa           the kernel_sdpav_1pass port (12/12 at five context
-#                  lengths); the kL > 1024 route is not ported, so the plan
-#                  gates on capacity and the caller falls back per layer
+#   sdpa           kL <= 1024: the kernel_sdpav_1pass port (12/12 at five
+#                  context lengths); kL > 1024: the kernel_sdpav_2pass port
+#                  (benchmarks/maple_attention_2pass_semantics.py, 12/12 at
+#                  six lengths up to 8192) -- 32 fp32 slab partials per head
+#                  behind one extra grid barrier, merged by a 32x32 block
 #   cache append   value-identical writes into caller-owned contiguous
 #                  buffers at the same physical slot the stock rotating
 #                  cache uses -- SDPA walks the same physical order, so the
@@ -3164,10 +3166,16 @@ _ATTN_MEGAKERNEL_SOURCE = r"""
     constexpr int OFF_QKV = 16;
     constexpr int OFF_Q = OFF_QKV + QKVROWS;
     constexpr int OFF_O = OFF_Q + NQ_ * HD;
+    constexpr int OFF_P = OFF_O + NQ_ * HD;      // 2-pass slab partials
+    constexpr int OFF_PS = OFF_P + NQ_ * 32 * HD;  // 2-pass slab sums
+    constexpr int OFF_PM = OFF_PS + NQ_ * 32;      // 2-pass slab maxs
     unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
     float* stq_kv = scratch + OFF_QKV;
     float* stq = scratch + OFF_Q;
     float* sto = scratch + OFF_O;
+    float* partials = scratch + OFF_P;
+    float* psums = scratch + OFF_PS;
+    float* pmaxs = scratch + OFF_PM;
 
     // Persistent step counters, advanced by the kernel itself so every
     // input pointer stays stable and the CUDA graph is captured once.
@@ -3288,16 +3296,21 @@ _ATTN_MEGAKERNEL_SOURCE = r"""
     __syncthreads();
     __threadfence();
 
-    // ---- phase C: single-token SDPA, one head per block --------------------
-    // The kernel_sdpav_1pass port: 32 warps interleave the keys, base-2
-    // online softmax, xor butterflies, __frcp_rn, shared transpose merge.
+    // ---- phase C: single-token SDPA ----------------------------------------
+    // kL <= 1024: the kernel_sdpav_1pass port, one head per block -- 32 warps
+    // interleave the keys, base-2 online softmax, xor butterflies, __frcp_rn,
+    // shared transpose merge.  kL > 1024: the kernel_sdpav_2pass port -- 32
+    // slabs per head (8 warps each, keys at stride 256), fp32 partials scaled
+    // to the slab max, one extra grid barrier, then a 32x32 merge block per
+    // head walking the slab maxs/sums exactly like the stock second kernel.
+    __shared__ float outs[32][33];
+    __shared__ float maxs[32];
+    __shared__ float sums[32];
+    const float scale_log2 = SCALE_ * 1.44269504088896340736f;
+    if (kL <= 1024) {
     if (blk < NQ_) {
         const int head = blk;
         const int kvh = head / (NQ_ / NKV_);
-        __shared__ float outs[32][33];
-        __shared__ float maxs[32];
-        __shared__ float sums[32];
-        const float scale_log2 = SCALE_ * 1.44269504088896340736f;
         float q[VPL], k[VPL], o[VPL];
         #pragma unroll
         for (int i = 0; i < VPL; ++i) {
@@ -3359,6 +3372,142 @@ _ATTN_MEGAKERNEL_SOURCE = r"""
                 sto[head * HD + VPL * warp + i] = static_cast<float>(
                     static_cast<T_>(o[i]));
         }
+    }
+    } else {
+    // 2-pass, pass 1: every block hosts four 8-warp slabs; slab s of head h
+    // walks keys s*8+w :: 256 with a warp-local online softmax, merges its
+    // eight warps through the -1e9 lane mask and a linear j=1..7 fold, and
+    // writes fp32 partials scaled to the slab max.  All 64 blocks make the
+    // same fixed slab-wave count, so the shared reuse stays in lockstep.
+    {
+        const int sub = warp >> 3;         // four slabs per real block
+        const int swrp = warp & 7;         // warp within the slab
+        for (int vb = blk * 4 + sub; vb < NQ_ * 32; vb += GRID_ * 4) {
+            const int head = vb >> 5;
+            const int slab = vb & 31;
+            const int kvh = head / (NQ_ / NKV_);
+            float q[VPL], k[VPL], o[VPL];
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                q[i] = scale_log2 * stq[head * HD + VPL * lane + i];
+                o[i] = 0.0f;
+            }
+            float max_score = -3.402823466e38f;
+            float sum_exp = 0.0f;
+            const long long kh = (long long)kvh * CAP_ * HD;
+            for (int i = slab * 8 + swrp; i < kL; i += 256) {
+                #pragma unroll
+                for (int j = 0; j < VPL; ++j)
+                    k[j] = static_cast<float>(
+                        kcache[kh + (long long)i * HD + VPL * lane + j]);
+                float score = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < VPL; ++j) score += q[j] * k[j];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    score += __shfl_xor_sync(0xffffffffu, score, off);
+                const float new_max = fmaxf(max_score, score);
+                const float factor = exp2f(max_score - new_max);
+                const float exp_score = exp2f(score - new_max);
+                max_score = new_max;
+                sum_exp = sum_exp * factor + exp_score;
+                #pragma unroll
+                for (int j = 0; j < VPL; ++j)
+                    o[j] = o[j] * factor + exp_score * static_cast<float>(
+                        vcache[kh + (long long)i * HD + VPL * lane + j]);
+            }
+            if (lane == 0) {
+                maxs[sub * 8 + swrp] = max_score;
+                sums[sub * 8 + swrp] = sum_exp;
+            }
+            __syncthreads();
+            const float wmax = (lane < 8) ? maxs[sub * 8 + lane] : -1e9f;
+            float new_max = wmax;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                new_max = fmaxf(new_max,
+                                __shfl_xor_sync(0xffffffffu, new_max, off));
+            const float factor = exp2f(wmax - new_max);
+            float se = (lane < 8) ? sums[sub * 8 + lane] : 0.0f;
+            se *= factor;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                se += __shfl_xor_sync(0xffffffffu, se, off);
+            const long long p = (long long)head * 32 + slab;
+            if (swrp == 0 && lane == 0) { psums[p] = se; pmaxs[p] = new_max; }
+            const float ff = exp2f(maxs[sub * 8 + swrp] - new_max);
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                outs[sub * 8 + swrp][lane] = o[i] * ff;
+                __syncthreads();
+                if (swrp == 0) {
+                    float ot = outs[sub * 8][lane];
+                    #pragma unroll
+                    for (int j = 1; j < 8; ++j)
+                        ot += outs[sub * 8 + j][lane];
+                    o[i] = ot;
+                }
+                __syncthreads();
+            }
+            if (swrp == 0) {
+                #pragma unroll
+                for (int i = 0; i < VPL; ++i)
+                    partials[p * HD + VPL * lane + i] = o[i];
+            }
+            __syncthreads();
+        }
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[3], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[11], 1u);
+        else while (atomicAdd(&ctr[11], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // 2-pass, pass 2: one 32x32 block per head; lane l owns slab l's
+    // max/sum, warp w owns slab w's partial, transposed shared merge,
+    // __frcp_rn of the global sum, bf16 rounding into the staging row.
+    if (blk < NQ_) {
+        const int head = blk;
+        const long long p0 = (long long)head * 32;
+        const float bmax = pmaxs[p0 + lane];
+        float new_max = bmax;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            new_max = fmaxf(new_max,
+                            __shfl_xor_sync(0xffffffffu, new_max, off));
+        const float factor = exp2f(bmax - new_max);
+        float se = psums[p0 + lane] * factor;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            se += __shfl_xor_sync(0xffffffffu, se, off);
+        se = (se == 0.0f) ? 0.0f : __frcp_rn(se);
+        float o[VPL];
+        #pragma unroll
+        for (int i = 0; i < VPL; ++i)
+            o[i] = partials[(p0 + warp) * HD + VPL * lane + i];
+        #pragma unroll
+        for (int i = 0; i < VPL; ++i) {
+            outs[lane][warp] = o[i];
+            __syncthreads();
+            float ot = outs[warp][lane] * factor;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                ot += __shfl_xor_sync(0xffffffffu, ot, off);
+            o[i] = ot * se;
+            __syncthreads();
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i)
+                sto[head * HD + VPL * warp + i] = static_cast<float>(
+                    static_cast<T_>(o[i]));
+        }
+    }
     }
 
     __threadfence();
@@ -3426,6 +3575,12 @@ class _AttnMegaState:
     The stock cache object stays the source of truth for counters; the
     buffers here are the truth for contents while the fused path runs, and
     are written back whenever the layer leaves the fused regime.
+
+    The device buffers must NEVER be reassigned once the megakernel has
+    seen them: a python-side slice assignment copies-on-write into a fresh
+    buffer, and the kernel's const_cast appends then land in the orphaned
+    one.  All (re)seeding therefore goes through _attn_seed_kernel, which
+    writes into the very input buffers the megakernel reads.
     """
 
     __slots__ = ("kbuf", "vbuf", "ctr", "cap", "synced_offset")
@@ -3437,6 +3592,69 @@ class _AttnMegaState:
         mx.eval(self.kbuf, self.vbuf, self.ctr)
         self.cap = cap
         self.synced_offset = -1
+
+
+# Seeds the persistent attention-mega buffers in place: copies n rows of
+# K/V per kv-head from the stock cache slices and stamps the three live
+# counters, all through const_cast writes into the kernel INPUTS so their
+# device pointers never change.
+_ATTN_SEED_SOURCE = r"""
+    constexpr int HD = 128;
+    const int n = static_cast<int>(meta[0]);
+    T_* kd = const_cast<T_*>(kbuf);
+    T_* vd = const_cast<T_*>(vbuf);
+    const long long total = (long long)KVH_ * n * HD;
+    for (long long i = (long long)blockIdx.x * THREADS_ + threadIdx.x;
+         i < total; i += (long long)GRID_ * THREADS_) {
+        const int h = (int)(i / ((long long)n * HD));
+        const long long r = i - (long long)h * n * HD;
+        const int row = (int)(r / HD);
+        const int j = (int)(r - (long long)row * HD);
+        const long long dst = ((long long)h * CAP_ + row) * HD + j;
+        kd[dst] = ks[i];
+        vd[dst] = vs[i];
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        float* live = const_cast<float*>(ctr);
+        live[0] = meta[1];
+        live[1] = meta[2];
+        live[2] = meta[3];
+    }
+"""
+
+_attn_seed_kernel_cache = {}
+
+
+def _attn_seed_kernel():
+    kernel = _attn_seed_kernel_cache.get("k")
+    if kernel is None:
+        kernel = _attn_seed_kernel_cache["k"] = mx.fast.cuda_kernel(
+            name="maple_attn_seed",
+            input_names=["kbuf", "vbuf", "ctr", "ks", "vs", "meta"],
+            output_names=["ok"],
+            source=_ATTN_SEED_SOURCE,
+        )
+    return kernel
+
+
+def _attn_seed(state, keys_src, values_src, pos, kl, slot, dtype):
+    """Copy the stock rows and stamp counters without moving any buffer."""
+    n = keys_src.shape[2] if keys_src is not None else 0
+    if n == 0:
+        keys_src = mx.zeros((1, state.kbuf.shape[1], 1, 128), dtype)
+        values_src = keys_src
+        n = 0
+    meta = mx.array([float(n), float(pos), float(kl), float(slot)],
+                    mx.float32)
+    (ok,) = _attn_seed_kernel()(
+        inputs=[state.kbuf, state.vbuf, state.ctr,
+                keys_src.astype(dtype), values_src.astype(dtype), meta],
+        template=[("T_", dtype), ("KVH_", int(state.kbuf.shape[1])),
+                  ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
+        grid=(64 * 256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(1,)], output_dtypes=[mx.float32],
+    )
+    mx.eval(ok)
 
 
 def _attn_mega_call(layer, hn, c):
@@ -3472,16 +3690,61 @@ def _attn_mega_call(layer, hn, c):
         return None
 
     state = getattr(attn, "_mega_state", None)
-    cap = c.max_size if rotating else 1024
-    if state is None or state.cap != cap:
-        state = _AttnMegaState(attn.num_key_value_heads, cap, hn.dtype)
-        attn._mega_state = state
+    if rotating:
+        cap = c.max_size
+        if state is None or state.cap != cap:
+            state = _AttnMegaState(attn.num_key_value_heads, cap, hn.dtype)
+            attn._mega_state = state
+    else:
+        # Full-attention layers grow: start at 1024 (the 1-pass limit) and
+        # double up to 8192 -- each step is one recompile/regraph, and the
+        # kernel's 2-pass branch covers everything past 1024.
+        needed = c.offset + 1
+        if needed > 8192:
+            _attn_mega_writeback(attn, c)
+            return None
+        if state is None:
+            cap = 1024
+            while cap < needed:
+                cap *= 2
+            state = _AttnMegaState(attn.num_key_value_heads, cap, hn.dtype)
+            attn._mega_state = state
+        elif needed > state.cap:
+            cap = state.cap
+            while cap < needed:
+                cap *= 2
+            grown = _AttnMegaState(attn.num_key_value_heads, cap, hn.dtype)
+            if state.synced_offset == c.offset and state.synced_offset > 0:
+                # Mid-fused-run growth: the stock cache is stale, so carry
+                # our own buffers over and reseed the on-device counters.
+                n = min(state.synced_offset, state.cap)
+                _attn_seed(grown, state.kbuf[..., :n, :],
+                           state.vbuf[..., :n, :],
+                           c.offset, c.offset + 1, c.offset, hn.dtype)
+                grown.synced_offset = c.offset
+            # Otherwise stay fresh (-1); the resync below seeds from the
+            # stock cache, which is current when we are not mid-run.
+            state = grown
+            attn._mega_state = state
+        cap = state.cap
 
     offset = c.offset
+    # After a multi-token _update_concat on an overflowing ring the stock
+    # buffer is TEMPORAL order and longer than the window (max_size + S - 1);
+    # the next stock in-place step trims it to the last max_size rows and
+    # restarts the ring at slot keep(=0).  Mirror that state exactly -- but
+    # only on (re)entry: once synced, the stale stock buffer keeps its
+    # concat shape while our ring and c._idx advance in lockstep.
+    concat_tail = (
+        rotating and state.synced_offset != offset
+        and c.keys is not None and c.keys.shape[2] > cap)
     if rotating:
-        idx = c._idx
-        if idx == c.max_size:
+        if concat_tail:
             idx = 0
+        else:
+            idx = c._idx
+            if idx == c.max_size:
+                idx = 0
         kl_after = min(offset + 1, cap)
         slot = idx
     else:
@@ -3493,18 +3756,19 @@ def _attn_mega_call(layer, hn, c):
 
     if state.synced_offset != offset:
         # (Re)enter the fused regime: copy the stock cache's physical layout
-        # into our buffers and seed the on-device step counters once.
+        # into our buffers and seed the on-device step counters once -- all
+        # kernel-side, so the persistent buffer pointers never move.
+        ks = vs = None
         if c.keys is not None and offset > 0:
-            n = min(c.keys.shape[2], cap)
-            kb, vb = state.kbuf, state.vbuf
-            kb[..., :n, :] = c.keys[..., :n, :].astype(hn.dtype)
-            vb[..., :n, :] = c.values[..., :n, :].astype(hn.dtype)
-            mx.eval(kb, vb)
-        ctr = state.ctr
-        ctr[0] = float(offset)
-        ctr[1] = float(kl_after)
-        ctr[2] = float(slot)
-        mx.eval(ctr)
+            if concat_tail:
+                n_phys = c.keys.shape[2]
+                ks = c.keys[..., n_phys - cap:, :]
+                vs = c.values[..., n_phys - cap:, :]
+            else:
+                n = min(c.keys.shape[2], cap)
+                ks = c.keys[..., :n, :]
+                vs = c.values[..., :n, :]
+        _attn_seed(state, ks, vs, offset, kl_after, slot, hn.dtype)
         state.synced_offset = offset
 
     if attn._qk_w is None:
@@ -3533,7 +3797,8 @@ def _attn_mega_call(layer, hn, c):
                 (1, 1, kh),
                 (16 + (attn.num_attention_heads
                        + 2 * attn.num_key_value_heads) * 128
-                 + attn.num_attention_heads * 128 * 2,),
+                 + attn.num_attention_heads * 128 * 2
+                 + attn.num_attention_heads * 32 * (128 + 2),),
             ],
             output_dtypes=[hn.dtype, mx.float32],
             init_value=0,
