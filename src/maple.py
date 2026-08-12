@@ -109,13 +109,25 @@ _use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 # the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
 _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 
-# The one-dispatch decode attention block.  Default-on after the full
-# battery went green on sm86 and sm89: stream identity 4/4, the
-# window-rotation boundary and the kL>1024 fallback hand-back bit-identical,
-# and throughput up with a much tighter spread (the step stops being
-# hostage to CPU neighbours once ~700 us of host work per step is gone).
-# MAPLE_ATTENTION_MEGAKERNEL=0 restores the stock attention path.
-_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", True)
+# The one-dispatch decode attention block.  The full bit battery is green
+# on sm86/sm89/sm90 (stream identity, the window-rotation boundary, the
+# whole kL>1024 boundary suite incl. cap growth), but the SPEED verdict is
+# per-architecture: +20.6% on sm86 and +42.9% on sm89, while H100 measured
+# a consistent -12..-14% in interleaved in-process pairs at every context
+# length (132 SMs are starved by the 64-block grid).  The default is
+# therefore data-driven: on where the lane is measured faster, off
+# elsewhere until profiled.  An explicit MAPLE_ATTENTION_MEGAKERNEL=0/1
+# always wins over the auto choice.
+_ATTENTION_MEGAKERNEL_FAST_PROFILES = ("sm86", "sm89")
+_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", None)
+
+
+def _attention_megakernel_enabled():
+    if _use_attention_megakernel is not None:
+        return _use_attention_megakernel
+    profile = _cuda_profile()
+    return (profile is not None
+            and profile.name in _ATTENTION_MEGAKERNEL_FAST_PROFILES)
 
 
 def _kernel_backend():
@@ -4211,7 +4223,7 @@ class MapleModel(nn.Module):
                 ln = layer.input_layernorm
                 h, hn = fuse(h, r, ln.weight, ln.eps)
             r = None
-            if _use_attention_megakernel:
+            if _attention_megakernel_enabled():
                 r = _attn_mega_call(layer, hn, c)
             if r is None:
                 r = layer.self_attn(hn, mask, c)

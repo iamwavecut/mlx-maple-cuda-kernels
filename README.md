@@ -29,15 +29,18 @@ number more than the GPU does, so compare within rows, not across them.
 | --- | --- | ---: | ---: | ---: | ---: | --- |
 | RTX 3090 | `sm86` | 152.3 | 176.3 | 345.2 | **+20.6%** (graphs on; +13.3% off) | 8/8 identical |
 | RTX 4090 | `sm89` | 157.7 | 175.8 | 318.8 | **455.7** (+42.9%, spread 454.1-455.8) | 8/8 identical |
-| H100 80GB | `sm90` | 206.8 | 233.5 | **388.6** | — | 8/8 identical |
+| H100 80GB | `sm90` | 206.8 | 233.5 | **388.6** | −12…−14% → auto-off | 8/8 identical |
 | B200 | `sm100` | 141.9 | 322.1 | **358.0** | — | 8/8 identical |
 | RTX 5090 | `sm120` | 242.6 | 217.7 | **381.6** | — | 8/8 identical |
 
 The attention lane is bit-validated everywhere it engages (live per-layer
-probes plus the stream/rotation/boundary suites below); "—" means its
-*performance* on `sm90`/`sm100`/`sm120` is the outstanding follow-up, and
-the sm86 attention absolute was measured only as a paired gain on a shared
-host — the clean-host absolute is the sm89 row. The RTX 4090 spread
+probes plus the stream/rotation/boundary suites, green on sm86/sm89/sm90
+incl. the growth tiers); its default is **per-architecture** — auto-on
+where measured faster (sm86/sm89), auto-off elsewhere (H100 measured a
+consistent −12…−14% in interleaved pairs: 132 SMs starve on the 64-block
+grid), and an explicit `MAPLE_ATTENTION_MEGAKERNEL=0/1` always wins. "—"
+means not yet profiled; the sm86 attention absolute was measured only as a
+paired gain on a shared host — the clean-host absolute is the sm89 row. The RTX 4090 spread
 collapsing to ±1.7 tok/s is the host-bound step disappearing: two
 dispatches per layer leave almost nothing for the host to do. `strict` and
 `off` per-arch values are from the fusion-era campaign of the same
@@ -48,7 +51,7 @@ Lane defaults and their exactness status:
 
 | Path | Default | Status |
 | --- | --- | --- |
-| Attention megakernel (`MAPLE_ATTENTION_MEGAKERNEL`) | **on** | array-exact; the whole decode attention block in one dispatch — fused 2-bit qkv projection, Q/K RMSNorm + partial RoPE, KV-cache append, SDPA, o_proj. kL ≤ 1024 runs the 1-pass SDPA port; longer contexts the 2-pass port, full-attention buffers growing 1024→8192. All (re)seeding is kernel-side so the persistent buffers never move |
+| Attention megakernel (`MAPLE_ATTENTION_MEGAKERNEL`) | **auto** (on: sm86/sm89) | array-exact; the whole decode attention block in one dispatch — fused 2-bit qkv projection, Q/K RMSNorm + partial RoPE, KV-cache append, SDPA, o_proj. kL ≤ 1024 runs the 1-pass SDPA port; longer contexts the 2-pass port, full-attention buffers growing 1024→8192. All (re)seeding is kernel-side so the persistent buffers never move |
 | Exact MoE megakernel (`MAPLE_MOE_MEGAKERNEL_EXACT`) | **on** | array-exact; router, 8 gathered experts, SwiGLU, aggregation, both surrounding add/RMSNorm and the next layer's carrier in one dispatch; stock stream on 8/8 screened prompts on all five architectures |
 | ~1 ULP MoE megakernel (`MAPLE_MOE_MEGAKERNEL`) | **on** (fallback) | within ~1 ULP of bf16; runs only where the exact plan declines (non-standard geometry) |
 | Fused QKV split (`_use_fused_qkv`) | **on** | array-exact by construction; probed live |
@@ -397,6 +400,19 @@ seeding is now kernel-side through the input pointers. Boundary cases A-E
 tier, 2048→4096 growth over 260 tokens) and every legacy regression
 (multi-turn 2/2, rotation 700×2, stream 4×256, chained cache) are
 bit-identical.
+
+### 14. 2026-08-12 — the multi-arch verdicts and the per-arch default
+
+Clean-pod campaigns: the boundary suite is bit-identical on `sm89` and
+`sm90` (all five cases incl. growth tiers), and the attention lane's gain
+holds past kL=1024 on `sm89` (+2.2…+6.5% in-run at every length up to
+6000). But H100 measured a consistent **−12…−14%** in interleaved pairs —
+132 SMs starve on the 64-block grid — so the lane's default became
+data-driven: auto-on for `sm86`/`sm89`, auto-off elsewhere until profiled,
+explicit env always winning. The same day the multi-token chain idea was
+honestly killed: bits identical at every L, but against the stock async
+double-buffer it loses (351.5 vs 296-348) — after the two-dispatch layer
+the wall is GPU time, and host-side batching is exhausted.
 
 ## NVIDIA QuickStart
 
