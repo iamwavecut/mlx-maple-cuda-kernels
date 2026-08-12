@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..cc58710 100644
+index a0673f7..a271dfb 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index a0673f7..cc58710 100644
  from dataclasses import dataclass
  from functools import partial
  from typing import Any, List, Optional
-@@ -17,32 +19,222 @@ from mlx_lm.models.base import (
+@@ -17,32 +19,234 @@ from mlx_lm.models.base import (
  )
  from mlx_lm.models.cache import KVCache, RotatingKVCache
  from mlx_lm.models.rope_utils import initialize_rope
@@ -105,13 +105,25 @@ index a0673f7..cc58710 100644
 +# the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
 +_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 +
-+# The one-dispatch decode attention block.  Default-on after the full
-+# battery went green on sm86 and sm89: stream identity 4/4, the
-+# window-rotation boundary and the kL>1024 fallback hand-back bit-identical,
-+# and throughput up with a much tighter spread (the step stops being
-+# hostage to CPU neighbours once ~700 us of host work per step is gone).
-+# MAPLE_ATTENTION_MEGAKERNEL=0 restores the stock attention path.
-+_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", True)
++# The one-dispatch decode attention block.  The full bit battery is green
++# on sm86/sm89/sm90 (stream identity, the window-rotation boundary, the
++# whole kL>1024 boundary suite incl. cap growth), but the SPEED verdict is
++# per-architecture: +20.6% on sm86 and +42.9% on sm89, while H100 measured
++# a consistent -12..-14% in interleaved in-process pairs at every context
++# length (132 SMs are starved by the 64-block grid).  The default is
++# therefore data-driven: on where the lane is measured faster, off
++# elsewhere until profiled.  An explicit MAPLE_ATTENTION_MEGAKERNEL=0/1
++# always wins over the auto choice.
++_ATTENTION_MEGAKERNEL_FAST_PROFILES = ("sm86", "sm89")
++_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", None)
++
++
++def _attention_megakernel_enabled():
++    if _use_attention_megakernel is not None:
++        return _use_attention_megakernel
++    profile = _cuda_profile()
++    return (profile is not None
++            and profile.name in _ATTENTION_MEGAKERNEL_FAST_PROFILES)
 +
 +
 +def _kernel_backend():
@@ -246,7 +258,7 @@ index a0673f7..cc58710 100644
      """
      try:
          got, want = fast(), reference()
-@@ -51,9 +243,8 @@ def _matches(fast, reference, tol=2e-2):
+@@ -51,9 +255,8 @@ def _matches(fast, reference, tol=2e-2):
          return False
      return len(got) == len(want) and all(
          g.shape == w.shape
@@ -258,7 +270,7 @@ index a0673f7..cc58710 100644
          for g, w in zip(got, want)
      )
  
-@@ -123,24 +314,129 @@ def _make_add_rms_norm_kernel(eps):
+@@ -123,24 +326,129 @@ def _make_add_rms_norm_kernel(eps):
      )
  
  
@@ -395,7 +407,7 @@ index a0673f7..cc58710 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -154,6 +450,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
+@@ -154,6 +462,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
      )
  
  
@@ -525,7 +537,7 @@ index a0673f7..cc58710 100644
  # Inlined rather than imported from switch_layers: those helpers are private
  # (underscore-prefixed), and this file must keep loading against whatever
  # mlx-lm a user has installed when it ships inside a checkpoint.
-@@ -226,7 +645,7 @@ def _make_qk_norm_rope_kernel():
+@@ -226,7 +657,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -534,7 +546,7 @@ index a0673f7..cc58710 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +682,244 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +694,244 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -780,7 +792,7 @@ index a0673f7..cc58710 100644
  
  
  class MapleAttention(nn.Module):
-@@ -293,15 +949,23 @@ class MapleAttention(nn.Module):
+@@ -293,15 +961,23 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -804,7 +816,7 @@ index a0673f7..cc58710 100644
              self.rope = initialize_rope(
                  rope_dim,
                  args.rope_theta,
-@@ -310,45 +974,61 @@ class MapleAttention(nn.Module):
+@@ -310,45 +986,61 @@ class MapleAttention(nn.Module):
                  max_position_embeddings=args.max_position_embeddings,
              )
  
@@ -894,7 +906,7 @@ index a0673f7..cc58710 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -369,20 +1049,48 @@ class MapleAttention(nn.Module):
+@@ -369,20 +1061,48 @@ class MapleAttention(nn.Module):
      ) -> mx.array:
          B, L, _ = x.shape
  
@@ -946,7 +958,7 @@ index a0673f7..cc58710 100644
              out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
              queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
              keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-@@ -409,6 +1117,9 @@ class MapleAttention(nn.Module):
+@@ -409,6 +1129,9 @@ class MapleAttention(nn.Module):
                  queries = self.rope(queries, offset=offset)
                  keys = self.rope(keys, offset=offset)
  
@@ -956,7 +968,7 @@ index a0673f7..cc58710 100644
          if cache is not None:
              keys, values = cache.update_and_fetch(keys, values)
  
-@@ -419,6 +1130,48 @@ class MapleAttention(nn.Module):
+@@ -419,6 +1142,48 @@ class MapleAttention(nn.Module):
          output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
          return self.o_proj(output)
  
@@ -1005,7 +1017,7 @@ index a0673f7..cc58710 100644
  
  class MapleMLP(nn.Module):
      def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-@@ -618,7 +1371,335 @@ def _make_fused_router_kernel():
+@@ -618,7 +1383,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -1342,7 +1354,7 @@ index a0673f7..cc58710 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1714,84 @@ class MapleGate(nn.Module):
+@@ -633,23 +1726,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -1441,7 +1453,7 @@ index a0673f7..cc58710 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -659,6 +1801,19 @@ class MapleGate(nn.Module):
+@@ -659,6 +1813,19 @@ class MapleGate(nn.Module):
          gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
          return group_expert_select(gates, self.top_k)
  
@@ -1461,7 +1473,7 @@ index a0673f7..cc58710 100644
      def _probe(self, x):
          # Not _matches(): the two paths may order the selected experts
          # differently, and an exact tie at the top-k boundary may legitimately
-@@ -670,13 +1825,34 @@ class MapleGate(nn.Module):
+@@ -670,13 +1837,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -1499,7 +1511,7 @@ index a0673f7..cc58710 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1871,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,6 +1883,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -1643,7 +1655,7 @@ index a0673f7..cc58710 100644
  class MapleSwitchGLU(nn.Module):
      """SwitchGLU with the up and gate projections fused into one gather
      matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +2018,78 @@ class MapleSwitchGLU(nn.Module):
+@@ -705,8 +2030,78 @@ class MapleSwitchGLU(nn.Module):
              input_dims, 2 * hidden_dims, num_experts, bias=bias
          )
          self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
@@ -1722,7 +1734,7 @@ index a0673f7..cc58710 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,16 +2098,1995 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2110,1995 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -3720,7 +3732,7 @@ index a0673f7..cc58710 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +4154,86 @@ class MapleModel(nn.Module):
+@@ -792,29 +4166,86 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -3786,7 +3798,7 @@ index a0673f7..cc58710 100644
 +                ln = layer.input_layernorm
 +                h, hn = fuse(h, r, ln.weight, ln.eps)
 +            r = None
-+            if _use_attention_megakernel:
++            if _attention_megakernel_enabled():
 +                r = _attn_mega_call(layer, hn, c)
 +            if r is None:
 +                r = layer.self_attn(hn, mask, c)
@@ -3815,7 +3827,7 @@ index a0673f7..cc58710 100644
  
      def __call__(
          self,
-@@ -836,12 +4255,29 @@ class MapleModel(nn.Module):
+@@ -836,12 +4267,29 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
@@ -3847,7 +3859,7 @@ index a0673f7..cc58710 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -1021,6 +4457,32 @@ class Model(nn.Module):
+@@ -1021,6 +4469,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -3880,7 +3892,7 @@ index a0673f7..cc58710 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +4501,8 @@ class Model(nn.Module):
+@@ -1039,8 +4513,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
