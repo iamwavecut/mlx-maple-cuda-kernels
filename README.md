@@ -97,9 +97,9 @@ not benchmark on a shared device. Full list in
 - [`results/`](results/) — evidence: campaign records, provenance
   manifests, per-architecture artifacts.
 - Provenance: [`src/maple.py`](src/maple.py) SHA-256
-  `9f8f933fc454570fabf5bd8076987fe633b560d994fb528bf838a7579fbf211d`,
+  `1e6300f5d021812c65db647b048d6ea892be3971721270a44e00a02a260c2b3b`,
   patch SHA-256
-  `2f900fae98789fdc8639f295281278064e2d1cd81f490a0983cc3a12135fe06f`.
+  `690f77ed8aa2bda79498fb8a105b0211e0310148b35b5fb99a6cc81234be3dbf`.
 
 ## License
 
