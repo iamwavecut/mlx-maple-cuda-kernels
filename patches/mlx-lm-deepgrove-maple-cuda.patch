@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..db1e638 100644
+index a0673f7..3afb600 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,7 @@
@@ -894,7 +894,25 @@ index a0673f7..db1e638 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -375,14 +1055,30 @@ class MapleAttention(nn.Module):
+@@ -369,20 +1049,48 @@ class MapleAttention(nn.Module):
+     ) -> mx.array:
+         B, L, _ = x.shape
+ 
++        # Any stock-path call that will touch the cache must first flush the
++        # attention megakernel's buffers back into it: during fused decode
++        # the stock buffers go stale, and a multi-turn prefill would other-
++        # wise concatenate against history that is missing our appends.
++        state = getattr(self, "_mega_state", None)
++        if (
++            cache is not None
++            and state is not None
++            and state.synced_offset >= 0
++        ):
++            _attn_mega_writeback(self, cache)
++
+         qkv = self.qkv_proj(x)
+ 
+         if B == 1 and L == 1 and self.use_qk_norm:
              n_q = self.num_attention_heads
              n_kv = self.num_key_value_heads
              qk_size = (n_q + n_kv) * self.head_dim
@@ -928,7 +946,7 @@ index a0673f7..db1e638 100644
              out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
              queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
              keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-@@ -409,6 +1105,9 @@ class MapleAttention(nn.Module):
+@@ -409,6 +1117,9 @@ class MapleAttention(nn.Module):
                  queries = self.rope(queries, offset=offset)
                  keys = self.rope(keys, offset=offset)
  
@@ -938,7 +956,7 @@ index a0673f7..db1e638 100644
          if cache is not None:
              keys, values = cache.update_and_fetch(keys, values)
  
-@@ -419,6 +1118,48 @@ class MapleAttention(nn.Module):
+@@ -419,6 +1130,48 @@ class MapleAttention(nn.Module):
          output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
          return self.o_proj(output)
  
@@ -987,7 +1005,7 @@ index a0673f7..db1e638 100644
  
  class MapleMLP(nn.Module):
      def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-@@ -618,7 +1359,335 @@ def _make_fused_router_kernel():
+@@ -618,7 +1371,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -1324,7 +1342,7 @@ index a0673f7..db1e638 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1702,84 @@ class MapleGate(nn.Module):
+@@ -633,23 +1714,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -1379,7 +1397,7 @@ index a0673f7..db1e638 100644
 +            (self.num_experts // 32) * 256
 +            if backend == "metal"
 +            else _cuda_router_grid_size(self.num_experts, profile)
-         )
++        )
 +        template = [
 +            ("T_", self.weight.dtype),
 +            ("NEXP", self.num_experts),
@@ -1391,7 +1409,7 @@ index a0673f7..db1e638 100644
 +            mx.uint32
 +            if backend == "cuda" and _cuda_router_indices_uint32
 +            else mx.int32
-+        )
+         )
 +        if backend == "cuda":
 +            # The multi-block completion counter is a zero-initialized output,
 +            # not hidden mutable input state.  This makes graph dependencies
@@ -1423,7 +1441,7 @@ index a0673f7..db1e638 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -659,6 +1789,19 @@ class MapleGate(nn.Module):
+@@ -659,6 +1801,19 @@ class MapleGate(nn.Module):
          gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
          return group_expert_select(gates, self.top_k)
  
@@ -1443,7 +1461,7 @@ index a0673f7..db1e638 100644
      def _probe(self, x):
          # Not _matches(): the two paths may order the selected experts
          # differently, and an exact tie at the top-k boundary may legitimately
-@@ -670,13 +1813,34 @@ class MapleGate(nn.Module):
+@@ -670,13 +1825,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -1481,7 +1499,7 @@ index a0673f7..db1e638 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1859,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,6 +1871,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -1625,7 +1643,7 @@ index a0673f7..db1e638 100644
  class MapleSwitchGLU(nn.Module):
      """SwitchGLU with the up and gate projections fused into one gather
      matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +2006,78 @@ class MapleSwitchGLU(nn.Module):
+@@ -705,8 +2018,78 @@ class MapleSwitchGLU(nn.Module):
              input_dims, 2 * hidden_dims, num_experts, bias=bias
          )
          self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
@@ -1704,7 +1722,7 @@ index a0673f7..db1e638 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,16 +2086,1730 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2098,1730 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -3437,7 +3455,7 @@ index a0673f7..db1e638 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +3877,86 @@ class MapleModel(nn.Module):
+@@ -792,29 +3889,86 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -3532,7 +3550,7 @@ index a0673f7..db1e638 100644
  
      def __call__(
          self,
-@@ -836,12 +3978,29 @@ class MapleModel(nn.Module):
+@@ -836,12 +3990,29 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
@@ -3564,7 +3582,7 @@ index a0673f7..db1e638 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -1021,6 +4180,32 @@ class Model(nn.Module):
+@@ -1021,6 +4192,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -3597,7 +3615,7 @@ index a0673f7..db1e638 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +4224,8 @@ class Model(nn.Module):
+@@ -1039,8 +4236,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.

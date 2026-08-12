@@ -1049,6 +1049,18 @@ class MapleAttention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
+        # Any stock-path call that will touch the cache must first flush the
+        # attention megakernel's buffers back into it: during fused decode
+        # the stock buffers go stale, and a multi-turn prefill would other-
+        # wise concatenate against history that is missing our appends.
+        state = getattr(self, "_mega_state", None)
+        if (
+            cache is not None
+            and state is not None
+            and state.synced_offset >= 0
+        ):
+            _attn_mega_writeback(self, cache)
+
         qkv = self.qkv_proj(x)
 
         if B == 1 and L == 1 and self.use_qk_norm:
