@@ -25,13 +25,14 @@ ap.add_argument("--prompt-seed", type=int, default=20260806)
 a = ap.parse_args()
 
 parts = set(a.mode.split("+"))
-if "strict" in parts or "fast" in parts or "exact" in parts:
+if parts & {"strict", "fast", "exact", "attn"}:
     parts |= {"norm", "qkv"}
 maple._use_fused_add_rms = "norm" in parts
 maple._use_fused_qkv = "qkv" in parts
 maple._use_compiled_router = "router" in parts
 maple._use_moe_megakernel = "fast" in parts
-maple._use_moe_megakernel_exact = "exact" in parts
+maple._use_moe_megakernel_exact = ("exact" in parts) or ("attn" in parts)
+maple._use_attention_megakernel = "attn" in parts
 if "fast" in parts:
     # the megakernel absorbs the router, so the compiled one never runs
     maple._use_compiled_router = False

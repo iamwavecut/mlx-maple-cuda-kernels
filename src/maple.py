@@ -109,9 +109,13 @@ _use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 # the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
 _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 
-# Research flag: the one-dispatch decode attention block.  Off by default
-# until it survives the full stream screen.
-_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", False)
+# The one-dispatch decode attention block.  Default-on after the full
+# battery went green on sm86 and sm89: stream identity 4/4, the
+# window-rotation boundary and the kL>1024 fallback hand-back bit-identical,
+# and throughput up with a much tighter spread (the step stops being
+# hostage to CPU neighbours once ~700 us of host work per step is gone).
+# MAPLE_ATTENTION_MEGAKERNEL=0 restores the stock attention path.
+_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", True)
 
 
 def _kernel_backend():

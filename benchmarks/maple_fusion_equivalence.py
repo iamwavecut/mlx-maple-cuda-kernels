@@ -44,7 +44,11 @@ def configure(mode):
     maple._use_fused_qkv = mode != "off"
     maple._use_compiled_router = mode != "off"
     maple._use_moe_megakernel = mode == "fast"
-    maple._use_moe_megakernel_exact = mode == "exact"
+    maple._use_moe_megakernel_exact = mode in ("exact", "exact+attn")
+    maple._use_attention_megakernel = mode == "exact+attn"
+    for l in model.model.layers:
+        if hasattr(l.self_attn, "_mega_state"):
+            del l.self_attn._mega_state
     model.model._exact_add_norm = None
     for l in model.model.layers:
         l.self_attn._split_qkv = None
@@ -60,7 +64,8 @@ def gen(p):
 
 summary = {"strict": {"prompts": 0, "identical": 0, "mismatches": []},
            "fast": {"prompts": 0, "identical": 0, "mismatches": []},
-           "exact": {"prompts": 0, "identical": 0, "mismatches": []}}
+           "exact": {"prompts": 0, "identical": 0, "mismatches": []},
+           "exact+attn": {"prompts": 0, "identical": 0, "mismatches": []}}
 unstable = []
 for name, prompt in prompts:
     configure("off")
@@ -72,7 +77,7 @@ for name, prompt in prompts:
             stable = min(stable, m)
     if stable < a.gen:
         unstable.append({"prompt": name, "reference_stable_up_to": stable})
-    for mode in ("strict", "fast", "exact"):
+    for mode in ("strict", "fast", "exact", "exact+attn"):
         configure(mode)
         cand = gen(prompt)
         s = summary[mode]
@@ -83,5 +88,5 @@ for name, prompt in prompts:
         else:
             s["mismatches"].append({"prompt": name, "index": m})
 print(json.dumps({"reference_unstable": unstable}), flush=True)
-for mode in ("strict", "fast", "exact"):
+for mode in ("strict", "fast", "exact", "exact+attn"):
     print(json.dumps({"mode": mode, **summary[mode]}), flush=True)

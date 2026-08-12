@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Made the attention megakernel the default decode path** after the full
+  battery went green on sm86 and sm89 (stream identity, the rotation
+  boundary, the kL>1024 fallback hand-back, throughput up with a collapsed
+  spread on every card). A decode layer is now two dispatches: the attention
+  block and the exact MoE block. `MAPLE_ATTENTION_MEGAKERNEL=0` restores the
+  stock attention path.
 - Attention megakernel (`MAPLE_ATTENTION_MEGAKERNEL=1`, research): the whole
   decode attention block — 2-bit qkv projection on the qmv recipe, per-head
   RMSNorm + partial RoPE, KV-cache append into caller-owned buffers that
