@@ -65,10 +65,22 @@ n-gram sits below that on average; prompt-lookup on agent traffic is the
 bet worth measuring first — instrument acceptance on real service logs
 before building the kernels.
 
+## First acceptance numbers (2026-08-12)
+
+Five prod-generated agent streams through the offline simulator
+(`benchmarks`-adjacent `acceptance_lab.py`; grid k∈{2,3,4} × L∈{4,8,16}):
+best mean 1.678 tokens/pass at k=2, L=16 — carried by copy-heavy traffic
+(code refactor: **4.11**, JSON extract 1.27) while quoting/freeform sit at
+~1.0. Above the ~1.4 break-even exactly where Maple serves agent loops;
+the corpus is small, so the next measurement round should be dozens of
+real streams before kernel work starts. Side effect of collecting them:
+the cross-request isolation incident (chronicle #17) — found, mitigated,
+and gated behind the LRU repro.
+
 ## Order of work for the next cycle
 
-1. Measure prompt-lookup acceptance offline against recorded service
-   streams (no kernels needed — pure Python over token logs).
+1. Extend the acceptance corpus to dozens of real service streams (the
+   collection+tokenize+simulate pipeline exists).
 2. If A clears ~1.5 on real traffic: build the L-row router/qmv ports and
    pin their bits (the recipes are per-token independent — expect clean
    ports).
