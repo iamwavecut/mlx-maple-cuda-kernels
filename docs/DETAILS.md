@@ -430,3 +430,20 @@ bit for bit — speculation can keep the project's exactness invariant. The
 design and break-even arithmetic live in `SPECULATION-DESIGN.md`; the
 first step of the next cycle is measuring prompt-lookup acceptance on
 real service streams, no kernels required.
+
+### 17. 2026-08-12 — the cross-request isolation incident
+
+Collecting acceptance streams found it: chained prod requests returned the
+previous request's answer byte-for-byte. Three mechanisms deep: the mega
+state outlives per-request cache objects (fixed with weakref binding and a
+write refusal for unbound caches); the serving LRU deep-copies, stores and
+trims caches while the lane's buffers were lazily unsynced (fixed with
+live zero-copy views each step plus materialize-on-unbind); and — still
+open — stock cache code picks paths off the PHYSICAL buffer shape
+(256-row growth blocks), which exact-length buffers alter: the LRU repro
+(`benchmarks/maple_lru_service_repro.py`) still diverges at the third
+generated token with every per-layer shadow bit-clean. The lane is
+**opt-in** (`MAPLE_ATTENTION_MEGAKERNEL=1`) until that repro is green;
+the fix direction is a physical-shape invariant — publish views and
+materializations at the stock-grown shape. All other suites stay green
+and the sm89 A/B holds 390→440 with the views in place.

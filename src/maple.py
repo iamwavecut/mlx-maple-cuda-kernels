@@ -2,6 +2,7 @@
 
 import math
 import os
+import weakref
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, List, Optional
@@ -118,6 +119,15 @@ _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 # therefore data-driven: on where the lane is measured faster, off
 # elsewhere until profiled.  An explicit MAPLE_ATTENTION_MEGAKERNEL=0/1
 # always wins over the auto choice.
+# OPT-IN until the LRU physical-shape invariant lands: serving stacks that
+# store, deep-copy and trim cache objects between requests (mlx-lm's
+# LRUPromptCache) pick code paths off the PHYSICAL buffer shape, and the
+# lane's materialized/viewed buffers are exact-length rather than
+# stock-shaped (grown in 256-row blocks).  Every fused computation is
+# bit-exact in isolation -- the boundary, rotation, stream and multi-turn
+# suites are green -- but the cross-request LRU repro
+# (benchmarks/maple_lru_service_repro.py) still diverges, and a lane that
+# can interact with request isolation stays off until that repro is green.
 _ATTENTION_MEGAKERNEL_FAST_PROFILES = ("sm86", "sm89")
 _use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", None)
 
@@ -125,9 +135,7 @@ _use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", None)
 def _attention_megakernel_enabled():
     if _use_attention_megakernel is not None:
         return _use_attention_megakernel
-    profile = _cuda_profile()
-    return (profile is not None
-            and profile.name in _ATTENTION_MEGAKERNEL_FAST_PROFILES)
+    return False
 
 
 def _kernel_backend():
@@ -3595,7 +3603,7 @@ class _AttnMegaState:
     writes into the very input buffers the megakernel reads.
     """
 
-    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "synced_offset")
+    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "synced_offset", "cache_ref")
 
     def __init__(self, kv_heads, cap, dtype):
         self.kbuf = mx.zeros((1, kv_heads, cap, 128), dtype)
@@ -3604,6 +3612,27 @@ class _AttnMegaState:
         mx.eval(self.kbuf, self.vbuf, self.ctr)
         self.cap = cap
         self.synced_offset = -1
+        self.cache_ref = None
+
+    def bound_to(self, c):
+        return self.cache_ref is not None and self.cache_ref() is c
+
+    def bind(self, c):
+        if self.bound_to(c):
+            return
+        # A different cache object means a different request. Two duties:
+        # the OLD cache may live on (the service's LRU stores it) and its
+        # keys are zero-copy views into our buffers, which the new request
+        # is about to overwrite -- materialize its history first. And our
+        # sync is meaningless for the new cache -- resync from it instead.
+        old = self.cache_ref() if self.cache_ref is not None else None
+        if old is not None and self.synced_offset > 0:
+            n = min(self.synced_offset, self.cap)
+            old.keys = mx.contiguous(self.kbuf[..., :n, :])
+            old.values = mx.contiguous(self.vbuf[..., :n, :])
+            mx.eval(old.keys, old.values)
+        self.synced_offset = -1
+        self.cache_ref = weakref.ref(c)
 
 
 # Seeds the persistent attention-mega buffers in place: copies n rows of
@@ -3702,11 +3731,14 @@ def _attn_mega_call(layer, hn, c):
         return None
 
     state = getattr(attn, "_mega_state", None)
+    if state is not None:
+        state.bind(c)
     if rotating:
         cap = c.max_size
         if state is None or state.cap != cap:
             state = _AttnMegaState(attn.num_key_value_heads, cap, hn.dtype)
             attn._mega_state = state
+            state.bind(c)
     else:
         # Full-attention layers grow: start at 1024 (the 1-pass limit) and
         # double up to 8192 -- each step is one recompile/regraph, and the
@@ -3721,6 +3753,7 @@ def _attn_mega_call(layer, hn, c):
                 cap *= 2
             state = _AttnMegaState(attn.num_key_value_heads, cap, hn.dtype)
             attn._mega_state = state
+            state.bind(c)
         elif needed > state.cap:
             cap = state.cap
             while cap < needed:
@@ -3736,6 +3769,7 @@ def _attn_mega_call(layer, hn, c):
                 grown.synced_offset = c.offset
             # Otherwise stay fresh (-1); the resync below seeds from the
             # stock cache, which is current when we are not mid-run.
+            grown.cache_ref = state.cache_ref
             state = grown
             attn._mega_state = state
         cap = state.cap
@@ -3819,11 +3853,17 @@ def _attn_mega_call(layer, hn, c):
     except (RuntimeError, TypeError, ValueError):
         return None
 
-    # Advance the stock counters exactly as update_and_fetch would; the
-    # buffers themselves are stale until write-back.
+    # Advance the stock counters exactly as update_and_fetch would, and
+    # leave the stock buffers as LIVE zero-copy views into ours: anything
+    # that deep-copies, stores or trims this cache object between calls
+    # (the service's LRU prompt cache does all three) then sees the real
+    # history instead of a stale snapshot -- that staleness is exactly how
+    # one request's context leaked into another's answer.
     c.offset = offset + 1
     if rotating:
         c._idx = slot + 1
+    c.keys = state.kbuf[..., :kl_after, :]
+    c.values = state.vbuf[..., :kl_after, :]
     state.synced_offset = offset + 1  # our buffers are current for this offset
     return out
 
@@ -3837,6 +3877,13 @@ def _attn_mega_writeback(attn, c):
     """
     state = getattr(attn, "_mega_state", None)
     if state is None or state.synced_offset < 0:
+        return
+    if not state.bound_to(c):
+        # A fresh request reuses the module but not the cache object; our
+        # buffers belong to the previous conversation. Writing them here
+        # is exactly the way one user's context leaks into another's
+        # answer -- drop the sync instead.
+        state.synced_offset = -1
         return
     n = min(state.synced_offset, state.cap)
     if n > 0:

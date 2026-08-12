@@ -73,10 +73,45 @@ CASES = {
     "B_start_past_1024": dict(plen=1500, steps=40),
     "C_writeback_regrow": dict(plen=1000, steps=40, plen2=200, steps2=40),
 }
+
+
+def run_fresh_cache_pair(attn_on, seed):
+    """Two independent requests on one model: fresh caches, live state.
+
+    This is the service pattern that leaked one user's context into the
+    next answer: the megakernel state outlives the per-request cache
+    object, and an unbound write-back used to inject the previous
+    request's KV history into the new empty cache.
+    """
+    maple._use_attention_megakernel = attn_on
+    for l in inner.layers:
+        if hasattr(l.self_attn, "_mega_state"):
+            del l.self_attn._mega_state
+    outs = []
+    for r in range(2):
+        mx.random.seed(seed + 17 * r)
+        p = mx.random.randint(0, vocab, (1, 96 + 40 * r))
+        mx.eval(p)
+        cache = make_prompt_cache(model)
+        out = model(p, cache=cache); mx.eval(out)
+        y = mx.argmax(out[:, -1, :], axis=-1, keepdims=True); mx.eval(y)
+        toks = [int(y.item())]
+        for _ in range(24):
+            out = model(y, cache=cache); mx.eval(out)
+            y = mx.argmax(out[:, -1, :], axis=-1, keepdims=True); mx.eval(y)
+            toks.append(int(y.item()))
+        outs.append(toks)
+    return outs
 if args.long:
     CASES["D_start_at_4096"] = dict(plen=3800, steps=40)
     CASES["E_grow_2048_4096"] = dict(plen=1900, steps=260)
 rep = {}
+ref_pair = run_fresh_cache_pair(False, 8800)
+got_pair = run_fresh_cache_pair(True, 8800)
+rep["F_fresh_cache_reuse"] = {
+    "request2_identical": ref_pair[1] == got_pair[1],
+    "request1_identical": ref_pair[0] == got_pair[0],
+}
 for name, kw in CASES.items():
     seed = 4200 + len(name)
     ref = run(False, seed, **kw)
