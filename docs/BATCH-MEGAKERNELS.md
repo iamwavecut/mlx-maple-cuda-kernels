@@ -104,3 +104,23 @@ E rides the existing recipe. Then the gate swap in `MapleModel.__call__`
 - [ ] Per-B service suites (LRU isolation at B>1) before any default.
 - [ ] The end-to-end curve — the judge is aggregate tok/s vs stock
   (289/472/642 at B=1/4/8 on sm89).
+
+## E2E wiring round 1 (2026-08-13): lane landed opt-in, gate is RED
+
+`MAPLE_BATCH_MEGAKERNELS=1` wires both proven kernels behind the stock
+per-layer structure (`_decode_batch_fused`, `_attn_mega_call_batch`,
+`_moe_batch_call`); default stays off. The E2E gate
+(`maple_batch_e2e_check.py`) prefills each row SOLO, merges the caches on
+the batch axis, then requires every batched-decode row to equal its solo
+stream. Verdict: RED — and the control row is the discovery: **stock
+batched decode fails the same gate** (2/4 at B4, 4/8 at B8), so the
+batched tails outside our kernels (lm_head, embeddings) are not
+row-independent at the bit level. Our lane is additionally worse (0/4 at
+B4) — a wiring bug of its own on top. Aggregate tok/s (graphs off):
+mega 262/341/294 vs stock 231/370/344 at B=2/4/8.
+
+Debug order: (1) microscope one diverging row at B=2 layer by layer
+(batch-vs-solo capture, the lru_microscope pattern) to find the first
+diverging stage; (2) decide the tail strategy — per-row lm_head loop
+(cheap at B<=8) vs a row-exact batched port; (3) re-gate, then the curve
+with graphs on stock-side.

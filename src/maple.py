@@ -110,6 +110,14 @@ _use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 # the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
 _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 
+# The batch (2 <= B <= 8) decode lane: both proven M=B megakernels behind
+# the stock per-layer structure.  Research opt-in until the per-B service
+# suites and the aggregate curve land; requires MLX_USE_CUDA_GRAPHS=0
+# (the AB/CD pair trips graph capture) and covers kL <= 1024 (the pair
+# carries the 1-pass SDPA port only) -- layers past that fall back to the
+# stock path for the step, per layer, with an exact writeback.
+_use_batch_megakernels = _env_flag("MAPLE_BATCH_MEGAKERNELS", False)
+
 # The one-dispatch decode attention block.  The full bit battery is green
 # on sm86/sm89/sm90 (stream identity, the window-rotation boundary, the
 # whole kL>1024 boundary suite incl. cap growth), but the SPEED verdict is
@@ -3576,6 +3584,37 @@ def _moe_batch_megakernel_plan(block, ln, dtype, rows, grid=None,
     )
 
 
+def _moe_batch_call(layer, h, r, ln, next_w):
+    """The M=B MoE step; same contract as `_moe_exact_megakernel_call`."""
+    block = layer.mlp
+    rows = h.shape[0]
+    plans = getattr(block, "_batch_megakernel_plans", None)
+    if plans is None:
+        plans = block._batch_megakernel_plans = {}
+    plan = plans.get(rows)
+    if plan is None:
+        try:
+            plan = _moe_batch_megakernel_plan(block, ln, h.dtype, rows)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            plan = False
+        plans[rows] = plan
+    if plan is False:
+        return None
+    kernel, kwargs = plan
+    mlp = block.switch_mlp
+    ug, dp = mlp.up_gate_proj, mlp.down_proj
+    try:
+        hn, hout, _ = kernel(
+            inputs=[h, r, ln.weight, block.gate.weight, ug.weight, ug.scales,
+                    ug.biases, dp.weight, dp.scales, dp.biases, next_w],
+            **kwargs,
+        )
+    except (RuntimeError, TypeError, ValueError):
+        plans[rows] = False
+        return None
+    return hout, hn
+
+
 # The attention megakernel: the whole decode attention block -- qkv gemv,
 # per-head RMSNorm + RoPE, the KV-cache append, single-token SDPA and the
 # output projection -- in one dispatch behind three grid barriers.  Every
@@ -4448,14 +4487,16 @@ class _AttnMegaState:
     writes into the very input buffers the megakernel reads.
     """
 
-    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "synced_offset", "cache_ref")
+    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "rows", "synced_offset",
+                 "cache_ref")
 
-    def __init__(self, kv_heads, cap, dtype):
-        self.kbuf = mx.zeros((1, kv_heads, cap, 128), dtype)
-        self.vbuf = mx.zeros((1, kv_heads, cap, 128), dtype)
+    def __init__(self, kv_heads, cap, dtype, rows=1):
+        self.kbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
+        self.vbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
         self.ctr = mx.zeros((8,), mx.float32)
         mx.eval(self.kbuf, self.vbuf, self.ctr)
         self.cap = cap
+        self.rows = rows
         self.synced_offset = -1
         self.cache_ref = None
 
@@ -4539,10 +4580,13 @@ def _attn_seed(state, keys_src, values_src, pos, kl, slot, dtype):
         n = 0
     meta = mx.array([float(n), float(pos), float(kl), float(slot)],
                     mx.float32)
+    # The copy is a flat walk over (rows*kv_heads, n, 128) planes, so a
+    # batch state simply fuses its leading axes into the plane index.
     (ok,) = _attn_seed_kernel()(
         inputs=[state.kbuf, state.vbuf, state.ctr,
                 keys_src.astype(dtype), values_src.astype(dtype), meta],
-        template=[("T_", dtype), ("KVH_", int(state.kbuf.shape[1])),
+        template=[("T_", dtype),
+                  ("KVH_", int(state.kbuf.shape[0] * state.kbuf.shape[1])),
                   ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
         grid=(64 * 256, 1, 1), threadgroup=(256, 1, 1),
         output_shapes=[(1,)], output_dtypes=[mx.float32],
@@ -4719,6 +4763,157 @@ def _attn_mega_call(layer, hn, c):
     c.values = state.vbuf[..., :phys, :]
     state.synced_offset = offset + 1  # our buffers are current for this offset
     return out
+
+
+def _attn_mega_call_batch(layer, hn, c):
+    """The M=B decode attention step through the AB/CD pair, or None.
+
+    Mirrors `_attn_mega_call`'s state discipline exactly -- persistent
+    buffers seeded kernel-side, stock counters in lockstep, live zero-copy
+    views published each step -- with a leading batch axis everywhere.
+    The pair carries the 1-pass SDPA port only, so kL must stay <= 1024;
+    a layer past that writes back and declines (stock takes the step).
+    """
+    attn = layer.self_attn
+    qkv = attn.qkv_proj
+    op = attn.o_proj
+    B = hn.shape[0]
+    if (
+        _cuda_profile() is None
+        or hn.dtype != mx.bfloat16
+        or attn.head_dim != 128
+        or not attn.use_qk_norm
+        or not attn._can_fuse_qk
+        or attn._fused_qk is not True
+        or getattr(qkv, "bits", None) != 2
+        or getattr(op, "bits", None) != 2
+        or getattr(qkv, "group_size", None) != 128
+        or getattr(op, "group_size", None) != 128
+        or getattr(qkv, "mode", "affine") != "affine"
+        or getattr(qkv, "biases", None) is None
+        or getattr(op, "biases", None) is None
+        or "bias" in qkv or "bias" in op
+        or hn.shape[-1] % 512 != 0
+        or (attn.num_attention_heads * 128) % 512 != 0
+    ):
+        return None
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    rotating = isinstance(c, RotatingKVCache)
+    if not rotating and not isinstance(c, KVCache):
+        return None
+    if rotating and (c.keep != 0 or c.max_size is None):
+        return None
+
+    state = getattr(attn, "_mega_state", None)
+    if state is not None and state.rows != B:
+        state.materialize_old()
+        state = None
+        attn._mega_state = None
+    if state is not None:
+        state.bind(c)
+    if rotating:
+        cap = c.max_size
+        if cap > 1024:
+            return None
+        if state is None or state.cap != cap:
+            state = _AttnMegaState(attn.num_key_value_heads, cap,
+                                   hn.dtype, rows=B)
+            attn._mega_state = state
+            state.bind(c)
+    else:
+        needed = c.offset + 1
+        if needed > 1024:
+            _attn_mega_writeback(attn, c)
+            return None
+        if state is None:
+            state = _AttnMegaState(attn.num_key_value_heads, 1024,
+                                   hn.dtype, rows=B)
+            attn._mega_state = state
+            state.bind(c)
+        cap = state.cap
+
+    offset = c.offset
+    concat_tail = (
+        rotating and state.synced_offset != offset
+        and c.keys is not None and c.keys.shape[2] > cap)
+    if rotating:
+        if concat_tail:
+            idx = 0
+        else:
+            idx = c._idx
+            if idx == c.max_size:
+                idx = 0
+        kl_after = min(offset + 1, cap)
+        slot = idx
+    else:
+        slot = offset
+        kl_after = offset + 1
+    if kl_after > cap:
+        _attn_mega_writeback(attn, c)
+        return None
+
+    if state.synced_offset != offset:
+        ks = vs = None
+        if c.keys is not None and offset > 0:
+            if concat_tail:
+                n_phys = c.keys.shape[2]
+                ks = c.keys[..., n_phys - cap:, :]
+                vs = c.values[..., n_phys - cap:, :]
+            else:
+                n = min(c.keys.shape[2], cap)
+                ks = c.keys[..., :n, :]
+                vs = c.values[..., :n, :]
+        _attn_seed(state, ks, vs, offset, kl_after, slot, hn.dtype)
+        state.synced_offset = offset
+
+    if attn._qk_w is None:
+        attn._ensure_qk_constants()
+
+    ab, cd = _attn_verify_kernels(
+        _cuda_profile().name, attn.use_rope, float(attn.scale),
+        float(attn._eps), float(attn._rope_log2_base), batch=True,
+    )
+    kh = hn.shape[-1]
+    nq = attn.num_attention_heads
+    nkv = attn.num_key_value_heads
+    grid = _attn_megakernel_grid()
+    tmpl = [
+        ("T_", hn.dtype), ("KH_", kh), ("NQ_", nq), ("NKV_", nkv),
+        ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
+        ("RD_", getattr(attn, "_rope_dim", 0) if attn.use_rope else 0),
+        ("ROWS_", B), ("BATCH_", 1), ("GRID_", grid),
+    ]
+    try:
+        (scr,) = ab(
+            inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
+                    attn._qk_w, state.kbuf, state.vbuf, state.ctr],
+            template=tmpl + [("THREADS_", 512)],
+            grid=(grid * 512, 1, 1), threadgroup=(512, 1, 1),
+            output_shapes=[(16 + B * ((nq + 2 * nkv) * 128
+                                      + nq * 128 * 2 + kh),)],
+            output_dtypes=[mx.float32],
+            init_value=0,
+        )
+        (out,) = cd(
+            inputs=[scr, op.weight, op.scales, op.biases,
+                    state.kbuf, state.vbuf, state.ctr],
+            template=tmpl + [("THREADS_", 1024)],
+            grid=(grid * 1024, 1, 1), threadgroup=(1024, 1, 1),
+            output_shapes=[(B, kh)],
+            output_dtypes=[hn.dtype],
+        )
+    except (RuntimeError, TypeError, ValueError):
+        return None
+
+    c.offset = offset + 1
+    if rotating:
+        c._idx = slot + 1
+    phys = _stock_phys_rows(kl_after, cap)
+    c.keys = state.kbuf[..., :phys, :]
+    c.values = state.vbuf[..., :phys, :]
+    state.synced_offset = offset + 1
+    return out.reshape(B, 1, kh)
 
 
 def _attn_mega_rollback(attn, c, to_offset):
@@ -5166,6 +5361,42 @@ class MapleModel(nn.Module):
             self._mega_next = nxt
         return nxt if nxt is not False else None
 
+    def _decode_batch_fused(self, h, cache, full_mask, swa_mask):
+        """The B<=8 decode step through the M=B megakernels.
+
+        Same (h, r, hn) carry as `_decode_fused`, but the boundary fuse is
+        the plain stock pair (bf16 add, then rms_norm) -- bit-identical to
+        the stock stream by construction -- and each lane falls back to
+        the stock computation per layer when its plan declines.
+        """
+        r = mx.zeros(h.shape, h.dtype)
+        hn = None
+        mega_next = self._megakernel_next_norms()
+        for i, (layer, c, layer_type) in enumerate(
+            zip(self.layers, cache, self.layer_types)
+        ):
+            mask = full_mask if layer_type == "full_attention" else swa_mask
+            if hn is None:
+                ln = layer.input_layernorm
+                h = (h + r).astype(h.dtype)
+                hn = mx.fast.rms_norm(h, ln.weight, ln.eps)
+            r = _attn_mega_call_batch(layer, hn, c)
+            if r is None:
+                r = layer.self_attn(hn, mask, c)
+            hn = None
+            ln = layer.post_attention_layernorm
+            fused = _moe_batch_call(layer, h, r, ln, mega_next[i])
+            if fused is not None:
+                h, hn = fused
+                continue
+            h = (h + r).astype(h.dtype)
+            hn2 = mx.fast.rms_norm(h, ln.weight, ln.eps)
+            r = layer.mlp(hn2)
+        if hn is not None:
+            return hn
+        h = (h + r).astype(h.dtype)
+        return mx.fast.rms_norm(h, self.norm.weight, self.norm.eps)
+
     def _decode_fused(self, h, cache, full_mask, swa_mask, fuse):
         """Decode loop with residual adds folded into the norms.
 
@@ -5239,6 +5470,14 @@ class MapleModel(nn.Module):
             swa_mask = create_attention_mask(
                 h, cache[self.swa_idx], window_size=self.window_size
             )
+
+        if (
+            _use_batch_megakernels
+            and h.ndim == 3
+            and h.shape[1] == 1
+            and 2 <= h.shape[0] <= 8
+        ):
+            return self._decode_batch_fused(h, cache, full_mask, swa_mask)
 
         if h.size == h.shape[-1]:
             # Strict lane first: the corrected kernel reproduces
