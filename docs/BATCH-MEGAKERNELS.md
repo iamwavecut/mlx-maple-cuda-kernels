@@ -185,3 +185,14 @@ class member); big hosts opt higher via the env tunes. Ops scar for the
 book: CUDA-12.4 pod images + the new MLX wheel hit the ≥12.8-headers
 nvrtc trap — pip `nvidia-cuda-runtime-cu12==12.9.*` + a CUDA_HOME
 symlink fixes it without a toolkit install.
+
+### 2-pass in the pair (2026-08-13, late): kL <= 1024 scope lifted
+
+The CD kernel carries the production 2-pass slab recipe behind a
+per-row algorithm pick — full-attention layers in the batch lane now
+grow 1024→8192 like B=1 instead of dropping to stock past 1024. Gate:
+72/72 (pure 2-pass at kL≈3000 + 1-pass control, B=2/4/8). The port
+surfaced a latent race: AB consumes all four barrier-counter pairs of
+the shared scratch, so CD's old C→D barrier was a pass-through that had
+been green by luck — both CD barriers moved to fresh slots. Full
+battery re-run green.

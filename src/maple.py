@@ -4267,6 +4267,9 @@ _ATTN_VERIFY_CD_SOURCE = r"""
     constexpr int OFF_Q = OFF_QKV + ROWS_ * QKVROWS;
     constexpr int OFF_O = OFF_Q + ROWS_ * NQ_ * HD;
     constexpr int OFF_HNF = OFF_O + ROWS_ * NQ_ * HD;
+    constexpr int OFF_P = OFF_HNF + ROWS_ * KH_;   // 2-pass slab partials
+    constexpr int OFF_PS = OFF_P + ROWS_ * NQ_ * 32 * HD;
+    constexpr int OFF_PM = OFF_PS + ROWS_ * NQ_ * 32;
     float* scratch_w = const_cast<float*>(scratch_in);
     unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch_w);
     float* stq_kv = scratch_w + OFF_QKV;
@@ -4282,7 +4285,12 @@ _ATTN_VERIFY_CD_SOURCE = r"""
     constexpr float log2b = LOG2B_;
     (void)pos0; (void)eps; (void)log2b; (void)hnf; (void)stq_kv;
 
-    // ---- phase C: 1-pass SDPA per (head, row), causal via kL = kl0 + r --
+    // ---- phase C: SDPA per (head, row), causal via kL = kl0 + r ---------
+    // Each row runs the algorithm the stock dispatch would pick for its
+    // own kL: the 1-pass port at kL <= 1024, the 2-pass slab port past
+    // it.  Rows in 1-pass mode skip the slab sections (whole-block
+    // continue -- every thread of a block shares one task) and 2-pass
+    // rows skip the 1-pass loop; the slab barrier is unconditional.
     {
         __shared__ float outs[32][33];
         __shared__ float maxs[32];
@@ -4293,6 +4301,7 @@ _ATTN_VERIFY_CD_SOURCE = r"""
             const int r = task % ROWS_;
             const int kvh = head / (NQ_ / NKV_);
             const int kL = BATCH_ ? kl0 : (kl0 + r);
+            if (kL > 1024) continue;  // whole block: no divergence
             float q[VPL], k[VPL], o[VPL];
             #pragma unroll
             for (int i = 0; i < VPL; ++i) {
@@ -4358,14 +4367,199 @@ _ATTN_VERIFY_CD_SOURCE = r"""
             }
             __syncthreads();
         }
+
+        // -- 2-pass pass 1: the production slab recipe with a row plane.
+        // Four 8-warp slabs per block; sub-warps of one block can sit on
+        // DIFFERENT rows, so the loop is wave-shaped: barriers run
+        // unconditionally, work is gated per slab (shared traffic stays
+        // inside each sub's own maxs/sums/outs slots).
+        {
+            constexpr int PHD = HD + 2;
+            float* partials = scratch_w + OFF_P;
+            float* psums = scratch_w + OFF_PS;
+            float* pmaxs = scratch_w + OFF_PM;
+            (void)partials; (void)psums; (void)pmaxs; (void)PHD;
+            const int sub = warp >> 3;
+            const int swrp = warp & 7;
+            const int total1 = ROWS_ * NQ_ * 32;
+            const int waves1 = (total1 + GRID_ * 4 - 1) / (GRID_ * 4);
+            for (int w = 0; w < waves1; ++w) {
+                const int vb = (w * GRID_ + blk) * 4 + sub;
+                int r = 0, head = 0, slab = 0, kL = 0;
+                bool act = vb < total1;
+                if (act) {
+                    r = vb / (NQ_ * 32);
+                    const int rem = vb - r * NQ_ * 32;
+                    head = rem >> 5;
+                    slab = rem & 31;
+                    kL = BATCH_ ? kl0 : (kl0 + r);
+                    act = kL > 1024;
+                }
+                const int kvh = head / (NQ_ / NKV_);
+                float q[VPL], k[VPL], o[VPL];
+                float max_score = -3.402823466e38f;
+                float sum_exp = 0.0f;
+                if (act) {
+                    #pragma unroll
+                    for (int i = 0; i < VPL; ++i) {
+                        q[i] = scale_log2 * stq[
+                            ((long long)r * NQ_ + head) * HD + VPL * lane + i];
+                        o[i] = 0.0f;
+                    }
+                    const long long kh = (long long)kvh * CAP_ * HD
+                        + (BATCH_ ? (long long)r * NKV_ * CAP_ * HD : 0);
+                    for (int i = slab * 8 + swrp; i < kL; i += 256) {
+                        #pragma unroll
+                        for (int j = 0; j < VPL; ++j)
+                            k[j] = static_cast<float>(
+                                kcache[kh + (long long)i * HD + VPL * lane + j]);
+                        float score = 0.0f;
+                        #pragma unroll
+                        for (int j = 0; j < VPL; ++j) score += q[j] * k[j];
+                        #pragma unroll
+                        for (int off = 16; off > 0; off >>= 1)
+                            score += __shfl_xor_sync(0xffffffffu, score, off);
+                        const float new_max = fmaxf(max_score, score);
+                        const float factor = exp2f(max_score - new_max);
+                        const float exp_score = exp2f(score - new_max);
+                        max_score = new_max;
+                        sum_exp = sum_exp * factor + exp_score;
+                        #pragma unroll
+                        for (int j = 0; j < VPL; ++j)
+                            o[j] = o[j] * factor + exp_score * static_cast<float>(
+                                vcache[kh + (long long)i * HD + VPL * lane + j]);
+                    }
+                    if (lane == 0) {
+                        maxs[sub * 8 + swrp] = max_score;
+                        sums[sub * 8 + swrp] = sum_exp;
+                    }
+                }
+                __syncthreads();
+                float new_max = -3.402823466e38f;
+                if (act) {
+                    const float wmax = (lane < 8) ? maxs[sub * 8 + lane] : -1e9f;
+                    new_max = wmax;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        new_max = fmaxf(new_max,
+                                        __shfl_xor_sync(0xffffffffu, new_max, off));
+                    const float factor = exp2f(wmax - new_max);
+                    float se = (lane < 8) ? sums[sub * 8 + lane] : 0.0f;
+                    se *= factor;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        se += __shfl_xor_sync(0xffffffffu, se, off);
+                    const long long p = ((long long)r * NQ_ + head) * 32 + slab;
+                    if (swrp == 0 && lane == 0) {
+                        psums[p] = se;
+                        pmaxs[p] = new_max;
+                    }
+                }
+                const float ff = act
+                    ? exp2f(maxs[sub * 8 + swrp] - new_max) : 0.0f;
+                #pragma unroll
+                for (int i = 0; i < VPL; ++i) {
+                    if (act) outs[sub * 8 + swrp][lane] = o[i] * ff;
+                    __syncthreads();
+                    if (act && swrp == 0) {
+                        float ot = outs[sub * 8][lane];
+                        #pragma unroll
+                        for (int j = 1; j < 8; ++j)
+                            ot += outs[sub * 8 + j][lane];
+                        o[i] = ot;
+                    }
+                    __syncthreads();
+                }
+                if (act && swrp == 0) {
+                    const long long p = ((long long)r * NQ_ + head) * 32 + slab;
+                    #pragma unroll
+                    for (int i = 0; i < VPL; ++i)
+                        partials[p * HD + VPL * lane + i] = o[i];
+                }
+                __syncthreads();
+            }
+        }
+
+        // -- slab barrier ---------------------------------------------------
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            // AB consumed counter pairs 0-3; the CD kernel shares the
+            // scratch, so its barriers live on fresh slots 4 and 5.
+            const unsigned int old = atomicAdd(&ctr[5], 1u);
+            if (old == GRID_ - 1) atomicExch(&ctr[13], 1u);
+            else while (atomicAdd(&ctr[13], 0u) == 0u) __nanosleep(48);
+        }
+        __syncthreads();
+        __threadfence();
+
+        // -- 2-pass pass 2: one 32x32 merge per (row, head), wave-shaped.
+        {
+            float* partials = scratch_w + OFF_P;
+            float* psums = scratch_w + OFF_PS;
+            float* pmaxs = scratch_w + OFF_PM;
+            const int total2 = ROWS_ * NQ_;
+            const int waves2 = (total2 + GRID_ - 1) / GRID_;
+            for (int w = 0; w < waves2; ++w) {
+                const int t = w * GRID_ + blk;
+                int r = 0, head = 0, kL = 0;
+                bool act = t < total2;
+                if (act) {
+                    r = t / NQ_;
+                    head = t - r * NQ_;
+                    kL = BATCH_ ? kl0 : (kl0 + r);
+                    act = kL > 1024;
+                }
+                float o[VPL];
+                float factor = 0.0f, se = 0.0f;
+                if (act) {
+                    const long long p0 = ((long long)r * NQ_ + head) * 32;
+                    const float bmax = pmaxs[p0 + lane];
+                    float new_max = bmax;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        new_max = fmaxf(new_max,
+                                        __shfl_xor_sync(0xffffffffu, new_max, off));
+                    factor = exp2f(bmax - new_max);
+                    se = psums[p0 + lane] * factor;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        se += __shfl_xor_sync(0xffffffffu, se, off);
+                    se = (se == 0.0f) ? 0.0f : __frcp_rn(se);
+                    #pragma unroll
+                    for (int i = 0; i < VPL; ++i)
+                        o[i] = partials[(p0 + warp) * HD + VPL * lane + i];
+                }
+                #pragma unroll
+                for (int i = 0; i < VPL; ++i) {
+                    if (act) outs[lane][warp] = o[i];
+                    __syncthreads();
+                    if (act) {
+                        float ot = outs[warp][lane] * factor;
+                        #pragma unroll
+                        for (int off = 16; off > 0; off >>= 1)
+                            ot += __shfl_xor_sync(0xffffffffu, ot, off);
+                        o[i] = ot * se;
+                    }
+                    __syncthreads();
+                }
+                if (act && lane == 0) {
+                    #pragma unroll
+                    for (int i = 0; i < VPL; ++i)
+                        sto[((long long)r * NQ_ + head) * HD + VPL * warp + i]
+                            = static_cast<float>(static_cast<T_>(o[i]));
+                }
+                __syncthreads();
+            }
+        }
     }
 
     __threadfence();
     __syncthreads();
     if (tid == 0) {
-        const unsigned int old = atomicAdd(&ctr[2], 1u);
-        if (old == GRID_ - 1) atomicExch(&ctr[10], 1u);
-        else while (atomicAdd(&ctr[10], 0u) == 0u) __nanosleep(48);
+        const unsigned int old = atomicAdd(&ctr[4], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[12], 1u);
+        else while (atomicAdd(&ctr[12], 0u) == 0u) __nanosleep(48);
     }
     __syncthreads();
     __threadfence();
@@ -4857,15 +5051,35 @@ def _attn_mega_call_batch(layer, hn, c):
             attn._mega_state = state
             state.bind(c)
     else:
+        # Full-attention layers grow 1024 -> 8192 exactly like the B=1
+        # lane; the CD kernel's 2-pass branch covers every kL past 1024.
         needed = c.offset + 1
-        if needed > 1024:
+        if needed > 8192:
             _attn_mega_writeback(attn, c)
             return None
         if state is None:
-            state = _AttnMegaState(attn.num_key_value_heads, 1024,
+            cap = 1024
+            while cap < needed:
+                cap *= 2
+            state = _AttnMegaState(attn.num_key_value_heads, cap,
                                    hn.dtype, rows=B)
             attn._mega_state = state
             state.bind(c)
+        elif needed > state.cap:
+            cap = state.cap
+            while cap < needed:
+                cap *= 2
+            grown = _AttnMegaState(attn.num_key_value_heads, cap,
+                                   hn.dtype, rows=B)
+            if state.synced_offset == c.offset and state.synced_offset > 0:
+                n = min(state.synced_offset, state.cap)
+                _attn_seed(grown, state.kbuf[..., :n, :],
+                           state.vbuf[..., :n, :],
+                           c.offset, c.offset + 1, c.offset, hn.dtype)
+                grown.synced_offset = c.offset
+            grown.cache_ref = state.cache_ref
+            state = grown
+            attn._mega_state = state
         cap = state.cap
 
     offset = c.offset
@@ -4938,7 +5152,8 @@ def _attn_mega_call_batch(layer, hn, c):
             template=tmpl + [("THREADS_", 512)],
             grid=(grid * 512, 1, 1), threadgroup=(512, 1, 1),
             output_shapes=[(16 + B * ((nq + 2 * nkv) * 128
-                                      + nq * 128 * 2 + kh),)],
+                                      + nq * 128 * 2 + kh
+                                      + nq * 32 * (128 + 2)),)],
             output_dtypes=[mx.float32],
             init_value=0,
         )
