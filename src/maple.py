@@ -3892,6 +3892,47 @@ def _attn_mega_call(layer, hn, c):
     return out
 
 
+def _attn_mega_rollback(attn, c, to_offset):
+    """Rewind a fused layer's cache to an earlier offset (speculation).
+
+    Rejected draft tokens live only in slots past `to_offset` of the
+    persistent buffers; the next accepted token overwrites them, so a
+    rollback is purely counter surgery: reseed the on-device counters
+    through the seed kernel (n=0 copies nothing) and rewind the stock
+    counters in lockstep. Bit-safety: verified tokens' K/V at slots
+    < to_offset were written by the same recipes a sequential decode
+    would have used, so the resumed stream is the sequential stream.
+    Only valid while the state is bound and synced past `to_offset`.
+    """
+    state = getattr(attn, "_mega_state", None)
+    if state is None or not state.bound_to(c):
+        return False
+    if state.synced_offset < to_offset:
+        return False
+    from mlx_lm.models.cache import RotatingKVCache
+
+    rotating = isinstance(c, RotatingKVCache)
+    if rotating:
+        if c.offset >= c.max_size or to_offset >= c.max_size:
+            # A wrapped ring cannot rewind by counters alone: rejected
+            # slots may have overwritten live history.
+            return False
+        slot = to_offset
+        kl_after = min(to_offset + 1, state.cap)
+    else:
+        slot = to_offset
+        kl_after = to_offset + 1
+    # The counters describe the NEXT step: pos to write, kL after its
+    # append, and the slot it lands in -- same contract as the resync.
+    _attn_seed(state, None, None, to_offset, kl_after, slot,
+               state.kbuf.dtype)
+    c.offset = to_offset
+    if rotating:
+        c._idx = to_offset
+    state.synced_offset = to_offset
+    return True
+
+
 def _attn_mega_writeback(attn, c):
     """Push the fused buffers back into the stock cache before leaving.
 
