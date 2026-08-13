@@ -136,3 +136,16 @@ at B=8 regardless of our kernels; and `_attn_mega_call` needed a
 past step 8 — the 8-step microscope on the same prompts is clean, so
 the next tool is a 48-step per-layer capture to localize the first
 diverging (step, layer, stage). Lane stays opt-in.
+
+## E2E PASS (2026-08-13 night): solo-exact batching, all B
+
+Three root causes later (per-row boundary fuse — the solo
+`_exact_add_rms_norm` is neither pair-equal nor row-safe; per-row
+lm_head past M=4 — the stock qmm head loses bit row-invariance at M=8;
+the `state.rows` guard), `maple_batch_e2e_check.py` is green: **every
+batched row reproduces its solo stream bit-for-bit** at B=2/4/8 over 48
+steps. The stock batch path cannot make that promise on its own rows
+(2/4 at B4, 4/8 at B8). Aggregate tok/s (graphs off): 266/300/364 vs
+stock 252/386/322 — correctness landed, throughput is the open front
+(graph capture for the AB/CD pair, then the curve vs stock-with-graphs
+472 @ B4).

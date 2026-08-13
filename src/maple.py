@@ -5367,14 +5367,28 @@ class MapleModel(nn.Module):
             self._mega_next = nxt
         return nxt if nxt is not False else None
 
-    def _decode_batch_fused(self, h, cache, full_mask, swa_mask):
+    def _decode_batch_fused(self, h, cache, full_mask, swa_mask, fuse=None):
         """The B<=8 decode step through the M=B megakernels.
 
-        Same (h, r, hn) carry as `_decode_fused`, but the boundary fuse is
-        the plain stock pair (bf16 add, then rms_norm) -- bit-identical to
-        the stock stream by construction -- and each lane falls back to
-        the stock computation per layer when its plan declines.
+        Same (h, r, hn) carry as `_decode_fused`.  Boundary fuses MUST be
+        bit-equal per row to whatever the solo stream uses -- and the solo
+        stream's `_exact_add_rms_norm` is NOT bit-equal to the plain
+        add+rms pair (nor row-safe at B>1), so when a fuse is given it is
+        applied per row; only a fuse-less solo baseline uses the stock
+        pair.  Each megakernel lane falls back to the stock computation
+        per layer when its plan declines.
         """
+        B = h.shape[0]
+
+        def bfuse(hh, rr, w, eps):
+            if fuse is None:
+                s = (hh + rr).astype(hh.dtype)
+                return s, mx.fast.rms_norm(s, w, eps)
+            parts = [fuse(hh[b:b + 1], rr[b:b + 1], w, eps)
+                     for b in range(B)]
+            return (mx.concatenate([p[0] for p in parts], axis=0),
+                    mx.concatenate([p[1] for p in parts], axis=0))
+
         r = mx.zeros(h.shape, h.dtype)
         hn = None
         mega_next = self._megakernel_next_norms()
@@ -5384,8 +5398,7 @@ class MapleModel(nn.Module):
             mask = full_mask if layer_type == "full_attention" else swa_mask
             if hn is None:
                 ln = layer.input_layernorm
-                h = (h + r).astype(h.dtype)
-                hn = mx.fast.rms_norm(h, ln.weight, ln.eps)
+                h, hn = bfuse(h, r, ln.weight, ln.eps)
             r = _attn_mega_call_batch(layer, hn, c)
             if r is None:
                 r = layer.self_attn(hn, mask, c)
@@ -5395,13 +5408,11 @@ class MapleModel(nn.Module):
             if fused is not None:
                 h, hn = fused
                 continue
-            h = (h + r).astype(h.dtype)
-            hn2 = mx.fast.rms_norm(h, ln.weight, ln.eps)
+            h, hn2 = bfuse(h, r, ln.weight, ln.eps)
             r = layer.mlp(hn2)
         if hn is not None:
             return hn
-        h = (h + r).astype(h.dtype)
-        return mx.fast.rms_norm(h, self.norm.weight, self.norm.eps)
+        return bfuse(h, r, self.norm.weight, self.norm.eps)[1]
 
     def _decode_fused(self, h, cache, full_mask, swa_mask, fuse):
         """Decode loop with residual adds folded into the norms.
@@ -5483,7 +5494,18 @@ class MapleModel(nn.Module):
             and h.shape[1] == 1
             and 2 <= h.shape[0] <= 8
         ):
-            return self._decode_batch_fused(h, cache, full_mask, swa_mask)
+            # Boundary fuse: the SAME lane the solo stream would pick, so
+            # each batched row's boundary bits match its solo run.
+            fuse = None
+            if _use_fused_add_rms:
+                if self._exact_add_norm is None:
+                    self._exact_add_norm = _exact_add_rms_ok(
+                        h.shape[-1], h.dtype, self.norm.weight, self.norm.eps
+                    )
+                if self._exact_add_norm:
+                    fuse = _exact_add_rms_norm
+            return self._decode_batch_fused(
+                h, cache, full_mask, swa_mask, fuse)
 
         if h.size == h.shape[-1]:
             # Strict lane first: the corrected kernel reproduces
@@ -5654,6 +5676,19 @@ class Model(nn.Module):
             and getattr(self.lm_head, "mode", "affine") == "affine"
         ):
             return self.lm_head_flash(out, self.lm_head)
+        if (
+            _use_batch_megakernels
+            and out.ndim == 3
+            and out.shape[1] == 1
+            and 4 < out.shape[0] <= 8
+        ):
+            # The quantized-matmul head switches algorithms past M=4 and
+            # stops being row-invariant at the bit level (measured at M=8:
+            # every row differs from its solo run).  The batch lane's
+            # solo-exact contract therefore runs the head per row here.
+            return mx.concatenate(
+                [self.lm_head(out[b:b + 1]) for b in range(out.shape[0])],
+                axis=0)
         return self.lm_head(out)
 
     def sanitize(self, weights):
