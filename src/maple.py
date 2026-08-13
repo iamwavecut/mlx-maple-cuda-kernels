@@ -3147,24 +3147,40 @@ __device__ __forceinline__ float qmv_row(
     const unsigned int* wrow = wq + (long long)row * (k >> 4);
     const __nv_bfloat16* srow = sc + (long long)row * (k >> 7);
     const __nv_bfloat16* brow = bi + (long long)row * (k >> 7);
-    __nv_bfloat16 sums[16];
+    // The 16 accumulators are independent; packing them into bfloat162
+    // pairs keeps every per-element rounding identical to the scalar
+    // __hfma/__hmul/__hadd chain (pinned: maple_hfma2_probe 2^20/2^20)
+    // while roughly doubling the arithmetic issue rate.
+    __nv_bfloat162 sums2[8];
     #pragma unroll
-    for (int i = 0; i < 16; ++i) sums[i] = __nv_bfloat16(0.0f);
+    for (int i = 0; i < 8; ++i)
+        sums2[i] = __halves2bfloat162(
+            __nv_bfloat16(0.0f), __nv_bfloat16(0.0f));
     for (int base = lane * 16; base < k; base += 512) {
         const unsigned int word = wrow[base >> 4];
         const __nv_bfloat16 scale = srow[base >> 7];
         const __nv_bfloat16 bias = brow[base >> 7];
+        const __nv_bfloat162 scale2 = __halves2bfloat162(scale, scale);
+        const __nv_bfloat162 bias2 = __halves2bfloat162(bias, bias);
         #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            const int q = (word >> (2 * i)) & 3;
-            const __nv_bfloat16 wdq = __hadd(
-                __hmul(__nv_bfloat16(float(q)), scale), bias);
-            sums[i] = __hfma(__nv_bfloat16(xf[base + i]), wdq, sums[i]);
+        for (int i = 0; i < 8; ++i) {
+            const int qa = (word >> (4 * i)) & 3;
+            const int qb = (word >> (4 * i + 2)) & 3;
+            const __nv_bfloat162 q2 = __halves2bfloat162(
+                __nv_bfloat16(float(qa)), __nv_bfloat16(float(qb)));
+            const __nv_bfloat162 wdq2 = __hadd2(__hmul2(q2, scale2), bias2);
+            const __nv_bfloat162 xp = __halves2bfloat162(
+                __nv_bfloat16(xf[base + 2 * i]),
+                __nv_bfloat16(xf[base + 2 * i + 1]));
+            sums2[i] = __hfma2(xp, wdq2, sums2[i]);
         }
     }
     float sum = 0.0f;
     #pragma unroll
-    for (int i = 0; i < 16; ++i) sum += __bfloat162float(sums[i]);
+    for (int i = 0; i < 8; ++i) {
+        sum += __bfloat162float(sums2[i].x);
+        sum += __bfloat162float(sums2[i].y);
+    }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
         sum += __shfl_xor_sync(0xffffffffu, sum, o);
