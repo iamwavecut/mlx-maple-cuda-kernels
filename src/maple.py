@@ -111,12 +111,26 @@ _use_moe_megakernel = _env_flag("MAPLE_MOE_MEGAKERNEL", True)
 _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 
 # The batch (2 <= B <= 8) decode lane: both proven M=B megakernels behind
-# the stock per-layer structure.  Research opt-in until the per-B service
-# suites and the aggregate curve land; requires MLX_USE_CUDA_GRAPHS=0
-# (the AB/CD pair trips graph capture) and covers kL <= 1024 (the pair
-# carries the 1-pass SDPA port only) -- layers past that fall back to the
-# stock path for the step, per layer, with an exact writeback.
-_use_batch_megakernels = _env_flag("MAPLE_BATCH_MEGAKERNELS", False)
+# the stock per-layer structure.  Every batched row reproduces its solo
+# stream bit for bit -- a contract stock batching does not hold (its own
+# rows drift through batch-variant GEMM tails, down to 2/8 on a 5090).
+# Default is data-driven per profile: ON where the full bit battery has
+# run (solo-exact E2E, kernel-vs-kernel, LRU isolation), OFF elsewhere
+# until scale-out.  MAPLE_BATCH_MEGAKERNELS=0/1 always wins.  Covers
+# kL <= 1024 (the pair carries the 1-pass SDPA port); layers past that
+# fall back to the stock path per step with an exact writeback.
+_BATCH_MEGAKERNEL_PROVEN_PROFILES = ("sm86", "sm120")
+_use_batch_megakernels = (
+    _env_flag("MAPLE_BATCH_MEGAKERNELS", False)
+    if "MAPLE_BATCH_MEGAKERNELS" in os.environ else None
+)
+
+
+def _batch_megakernels_enabled():
+    if _use_batch_megakernels is not None:
+        return _use_batch_megakernels
+    prof = _cuda_profile()
+    return prof is not None and prof.name in _BATCH_MEGAKERNEL_PROVEN_PROFILES
 
 # The one-dispatch decode attention block.  The full bit battery is green
 # on sm86/sm89/sm90 (stream identity, the window-rotation boundary, the
@@ -5516,7 +5530,7 @@ class MapleModel(nn.Module):
             )
 
         if (
-            _use_batch_megakernels
+            _batch_megakernels_enabled()
             and h.ndim == 3
             and h.shape[1] == 1
             and 2 <= h.shape[0] <= 8
@@ -5704,7 +5718,7 @@ class Model(nn.Module):
         ):
             return self.lm_head_flash(out, self.lm_head)
         if (
-            _use_batch_megakernels
+            _batch_megakernels_enabled()
             and out.ndim == 3
             and out.shape[1] == 1
             and 4 < out.shape[0] <= 8
