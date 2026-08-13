@@ -43,8 +43,10 @@ per-layer probes at load, screened-prompt stream equality, and an 846-token
 quality suite that reproduces the reference NLL to the last digit.
 
 Batched decode (2-8 concurrent streams) runs through the M=B megakernel
-lane, **on by default** on the bit-proven profiles (sm86 and sm120 up
-to B=8; H100 up to B=4, where its curve beats or matches stock): every
+lane, **on by default** on every bit-proven profile (sm86/sm120 up to
+B=8; RTX 4090 and H100 up to B=4, where their curves beat or match
+stock — the 4090 measures +41% at B=1 and +23% at B=2 on a quiet
+host): every
 batched row reproduces its solo stream bit for bit — a contract stock
 batching itself does not hold (its rows drift via batch-variant GEMM
 tails, down to 2/8 matching on a 5090) — and on a quiet RTX 5090 it

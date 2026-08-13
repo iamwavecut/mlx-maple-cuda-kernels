@@ -123,7 +123,8 @@ _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 # battery ran everywhere below, and the aggregate curve decides the cap
 # (sm90 measured +32%/+13%/par at B=1/2/4 but -22% at B8, where the 132
 # SMs make stock batching genuinely strong -- so its default stops at 4).
-_BATCH_MEGAKERNEL_PROVEN_PROFILES = {"sm86": 8, "sm120": 8, "sm90": 4}
+_BATCH_MEGAKERNEL_PROVEN_PROFILES = {"sm86": 8, "sm120": 8, "sm90": 4,
+                                      "sm89": 4}
 _use_batch_megakernels = (
     _env_flag("MAPLE_BATCH_MEGAKERNELS", False)
     if "MAPLE_BATCH_MEGAKERNELS" in os.environ else None

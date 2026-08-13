@@ -219,3 +219,15 @@ ceiling: **B≤4 on sm90**, B≤8 on sm86/sm120; `MAPLE_BATCH_MEGAKERNELS=1`
 lifts any profile to 8. Grid tunes for the profile: attention 96, MoE
 128 (residency: 132 SMs × 2 blocks at 1024 threads on Hopper).
 Remaining: sm89 (4090 rental still unavailable after 4 attempts).
+
+## sm89 scale-out (2026-08-14, vast.ai RTX 4090, quiet host): multi-arch CLOSED
+
+The last profile: full battery green (attn all 6/6 with the form-1 pin,
+MoE 162/162, E2E solo-exact PASS vs stock control 1/2·2/4·5/8, LRU,
+2-pass 72/72). Quiet-host tuned curve (grids 128/128): **+41% at B1,
++23% at B2, parity at B4, −12% at B8** → default ceiling B≤4, grid
+defaults stay class-safe at 64 (sm89 includes the 76-SM RTX 4080), env
+lifts to 128/128 on 4090 hosts. All four profiles of the batch lane are
+now bit-proven with data-driven defaults: sm86 ≤8, sm89 ≤4, sm90 ≤4,
+sm120 ≤8. Ops note: vast.ai had 4090s instantly ($0.28–0.35/hr) after a
+day of RunPod drought — first stop for consumer cards from now on.
