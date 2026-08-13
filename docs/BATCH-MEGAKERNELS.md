@@ -124,3 +124,15 @@ Debug order: (1) microscope one diverging row at B=2 layer by layer
 diverging stage; (2) decide the tail strategy — per-row lm_head loop
 (cheap at B<=8) vs a row-exact batched port; (3) re-gate, then the curve
 with graphs on stock-side.
+
+### Debug session 1 (2026-08-13, evening)
+
+The kernels are exonerated on real state (three-way compare: stock ==
+production == pair, 0 diffs). Two real culprits found so far: the
+STOCK lm_head qmm is not row-invariant at B=8 (bit-level, all rows,
+maxabs 0.0625) — so the solo-exact contract needs a per-row head tail
+at B=8 regardless of our kernels; and `_attn_mega_call` needed a
+`state.rows` guard (hygiene, landed). B=2/4 still diverge somewhere
+past step 8 — the 8-step microscope on the same prompts is clean, so
+the next tool is a 48-step per-layer capture to localize the first
+diverging (step, layer, stage). Lane stays opt-in.

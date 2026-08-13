@@ -4627,6 +4627,12 @@ def _attn_mega_call(layer, hn, c):
         return None
 
     state = getattr(attn, "_mega_state", None)
+    if state is not None and state.rows != 1:
+        # A batch-lane state: its buffers carry B planes the single-row
+        # kernel would misindex. Materialize and rebuild.
+        state.materialize_old()
+        state = None
+        attn._mega_state = None
     if state is not None:
         state.bind(c)
     if rotating:
