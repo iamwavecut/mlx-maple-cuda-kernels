@@ -3560,6 +3560,346 @@ _ATTN_MEGAKERNEL_SOURCE = r"""
 """
 
 
+_ATTN_VERIFY_AB_SOURCE = r"""
+    constexpr int WARP = 32;
+    constexpr int HD = 128;
+    constexpr int VPL = HD / WARP;
+    constexpr int NH = NQ_ + 2 * NKV_;
+    constexpr int QKVROWS = NH * HD;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int blk = blockIdx.x;
+    const int wglobal = blk * (THREADS_ / 32) + warp;
+
+    constexpr int OFF_QKV = 16;
+    constexpr int OFF_Q = OFF_QKV + ROWS_ * QKVROWS;
+    constexpr int OFF_O = OFF_Q + ROWS_ * NQ_ * HD;
+    constexpr int OFF_HNF = OFF_O + ROWS_ * NQ_ * HD;
+    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
+    float* stq_kv = scratch + OFF_QKV;
+    float* stq = scratch + OFF_Q;
+    float* sto = scratch + OFF_O;
+    float* hnf = scratch + OFF_HNF;
+
+    float* live = const_cast<float*>(scalars);
+    const float pos0 = live[0];
+    const int kl0 = static_cast<int>(live[1]);
+    const int slot0 = static_cast<int>(live[2]);
+    constexpr float eps = EPS_;
+    constexpr float log2b = LOG2B_;
+
+    // ---- phase A0: stage the pack inputs as exact float(bf16) ----------
+    for (int i = blk * THREADS_ + tid; i < ROWS_ * KH_;
+         i += GRID_ * THREADS_) {
+        hnf[i] = static_cast<float>(hn[i]);
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old0 = atomicAdd(&ctr[3], 1u);
+        if (old0 == GRID_ - 1) atomicExch(&ctr[11], 1u);
+        else while (atomicAdd(&ctr[11], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase A: qkv for every pack row (the stock qmv recipe) --------
+    for (int task = wglobal; task < ROWS_ * QKVROWS;
+         task += GRID_ * (THREADS_ / 32)) {
+        const int r = task / QKVROWS;
+        const int qrow = task % QKVROWS;
+        const float sum = qmv_row(
+            hnf + (long long)r * KH_,
+            reinterpret_cast<const unsigned int*>(wqkv),
+            reinterpret_cast<const __nv_bfloat16*>(sqkv),
+            reinterpret_cast<const __nv_bfloat16*>(bqkv),
+            qrow, KH_, lane);
+        if (lane == 0)
+            stq_kv[(long long)r * QKVROWS + qrow] =
+                static_cast<float>(static_cast<T_>(sum));
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[0], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[8], 1u);
+        else while (atomicAdd(&ctr[8], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase B: split + QK norm + RoPE + cache append, per (row, head)
+    for (int task = wglobal; task < ROWS_ * NH;
+         task += GRID_ * (THREADS_ / 32)) {
+        const int r = task / NH;
+        const int head = task % NH;
+        const float* xh = stq_kv + (long long)r * QKVROWS + head * HD;
+        const float pos = pos0 + (float)r;
+        const int slot = slot0 + r;
+        T_* kc = const_cast<T_*>(kcache);
+        T_* vc = const_cast<T_*>(vcache);
+        if (head >= NQ_ + NKV_) {
+            const int kvh = head - NQ_ - NKV_;
+            T_* vh = vc + ((long long)kvh * CAP_ + slot) * HD;
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                const int j = lane * VPL + i;
+                vh[j] = static_cast<T_>(xh[j]);
+            }
+        } else {
+            const T_* wh = wqk + head * HD;
+            float sum_sq = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                const float value = xh[lane * VPL + i];
+                sum_sq += value * value;
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, offset);
+            sum_sq = __shfl_sync(0xffffffffu, sum_sq, 0);
+            const float nscale = rsqrtf(sum_sq / (float)HD + eps);
+            float rope_cos[VPL], rope_sin[VPL];
+            if (ROPE_) {
+                #pragma unroll
+                for (int i = 0; i < VPL; ++i) {
+                    const int j = lane * VPL + i;
+                    if (j < RD_) {
+                        constexpr int rhalf = RD_ > 0 ? RD_ / 2 : 1;
+                        const int pp = (j < rhalf) ? j : j - rhalf;
+                        const float fraction = (float)pp / (float)(RD_ / 2);
+                        const float frequency = exp2f(-fraction * log2b);
+                        const float angle = pos * frequency;
+                        rope_cos[i] = cosf(angle);
+                        rope_sin[i] = sinf(angle);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                const int j = lane * VPL + i;
+                const T_ normalized = static_cast<T_>(
+                    xh[j] * nscale * static_cast<float>(wh[j]));
+                float value = static_cast<float>(normalized);
+                if (ROPE_ && j < RD_) {
+                    constexpr int rhalf = RD_ > 0 ? RD_ / 2 : 1;
+                    const int pair = j < rhalf ? j + rhalf : j - rhalf;
+                    const T_ paired_normalized = static_cast<T_>(
+                        xh[pair] * nscale * static_cast<float>(wh[pair]));
+                    const float paired = static_cast<float>(paired_normalized);
+                    value = (j < rhalf)
+                        ? value * rope_cos[i] - paired * rope_sin[i]
+                        : SECOND_HALF_;
+                }
+                const T_ out_b = static_cast<T_>(value);
+                if (head < NQ_) {
+                    stq[((long long)r * NQ_ + head) * HD + j] =
+                        static_cast<float>(out_b);
+                } else {
+                    const int kvh = head - NQ_;
+                    kc[((long long)kvh * CAP_ + slot) * HD + j] = out_b;
+                }
+            }
+        }
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[1], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[9], 1u);
+        else while (atomicAdd(&ctr[9], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+"""
+
+
+_ATTN_VERIFY_CD_SOURCE = r"""
+    constexpr int WARP = 32;
+    constexpr int HD = 128;
+    constexpr int VPL = HD / WARP;
+    constexpr int NH = NQ_ + 2 * NKV_;
+    constexpr int QKVROWS = NH * HD;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int blk = blockIdx.x;
+    const int wglobal = blk * (THREADS_ / 32) + warp;
+
+    constexpr int OFF_QKV = 16;
+    constexpr int OFF_Q = OFF_QKV + ROWS_ * QKVROWS;
+    constexpr int OFF_O = OFF_Q + ROWS_ * NQ_ * HD;
+    constexpr int OFF_HNF = OFF_O + ROWS_ * NQ_ * HD;
+    float* scratch_w = const_cast<float*>(scratch_in);
+    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch_w);
+    float* stq_kv = scratch_w + OFF_QKV;
+    float* stq = scratch_w + OFF_Q;
+    float* sto = scratch_w + OFF_O;
+    float* hnf = scratch_w + OFF_HNF;
+
+    float* live = const_cast<float*>(scalars);
+    const float pos0 = live[0];
+    const int kl0 = static_cast<int>(live[1]);
+    const int slot0 = static_cast<int>(live[2]);
+    constexpr float eps = EPS_;
+    constexpr float log2b = LOG2B_;
+    (void)pos0; (void)eps; (void)log2b; (void)hnf; (void)stq_kv;
+
+    // ---- phase C: 1-pass SDPA per (head, row), causal via kL = kl0 + r --
+    {
+        __shared__ float outs[32][33];
+        __shared__ float maxs[32];
+        __shared__ float sums[32];
+        const float scale_log2 = SCALE_ * 1.44269504088896340736f;
+        for (int task = blk; task < NQ_ * ROWS_; task += GRID_) {
+            const int head = task / ROWS_;
+            const int r = task % ROWS_;
+            const int kvh = head / (NQ_ / NKV_);
+            const int kL = kl0 + r;
+            float q[VPL], k[VPL], o[VPL];
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                q[i] = scale_log2
+                     * stq[((long long)r * NQ_ + head) * HD + VPL * lane + i];
+                o[i] = 0.0f;
+            }
+            float max_score = -3.402823466e38f;
+            float sum_exp = 0.0f;
+            const long long kh = (long long)kvh * CAP_ * HD;
+            for (int i = warp; i < kL; i += 32) {
+                #pragma unroll
+                for (int j = 0; j < VPL; ++j)
+                    k[j] = static_cast<float>(
+                        kcache[kh + (long long)i * HD + VPL * lane + j]);
+                float score = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < VPL; ++j) score += q[j] * k[j];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    score += __shfl_xor_sync(0xffffffffu, score, off);
+                const float new_max = fmaxf(max_score, score);
+                const float factor = exp2f(max_score - new_max);
+                const float exp_score = exp2f(score - new_max);
+                max_score = new_max;
+                sum_exp = sum_exp * factor + exp_score;
+                #pragma unroll
+                for (int j = 0; j < VPL; ++j)
+                    o[j] = o[j] * factor + exp_score * static_cast<float>(
+                        vcache[kh + (long long)i * HD + VPL * lane + j]);
+            }
+            if (lane == 0) { maxs[warp] = max_score; sums[warp] = sum_exp; }
+            __syncthreads();
+            max_score = maxs[lane];
+            float new_max = max_score;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                new_max = fmaxf(new_max,
+                                __shfl_xor_sync(0xffffffffu, new_max, off));
+            const float factor = exp2f(max_score - new_max);
+            float se = sums[lane] * factor;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                se += __shfl_xor_sync(0xffffffffu, se, off);
+            se = (se == 0.0f) ? 0.0f : __frcp_rn(se);
+            #pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                outs[lane][warp] = o[i];
+                __syncthreads();
+                float ot = outs[warp][lane] * factor;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    ot += __shfl_xor_sync(0xffffffffu, ot, off);
+                o[i] = ot * se;
+                __syncthreads();
+            }
+            if (lane == 0) {
+                #pragma unroll
+                for (int i = 0; i < VPL; ++i)
+                    sto[((long long)r * NQ_ + head) * HD + VPL * warp + i] =
+                        static_cast<float>(static_cast<T_>(o[i]));
+            }
+            __syncthreads();
+        }
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[2], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[10], 1u);
+        else while (atomicAdd(&ctr[10], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase D: o_proj for every pack row -----------------------------
+    for (int task = wglobal; task < ROWS_ * KH_;
+         task += GRID_ * (THREADS_ / 32)) {
+        const int r = task / KH_;
+        const int orow = task % KH_;
+        const float sum = qmv_row(
+            sto + (long long)r * NQ_ * HD,
+            reinterpret_cast<const unsigned int*>(wo),
+            reinterpret_cast<const __nv_bfloat16*>(so_),
+            reinterpret_cast<const __nv_bfloat16*>(bo_),
+            orow, NQ_ * HD, lane);
+        if (lane == 0)
+            out[(long long)r * KH_ + orow] = static_cast<T_>(sum);
+    }
+
+    if (blk == 0 && tid == 0) {
+        live[0] = pos0 + (float)ROWS_;
+        live[1] = (float)(kl0 + ROWS_);
+        live[2] = (float)(slot0 + ROWS_);
+    }
+"""
+
+
+_attn_verify_cache = {}
+
+
+def _attn_verify_kernels(profile_name, use_rope, scale, eps, log2b):
+    key = (profile_name, use_rope, scale, eps, log2b)
+    pair = _attn_verify_cache.get(key)
+    if pair is None:
+        second_half = (
+            "__fmaf_rn(value, rope_cos[i], "
+            "__fmul_rn(paired, rope_sin[i]))"
+            if profile_name in ("sm100", "sm120")
+            else "value * rope_cos[i] + paired * rope_sin[i]")
+
+        def bake(src):
+            return (src
+                    .replace("SCALE_", f"{scale:.17e}f")
+                    .replace("EPS_", f"{eps:.10e}f")
+                    .replace("LOG2B_", f"{log2b:.17e}f")
+                    .replace("SECOND_HALF_", second_half))
+
+        ab = mx.fast.cuda_kernel(
+            name="maple_attn_verify_ab",
+            input_names=["hn", "wqkv", "sqkv", "bqkv", "wqk",
+                         "kcache", "vcache", "scalars"],
+            output_names=["scratch"],
+            source=bake(_ATTN_VERIFY_AB_SOURCE),
+            header=_ATTN_MEGAKERNEL_HEADER,
+        )
+        cd = mx.fast.cuda_kernel(
+            name="maple_attn_verify_cd",
+            input_names=["scratch_in", "wo", "so_", "bo_",
+                         "kcache", "vcache", "scalars"],
+            output_names=["out"],
+            source=bake(_ATTN_VERIFY_CD_SOURCE),
+            header=_ATTN_MEGAKERNEL_HEADER,
+        )
+        pair = _attn_verify_cache[key] = (ab, cd)
+    return pair
+
+
 _attn_megakernel_cache = {}
 
 
