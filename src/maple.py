@@ -4808,6 +4808,66 @@ _ATTN_SEED_SOURCE = r"""
     }
 """
 
+# Row variant: seeds ONE row's plane of a ragged batch state and stamps
+# that row's counter triple at live[3 + row*3 .. +2] -- same const_cast
+# discipline (buffer pointers never move).
+_ATTN_SEED_ROW_SOURCE = r"""
+    constexpr int HD = 128;
+    const int n = static_cast<int>(meta[0]);
+    const int row = static_cast<int>(meta[4]);
+    T_* kd = const_cast<T_*>(kbuf) + (long long)row * KVH_ * CAP_ * HD;
+    T_* vd = const_cast<T_*>(vbuf) + (long long)row * KVH_ * CAP_ * HD;
+    const long long total = (long long)KVH_ * n * HD;
+    for (long long i = (long long)blockIdx.x * THREADS_ + threadIdx.x;
+         i < total; i += (long long)GRID_ * THREADS_) {
+        const int h = (int)(i / ((long long)n * HD));
+        const long long r = i - (long long)h * n * HD;
+        const int rw = (int)(r / HD);
+        const int j = (int)(r - (long long)rw * HD);
+        const long long dst = ((long long)h * CAP_ + rw) * HD + j;
+        kd[dst] = ks[i];
+        vd[dst] = vs[i];
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        float* live = const_cast<float*>(ctr);
+        live[3 + row * 3 + 0] = meta[1];
+        live[3 + row * 3 + 1] = meta[2];
+        live[3 + row * 3 + 2] = meta[3];
+    }
+"""
+
+
+def _attn_seed_row_kernel():
+    kernel = _attn_seed_kernel_cache.get("row")
+    if kernel is None:
+        kernel = _attn_seed_kernel_cache["row"] = mx.fast.cuda_kernel(
+            name="maple_attn_seed_row",
+            input_names=["kbuf", "vbuf", "ctr", "ks", "vs", "meta"],
+            output_names=["ok"],
+            source=_ATTN_SEED_ROW_SOURCE,
+        )
+    return kernel
+
+
+def _attn_seed_row(state, row, keys_src, values_src, pos, kl, slot, dtype):
+    """Seed one plane of a ragged state; src is (1, kvh, n, 128)."""
+    n = keys_src.shape[2] if keys_src is not None else 0
+    if n == 0:
+        keys_src = mx.zeros((1, state.kbuf.shape[1], 1, 128), dtype)
+        values_src = keys_src
+    meta = mx.array([float(n), float(pos), float(kl), float(slot),
+                     float(row)], mx.float32)
+    (ok,) = _attn_seed_row_kernel()(
+        inputs=[state.kbuf, state.vbuf, state.ctr,
+                keys_src.astype(dtype), values_src.astype(dtype), meta],
+        template=[("T_", dtype), ("KVH_", int(state.kbuf.shape[1])),
+                  ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
+        grid=(64 * 256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(1,)], output_dtypes=[mx.float32],
+    )
+    mx.eval(ok)
+
+
 _attn_seed_kernel_cache = {}
 
 
@@ -5206,6 +5266,275 @@ def _attn_mega_call_batch(layer, hn, c):
     c.values = state.vbuf[..., :phys, :]
     state.synced_offset = offset + 1
     return out.reshape(B, 1, kh)
+
+
+class _AttnRaggedState:
+    """B-plane persistent buffers with PER-ROW sync: each plane mirrors a
+    different request's cache at its own offset. Same pointer discipline
+    as _AttnMegaState -- all (re)seeding is kernel-side."""
+
+    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "rows", "synced",
+                 "cache_refs")
+
+    def __init__(self, kv_heads, cap, dtype, rows):
+        self.kbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
+        self.vbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
+        self.ctr = mx.zeros((3 + 3 * rows,), mx.float32)
+        mx.eval(self.kbuf, self.vbuf, self.ctr)
+        self.cap = cap
+        self.rows = rows
+        self.synced = [-1] * rows
+        self.cache_refs = [None] * rows
+
+    def materialize_row(self, r):
+        ref = self.cache_refs[r]
+        old = ref() if ref is not None else None
+        if old is not None and self.synced[r] > 0:
+            n = min(self.synced[r], self.cap)
+            phys = _stock_phys_rows(n, self.cap)
+            old.keys = mx.contiguous(self.kbuf[r:r + 1, :, :phys, :])
+            old.values = mx.contiguous(self.vbuf[r:r + 1, :, :phys, :])
+            mx.eval(old.keys, old.values)
+
+    def bind_row(self, r, c):
+        ref = self.cache_refs[r]
+        if ref is not None and ref() is c:
+            return
+        self.materialize_row(r)
+        self.synced[r] = -1
+        self.cache_refs[r] = weakref.ref(c)
+
+    def materialize_all(self):
+        for r in range(self.rows):
+            self.materialize_row(r)
+            self.synced[r] = -1
+
+
+def _attn_mega_call_ragged(layer, hn, caches):
+    """One-dispatch-pair decode attention for B requests at DIFFERENT
+    offsets (their per-layer caches in `caches`), or None for stock."""
+    attn = layer.self_attn
+    qkv = attn.qkv_proj
+    op = attn.o_proj
+    B = hn.shape[0]
+    if (
+        _cuda_profile() is None
+        or hn.dtype != mx.bfloat16
+        or attn.head_dim != 128
+        or not attn.use_qk_norm
+        or not attn._can_fuse_qk
+        or attn._fused_qk is not True
+        or getattr(qkv, "bits", None) != 2
+        or getattr(op, "bits", None) != 2
+        or getattr(qkv, "group_size", None) != 128
+        or getattr(op, "group_size", None) != 128
+        or getattr(qkv, "mode", "affine") != "affine"
+        or getattr(qkv, "biases", None) is None
+        or getattr(op, "biases", None) is None
+        or "bias" in qkv or "bias" in op
+        or hn.shape[-1] % 512 != 0
+        or (attn.num_attention_heads * 128) % 512 != 0
+    ):
+        return None
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    rotating = isinstance(caches[0], RotatingKVCache)
+    for c in caches:
+        if rotating != isinstance(c, RotatingKVCache):
+            return None
+        if not rotating and not isinstance(c, KVCache):
+            return None
+        if rotating and (c.keep != 0 or c.max_size is None):
+            return None
+
+    state = getattr(attn, "_ragged_state", None)
+    if state is not None and state.rows != B:
+        state.materialize_all()
+        state = None
+        attn._ragged_state = None
+    if rotating:
+        cap = caches[0].max_size
+        if cap > 1024 or any(c.max_size != cap for c in caches):
+            return None
+        if state is None or state.cap != cap:
+            if state is not None:
+                state.materialize_all()
+            state = _AttnRaggedState(attn.num_key_value_heads, cap,
+                                     hn.dtype, B)
+            attn._ragged_state = state
+    else:
+        needed = max(c.offset for c in caches) + 1
+        if needed > 8192:
+            if state is not None:
+                state.materialize_all()
+                attn._ragged_state = None
+            return None
+        if state is None or needed > state.cap:
+            cap = 1024 if state is None else state.cap
+            while cap < needed:
+                cap *= 2
+            if state is not None:
+                # simplest correct growth: push every plane back to its
+                # stock cache, rebuild, reseed below from stock
+                state.materialize_all()
+            state = _AttnRaggedState(attn.num_key_value_heads, cap,
+                                     hn.dtype, B)
+            attn._ragged_state = state
+        cap = state.cap
+
+    metas = []
+    for r, c in enumerate(caches):
+        state.bind_row(r, c)
+        offset = c.offset
+        concat_tail = (
+            rotating and state.synced[r] != offset
+            and c.keys is not None and c.keys.shape[2] > cap)
+        if rotating:
+            if concat_tail:
+                idx = 0
+            else:
+                idx = c._idx
+                if idx == c.max_size:
+                    idx = 0
+            kl_after = min(offset + 1, cap)
+            slot = idx
+        else:
+            slot = offset
+            kl_after = offset + 1
+        if kl_after > cap:
+            state.materialize_all()
+            attn._ragged_state = None
+            return None
+        if state.synced[r] != offset:
+            ks = vs = None
+            if c.keys is not None and offset > 0:
+                if concat_tail:
+                    n_phys = c.keys.shape[2]
+                    ks = c.keys[..., n_phys - cap:, :]
+                    vs = c.values[..., n_phys - cap:, :]
+                else:
+                    n = min(c.keys.shape[2], cap)
+                    ks = c.keys[..., :n, :]
+                    vs = c.values[..., :n, :]
+            _attn_seed_row(state, r, ks, vs, offset, kl_after, slot,
+                           hn.dtype)
+            state.synced[r] = offset
+        metas.append((offset, kl_after, slot))
+
+    if attn._qk_w is None:
+        attn._ensure_qk_constants()
+
+    ab, cd = _attn_verify_kernels(
+        _cuda_profile().name, attn.use_rope, float(attn.scale),
+        float(attn._eps), float(attn._rope_log2_base), batch=True,
+    )
+    kh = hn.shape[-1]
+    nq = attn.num_attention_heads
+    nkv = attn.num_key_value_heads
+    try:
+        grid = int(os.environ.get("MAPLE_BATCH_ATTENTION_GRID", "0"))
+    except ValueError:
+        grid = 0
+    if not grid:
+        grid = {"sm100": 80, "sm120": 80}.get(_cuda_profile().name, 0)
+    grid = grid or _attn_megakernel_grid()
+    tmpl = [
+        ("T_", hn.dtype), ("KH_", kh), ("NQ_", nq), ("NKV_", nkv),
+        ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
+        ("RD_", getattr(attn, "_rope_dim", 0) if attn.use_rope else 0),
+        ("ROWS_", B), ("BATCH_", 0), ("RAGGED_", 1), ("GRID_", grid),
+    ]
+    try:
+        (scr,) = ab(
+            inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
+                    attn._qk_w, state.kbuf, state.vbuf, state.ctr],
+            template=tmpl + [("THREADS_", 512)],
+            grid=(grid * 512, 1, 1), threadgroup=(512, 1, 1),
+            output_shapes=[(16 + B * ((nq + 2 * nkv) * 128
+                                      + nq * 128 * 2 + kh
+                                      + nq * 32 * (128 + 2)),)],
+            output_dtypes=[mx.float32],
+            init_value=0,
+        )
+        (out,) = cd(
+            inputs=[scr, op.weight, op.scales, op.biases,
+                    state.kbuf, state.vbuf, state.ctr],
+            template=tmpl + [("THREADS_", 1024)],
+            grid=(grid * 1024, 1, 1), threadgroup=(1024, 1, 1),
+            output_shapes=[(B, kh)],
+            output_dtypes=[hn.dtype],
+        )
+    except (RuntimeError, TypeError, ValueError):
+        return None
+
+    for r, (c, (offset, kl_after, slot)) in enumerate(zip(caches, metas)):
+        c.offset = offset + 1
+        if rotating:
+            c._idx = slot + 1
+        phys = _stock_phys_rows(kl_after, cap)
+        c.keys = state.kbuf[r:r + 1, :, :phys, :]
+        c.values = state.vbuf[r:r + 1, :, :phys, :]
+        state.synced[r] = offset + 1
+    return out.reshape(B, 1, kh)
+
+
+def ragged_decode_step(model, y, request_caches):
+    """One decode step for B requests at DIFFERENT offsets in ONE pass.
+
+    `y` is (B, 1) token ids; `request_caches` is a list of B per-request
+    prompt caches (each the usual per-layer list). Every row's bits equal
+    its solo decode step -- the serving contract. Returns (B, 1, vocab)
+    logits. The caller owns sampling and cache lifecycles.
+    """
+    inner = model.model
+    B = y.shape[0]
+    h = inner.word_embeddings(y)
+    fuse = None
+    if _use_fused_add_rms:
+        if inner._exact_add_norm is None:
+            inner._exact_add_norm = _exact_add_rms_ok(
+                h.shape[-1], h.dtype, inner.norm.weight, inner.norm.eps)
+        if inner._exact_add_norm:
+            fuse = _exact_add_rms_norm
+
+    def bfuse(hh, rr, w, eps):
+        if fuse is None:
+            ss = (hh + rr).astype(hh.dtype)
+            return ss, mx.fast.rms_norm(ss, w, eps)
+        parts = [fuse(hh[b:b + 1], rr[b:b + 1], w, eps) for b in range(B)]
+        return (mx.concatenate([pp[0] for pp in parts], axis=0),
+                mx.concatenate([pp[1] for pp in parts], axis=0))
+
+    r = mx.zeros(h.shape, h.dtype)
+    hn = None
+    mega_next = inner._megakernel_next_norms()
+    for i, (layer, layer_type) in enumerate(
+        zip(inner.layers, inner.layer_types)
+    ):
+        layer_caches = [rc[i] for rc in request_caches]
+        if hn is None:
+            ln = layer.input_layernorm
+            h, hn = bfuse(h, r, ln.weight, ln.eps)
+        r = _attn_mega_call_ragged(layer, hn, layer_caches)
+        if r is None:
+            r = mx.concatenate(
+                [layer.self_attn(hn[b:b + 1], None, layer_caches[b])
+                 for b in range(B)], axis=0)
+        hn = None
+        ln = layer.post_attention_layernorm
+        fused = _moe_batch_call(layer, h, r, ln, mega_next[i])
+        if fused is not None:
+            h, hn = fused
+            continue
+        h, hn2 = bfuse(h, r, ln.weight, ln.eps)
+        r = layer.mlp(hn2)
+    if hn is None:
+        h, hn = bfuse(h, r, inner.norm.weight, inner.norm.eps)
+    out = hn
+    if B > 4:
+        return mx.concatenate(
+            [model.lm_head(out[b:b + 1]) for b in range(B)], axis=0)
+    return model.lm_head(out)
 
 
 def _attn_mega_rollback(attn, c, to_offset):

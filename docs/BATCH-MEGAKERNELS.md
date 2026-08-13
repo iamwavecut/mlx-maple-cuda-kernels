@@ -244,3 +244,15 @@ boundary, and B=8. MoE needs nothing (offset-free). Remaining for the
 serving story: the ragged lane plumbing (per-request caches → B-plane
 seeding on composition changes), the ragged E2E gate, then the service
 engine's micro-batch scheduler.
+
+### Ragged E2E (2026-08-14): PASS first run — the serving primitive
+
+`maple.ragged_decode_step(model, y, request_caches)` decodes B requests
+at different offsets in one pass: per-row kernel seeds
+(`_attn_seed_row`), per-row live views, per-row counter advance, MoE
+untouched (offset-free), per-row boundary fuse and head. Gate: rows
+2/2·4/4·8/8 bit-equal to their solo streams at distinct prompt lengths.
+Against **sequential serving** — the actual service baseline — aggregate
+tok/s reads **+16% (B2), +44% (B4), +54% (B8)** on the noisy farm host.
+What remains is pure service engineering: the micro-batch scheduler in
+`aifarm-maple-mlx` (queue → join/leave between steps → ragged loop).
