@@ -33,7 +33,7 @@ processes; each row is one rented host, so compare within rows:
 | RTX 4090 | 157.7 | **455.7** | **×2.9** | bit-identical, 8/8 prompts |
 | RTX 3090 | 152.3 | ~415 (345.2 + 20.6%) | ×2.7 | bit-identical, 8/8 |
 | H100 80GB | 206.8 | 388.6 | ×1.9 | bit-identical, 8/8 |
-| RTX 5090 | 242.6 | 381.6 | ×1.6 | bit-identical, 8/8 |
+| RTX 5090 | 242.6 | 381.6 (attn lane: short +2.8%, long −8…−15% → auto-off) | ×1.6 | bit-identical, 8/8 |
 | B200 | 141.9 | 358.0 | ×2.5 | bit-identical, 8/8 |
 
 Long contexts hold: the attention lane runs the stock 2-pass SDPA in-kernel
