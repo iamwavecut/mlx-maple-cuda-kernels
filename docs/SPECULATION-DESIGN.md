@@ -87,13 +87,23 @@ traffic Maple serves, and costs nothing to skip elsewhere (the drafter
 simply finds no match and the pass degenerates to a single step). Verdict:
 build the L-row ports.
 
+## All four phases proven (2026-08-13)
+
+Every verify phase is now bit-exact on hardware:
+`benchmarks/maple_mma_row_independence.py` 16/16 (experts),
+`benchmarks/maple_lrow_semantics.py` 96/96 (router + qmv at L=2..16),
+`benchmarks/maple_pack_causal_sdpa.py` 40/40 (kL = base+row+1 over
+[cache | pack], incl. base 1000). Speculative verification of L ≤ 16
+drafts is bit-equal to L sequential steps by construction — no
+exactness trade anywhere.
+
 ## Order of work for the next cycle
 
-1. ~~Extend the acceptance corpus~~ done (24 streams; see above).
-2. If A clears ~1.5 on real traffic: build the L-row router/qmv ports and
-   pin their bits (the recipes are per-token independent — expect clean
-   ports).
-3. Pack-causal SDPA port; acceptance loop in `_decode_fused`; the cache
-   commit protocol.
-4. The megakernel M=L variants ride the existing templates (`ROWS_`
-   parameter), grid unchanged; bit gates extend the existing suites.
+1. ~~Corpus~~ done. 2. ~~L-row router/qmv pins~~ done. 3. ~~Pack-causal
+   SDPA pin~~ done.
+4. The acceptance loop in `_decode_fused`: prompt-lookup drafter (pure
+   host, cheap), verify via the pinned per-phase dispatches first (no
+   megakernel surgery yet), commit accepted K/V through the existing
+   seed-kernel discipline, emit tokens.
+5. Then fold verify into the megakernels (`ROWS_` template) for the
+   dispatch-count win; bit gates extend the existing suites.
