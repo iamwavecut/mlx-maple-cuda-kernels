@@ -162,3 +162,11 @@ residency is per-kernel, not per-source-family). Tuned E2E aggregate:
 260/331/373 tok/s vs stock 279/378/342 at B=2/4/8, bits still PASS —
 B8 beats stock +9% on a noisy host. Remaining: per-B LRU suites, a
 clean-host curve, then the default decision.
+
+### LRU isolation gate (2026-08-13): PASS
+
+`maple_batch_lru_check.py`: a stored solo history survives a full batch
+intervention on the same modules and continues bit-equal to an
+uninterrupted run — the materialize-on-detach discipline holds through
+row-count rebinds. Remaining before any default: a clean-host curve
+(GPU0 neighbor makes farm walls noisy) and multi-arch scale-out.
