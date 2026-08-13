@@ -50,3 +50,40 @@ Per-B bit suites (each row vs its solo stream), the batch curve re-run
 (the target: B=4 aggregate well above stock's 472), the LRU/service
 suites at B>1, and per-arch defaults only where measured faster —
 the standing discipline applies unchanged.
+
+## Exact-MoE M=B: the concrete decomposition (post-attention-proof)
+
+Attention M=B is proven (108/108, `maple_attn_batch_check.py`) — with a
+battle scar worth its own line: a fresh compilation contracted the
+upper-half RoPE differently from production sm86 (1 ULP, deterministic),
+so the batch/verify pair now pins the form per profile. Expect the same
+class of pin work anywhere a recipe expression is re-compiled in a new
+kernel body.
+
+The MoE kernel's phases map as follows (current scratch:
+idx[8], sco[8], logits[NROUT], probs[NROUT], ugstage[NEXP*2*KD], dstage):
+
+- **Phase 0 (add+RMS) and A (router gemv)**: per-row by construction —
+  task grids gain a ROWS_ factor, scratch regions gain a leading B.
+- **Phase B (softmax/top-8/renorm)**: currently block-0-only; becomes
+  one 64-thread sub-block per row (the pinned recipe is 64 threads), B
+  rows across the first ceil(B/16) blocks, plus a NEW tail: build the
+  DEDUP table — a 256-slot bitmask (uint32 per expert, bit r = row r
+  subscribes) reduced with atomicOr in scratch, then a compacted list
+  (unique expert id, subscriber mask) via a prefix scan on block 0.
+- **Phase C/D (experts)**: iterate the COMPACTED unique list instead of
+  the fixed 8: one weight read per unique expert serves every
+  subscriber row through the free MMA A-rows (row r of the atom = the
+  r-th subscriber's activation; the row-independence pin makes each
+  subscriber's bits equal its solo run). Worst case 8B uniques degrades
+  gracefully to per-row cost; the measured overlap (0.68-0.75 at L=4
+  windows) does not apply to independent streams — expect near-zero
+  sharing across unrelated requests and near-full sharing for
+  same-prompt fan-out (n-best, self-consistency), which is exactly the
+  serving shape that wants batch anyway.
+- **Phase E (aggregate + residual + next norm)**: per-row task grids.
+
+Order: land 0/A/B(+dedup) as one kernel with bit gates against B solo
+runs; C/D as the second (the gather is the only genuinely new code);
+E rides the existing recipe. Then the gate swap in `MapleModel.__call__`
+(`h.shape[-2] == 1 and h.shape[0] <= 8`), per-B suites, and the curve.
