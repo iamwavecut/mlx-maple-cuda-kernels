@@ -149,3 +149,16 @@ steps. The stock batch path cannot make that promise on its own rows
 stock 252/386/322 — correctness landed, throughput is the open front
 (graph capture for the AB/CD pair, then the curve vs stock-with-graphs
 472 @ B4).
+
+### Grid tunes + graphs (2026-08-13, late night)
+
+The lane runs under CUDA graphs (the old AB/CD capture failure does not
+reproduce end-to-end), and both kernels gain from bigger grids on sm86:
+the pair 290→272µs (B4) / 490→438µs (B8) at grid 80, batch MoE 241→216 /
+385→340µs at grid 128. Wired as `MAPLE_BATCH_ATTENTION_GRID` /
+`MAPLE_BATCH_MOE_GRID` (defaults stay safe: the batch MoE kernel is
+register-heavier and DEADLOCKS at the production-safe 192 on 82 SMs —
+residency is per-kernel, not per-source-family). Tuned E2E aggregate:
+260/331/373 tok/s vs stock 279/378/342 at B=2/4/8, bits still PASS —
+B8 beats stock +9% on a noisy host. Remaining: per-B LRU suites, a
+clean-host curve, then the default decision.

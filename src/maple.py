@@ -3593,8 +3593,17 @@ def _moe_batch_call(layer, h, r, ln, next_w):
         plans = block._batch_megakernel_plans = {}
     plan = plans.get(rows)
     if plan is None:
+        # The batch kernel is register-heavier than the single-row one, so
+        # its residency ceiling is lower (192 deadlocks on 82 SMs where
+        # the production kernel runs it); measured sm86 gains ~10-12% at
+        # 128 -- opt in per host, default to the production grid.
         try:
-            plan = _moe_batch_megakernel_plan(block, ln, h.dtype, rows)
+            grid = int(os.environ.get("MAPLE_BATCH_MOE_GRID", "0")) or None
+        except ValueError:
+            grid = None
+        try:
+            plan = _moe_batch_megakernel_plan(block, ln, h.dtype, rows,
+                                              grid=grid)
         except (AttributeError, RuntimeError, TypeError, ValueError):
             plan = False
         plans[rows] = plan
@@ -4883,7 +4892,14 @@ def _attn_mega_call_batch(layer, hn, c):
     kh = hn.shape[-1]
     nq = attn.num_attention_heads
     nkv = attn.num_key_value_heads
-    grid = _attn_megakernel_grid()
+    # Grid residency bounds the CD kernel (1024 threads: ONE block per SM
+    # on consumer parts), so the default stays at the universally-safe 64;
+    # measured sm86 (82 SMs) gains ~6-11% at 80 -- opt in per host.
+    try:
+        grid = int(os.environ.get("MAPLE_BATCH_ATTENTION_GRID", "0"))
+    except ValueError:
+        grid = 0
+    grid = grid or _attn_megakernel_grid()
     tmpl = [
         ("T_", hn.dtype), ("KH_", kh), ("NQ_", nq), ("NKV_", nkv),
         ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
