@@ -3589,6 +3589,21 @@ def _attn_megakernel(profile_name, use_rope, scale, eps, log2b):
     return kernel
 
 
+def _stock_phys_rows(n, cap):
+    """The PHYSICAL row count the stock cache would hold for n live rows.
+
+    Stock caches grow in 256-row blocks (both KVCache and the rotating
+    cache) and downstream cache code branches on the physical shape, not
+    just the logical offset -- the LRU repro caught exact-length buffers
+    changing those paths. Everything the lane publishes therefore carries
+    the stock-grown shape; rows past the logical offset are padding that
+    no stock path reads.
+    """
+    if n <= 0:
+        return 0
+    return min(cap, ((n + 255) // 256) * 256)
+
+
 class _AttnMegaState:
     """Caller-owned contiguous KV buffers mirroring the stock cache.
 
@@ -3628,8 +3643,9 @@ class _AttnMegaState:
         old = self.cache_ref() if self.cache_ref is not None else None
         if old is not None and self.synced_offset > 0:
             n = min(self.synced_offset, self.cap)
-            old.keys = mx.contiguous(self.kbuf[..., :n, :])
-            old.values = mx.contiguous(self.vbuf[..., :n, :])
+            phys = _stock_phys_rows(n, self.cap)
+            old.keys = mx.contiguous(self.kbuf[..., :phys, :])
+            old.values = mx.contiguous(self.vbuf[..., :phys, :])
             mx.eval(old.keys, old.values)
         self.synced_offset = -1
         self.cache_ref = weakref.ref(c)
@@ -3862,8 +3878,9 @@ def _attn_mega_call(layer, hn, c):
     c.offset = offset + 1
     if rotating:
         c._idx = slot + 1
-    c.keys = state.kbuf[..., :kl_after, :]
-    c.values = state.vbuf[..., :kl_after, :]
+    phys = _stock_phys_rows(kl_after, cap)
+    c.keys = state.kbuf[..., :phys, :]
+    c.values = state.vbuf[..., :phys, :]
     state.synced_offset = offset + 1  # our buffers are current for this offset
     return out
 
@@ -3887,8 +3904,9 @@ def _attn_mega_writeback(attn, c):
         return
     n = min(state.synced_offset, state.cap)
     if n > 0:
-        c.keys = state.kbuf[..., :n, :]
-        c.values = state.vbuf[..., :n, :]
+        phys = _stock_phys_rows(n, state.cap)
+        c.keys = state.kbuf[..., :phys, :]
+        c.values = state.vbuf[..., :phys, :]
         mx.eval(c.keys, c.values)
     state.synced_offset = -1
 
