@@ -8,7 +8,7 @@ GPUs under MLX — while reproducing the stock token stream bit for bit.**
 > Independent community research, not an MLX or DeepGrove release. Claims
 > are scoped to the exact GPUs, drivers, MLX 0.32.0 / CUDA 12.9, checkpoint
 > and source hashes in [`results/`](results/). Latest release:
-> [v0.8.1](https://github.com/iamwavecut/mlx-maple-cuda-kernels/releases).
+> [v0.11.0](https://github.com/iamwavecut/mlx-maple-cuda-kernels/releases).
 
 ## Why it exists
 
@@ -108,9 +108,9 @@ not benchmark on a shared device. Full list in
 - [`results/`](results/) — evidence: campaign records, provenance
   manifests, per-architecture artifacts.
 - Provenance: [`src/maple.py`](src/maple.py) SHA-256
-  `2ec5f36f1ff367fdd4046f3617522d079de9a95ad0cdfdcaf8edb01ec9161542`,
+  `ed35978ad0574df4ef5f22a424cbc70b42b7fb4d2d72b211f9f061167cbaebb1`,
   patch SHA-256
-  `ce985ed3246657f1e5293808f935c28e9d0cf853308b4407d7d80107c634c9f2`.
+  `a66bf601dc709c7f89c9cc0d407c54b885e821af6db45d56a3b319a26d715a6f`.
 
 ## License
 

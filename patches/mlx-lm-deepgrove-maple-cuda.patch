@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..fef0b29 100644
+index a0673f7..820224c 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,8 @@
@@ -11,7 +11,7 @@ index a0673f7..fef0b29 100644
  from dataclasses import dataclass
  from functools import partial
  from typing import Any, List, Optional
-@@ -17,32 +20,242 @@ from mlx_lm.models.base import (
+@@ -17,32 +20,275 @@ from mlx_lm.models.base import (
  )
  from mlx_lm.models.cache import KVCache, RotatingKVCache
  from mlx_lm.models.rope_utils import initialize_rope
@@ -105,6 +105,39 @@ index a0673f7..fef0b29 100644
 +# for speed.  The ~1 ULP lane below stays on as the fallback for geometries
 +# the exact plan declines; MAPLE_MOE_MEGAKERNEL_EXACT=0 disables this lane.
 +_use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
++
++# The batch (2 <= B <= 8) decode lane: both proven M=B megakernels behind
++# the stock per-layer structure.  Every batched row reproduces its solo
++# stream bit for bit -- a contract stock batching does not hold (its own
++# rows drift through batch-variant GEMM tails, down to 2/8 on a 5090).
++# Default is data-driven per profile: ON where the full bit battery has
++# run (solo-exact E2E, kernel-vs-kernel, LRU isolation), OFF elsewhere
++# until scale-out.  MAPLE_BATCH_MEGAKERNELS=0/1 always wins.  Covers
++# kL <= 1024 (the pair carries the 1-pass SDPA port); layers past that
++# fall back to the stock path per step with an exact writeback.
++# Per-profile default ceiling on the batch size the lane takes: the full
++# battery ran everywhere below, and the aggregate curve decides the cap
++# (sm90 measured +32%/+13%/par at B=1/2/4 but -22% at B8, where the 132
++# SMs make stock batching genuinely strong -- so its default stops at 4).
++_BATCH_MEGAKERNEL_PROVEN_PROFILES = {"sm86": 8, "sm120": 8, "sm90": 4,
++                                      "sm89": 4}
++_use_batch_megakernels = (
++    _env_flag("MAPLE_BATCH_MEGAKERNELS", False)
++    if "MAPLE_BATCH_MEGAKERNELS" in os.environ else None
++)
++
++
++def _batch_megakernel_max_rows():
++    if _use_batch_megakernels is not None:
++        return 8 if _use_batch_megakernels else 0
++    prof = _cuda_profile()
++    if prof is None:
++        return 0
++    return _BATCH_MEGAKERNEL_PROVEN_PROFILES.get(prof.name, 0)
++
++
++def _batch_megakernels_enabled():
++    return _batch_megakernel_max_rows() > 0
 +
 +# The one-dispatch decode attention block.  The full bit battery is green
 +# on sm86/sm89/sm90 (stream identity, the window-rotation boundary, the
@@ -245,16 +278,16 @@ index a0673f7..fef0b29 100644
  
 -def _matches(fast, reference, tol=2e-2):
 -    """One-time self-check for a hand-written Metal kernel.
--
++def _matches(fast, reference):
++    """Fail closed unless a hand-written kernel is array-exact.
+ 
 -    Every fast path below has a portable equivalent, and each is used only
 -    after its outputs have been compared against that equivalent once, on the
 -    live weights. This file ships inside checkpoints and runs on whatever mlx
 -    and GPU the user has, so a kernel that fails to compile, silently mismatches
 -    the config it was templated for, or drifts from a future mlx must degrade to
 -    the portable path rather than corrupt the token stream.
-+def _matches(fast, reference):
-+    """Fail closed unless a hand-written kernel is array-exact.
- 
+-
 -    Both callables return a tuple of arrays. The kernels stay in bounds for any
 -    config (loop counts are integer-divided from the templated dims), so a
 -    config they cannot handle shows up here as wrong values, not as a fault.
@@ -267,7 +300,7 @@ index a0673f7..fef0b29 100644
      """
      try:
          got, want = fast(), reference()
-@@ -51,9 +264,8 @@ def _matches(fast, reference, tol=2e-2):
+@@ -51,9 +297,8 @@ def _matches(fast, reference, tol=2e-2):
          return False
      return len(got) == len(want) and all(
          g.shape == w.shape
@@ -279,7 +312,7 @@ index a0673f7..fef0b29 100644
          for g, w in zip(got, want)
      )
  
-@@ -123,24 +335,129 @@ def _make_add_rms_norm_kernel(eps):
+@@ -123,24 +368,129 @@ def _make_add_rms_norm_kernel(eps):
      )
  
  
@@ -416,7 +449,7 @@ index a0673f7..fef0b29 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -154,6 +471,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
+@@ -154,6 +504,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
      )
  
  
@@ -546,7 +579,7 @@ index a0673f7..fef0b29 100644
  # Inlined rather than imported from switch_layers: those helpers are private
  # (underscore-prefixed), and this file must keep loading against whatever
  # mlx-lm a user has installed when it ships inside a checkpoint.
-@@ -226,7 +666,7 @@ def _make_qk_norm_rope_kernel():
+@@ -226,7 +699,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -555,7 +588,7 @@ index a0673f7..fef0b29 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +703,244 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +736,244 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -801,7 +834,7 @@ index a0673f7..fef0b29 100644
  
  
  class MapleAttention(nn.Module):
-@@ -293,15 +970,23 @@ class MapleAttention(nn.Module):
+@@ -293,15 +1003,23 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -825,7 +858,7 @@ index a0673f7..fef0b29 100644
              self.rope = initialize_rope(
                  rope_dim,
                  args.rope_theta,
-@@ -310,45 +995,61 @@ class MapleAttention(nn.Module):
+@@ -310,45 +1028,61 @@ class MapleAttention(nn.Module):
                  max_position_embeddings=args.max_position_embeddings,
              )
  
@@ -915,7 +948,7 @@ index a0673f7..fef0b29 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -369,20 +1070,48 @@ class MapleAttention(nn.Module):
+@@ -369,20 +1103,48 @@ class MapleAttention(nn.Module):
      ) -> mx.array:
          B, L, _ = x.shape
  
@@ -967,7 +1000,7 @@ index a0673f7..fef0b29 100644
              out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
              queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
              keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-@@ -409,6 +1138,9 @@ class MapleAttention(nn.Module):
+@@ -409,6 +1171,9 @@ class MapleAttention(nn.Module):
                  queries = self.rope(queries, offset=offset)
                  keys = self.rope(keys, offset=offset)
  
@@ -977,7 +1010,7 @@ index a0673f7..fef0b29 100644
          if cache is not None:
              keys, values = cache.update_and_fetch(keys, values)
  
-@@ -419,6 +1151,48 @@ class MapleAttention(nn.Module):
+@@ -419,6 +1184,48 @@ class MapleAttention(nn.Module):
          output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
          return self.o_proj(output)
  
@@ -1026,7 +1059,7 @@ index a0673f7..fef0b29 100644
  
  class MapleMLP(nn.Module):
      def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-@@ -618,7 +1392,335 @@ def _make_fused_router_kernel():
+@@ -618,7 +1425,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -1363,7 +1396,7 @@ index a0673f7..fef0b29 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1735,84 @@ class MapleGate(nn.Module):
+@@ -633,23 +1768,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -1462,7 +1495,7 @@ index a0673f7..fef0b29 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -659,6 +1822,19 @@ class MapleGate(nn.Module):
+@@ -659,6 +1855,19 @@ class MapleGate(nn.Module):
          gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
          return group_expert_select(gates, self.top_k)
  
@@ -1482,7 +1515,7 @@ index a0673f7..fef0b29 100644
      def _probe(self, x):
          # Not _matches(): the two paths may order the selected experts
          # differently, and an exact tie at the top-k boundary may legitimately
-@@ -670,13 +1846,34 @@ class MapleGate(nn.Module):
+@@ -670,13 +1879,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -1520,11 +1553,23 @@ index a0673f7..fef0b29 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1892,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,36 +1925,3970 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
-+
+-class MapleSwitchGLU(nn.Module):
+-    """SwitchGLU with the up and gate projections fused into one gather
+-    matmul; sanitize() concatenates the checkpoint's split tensors."""
+-
+-    def __init__(self, input_dims, hidden_dims, num_experts, bias=False):
+-        super().__init__()
+-        self.up_gate_proj = SwitchLinear(
+-            input_dims, 2 * hidden_dims, num_experts, bias=bias
+-        )
+-        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
+ 
+-    def __call__(self, x, indices):
+-        x = mx.expand_dims(x, (-2, -3))
 +# Maple Preview's checkpoint stores true ternary expert weights: codes 0/1/2,
 +# one alpha per output row, and affine bias == -alpha.  This decode-only
 +# specialization is deliberately Maple-owned; generic affine W2 layers still
@@ -1564,7 +1609,8 @@ index a0673f7..fef0b29 100644
 +            alpha[r] = static_cast<float>(scales[scale_off]);
 +        }
 +    }
-+
+ 
+-        do_sort = indices.size >= 64
 +    for (int col = lane; col < K; col += WARP) {
 +        float xv = static_cast<float>(x[col]);
 +        int word = col >> 4;
@@ -1661,13 +1707,16 @@ index a0673f7..fef0b29 100644
 +    return indices
 +
 +
- class MapleSwitchGLU(nn.Module):
-     """SwitchGLU with the up and gate projections fused into one gather
-     matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +2039,78 @@ class MapleSwitchGLU(nn.Module):
-             input_dims, 2 * hidden_dims, num_experts, bias=bias
-         )
-         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
++class MapleSwitchGLU(nn.Module):
++    """SwitchGLU with the up and gate projections fused into one gather
++    matmul; sanitize() concatenates the checkpoint's split tensors."""
++
++    def __init__(self, input_dims, hidden_dims, num_experts, bias=False):
++        super().__init__()
++        self.up_gate_proj = SwitchLinear(
++            input_dims, 2 * hidden_dims, num_experts, bias=bias
++        )
++        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
 +        self._ternary_row_alpha = False
 +        self._ternary_up_gate = None  # None = unprobed, then True/False
 +
@@ -1737,13 +1786,14 @@ index a0673f7..fef0b29 100644
 +        except (AttributeError, RuntimeError, TypeError, ValueError):
 +            self._ternary_up_gate = False
 +        return stock()
- 
-     def __call__(self, x, indices):
++
++    def __call__(self, x, indices):
 +        single_token = x.size == self.up_gate_proj.input_dims and indices.size == 8
-         x = mx.expand_dims(x, (-2, -3))
- 
-         do_sort = indices.size >= 64
-@@ -715,16 +2119,2090 @@ class MapleSwitchGLU(nn.Module):
++        x = mx.expand_dims(x, (-2, -3))
++
++        do_sort = indices.size >= 64
+         idx = indices
+         inv_order = None
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -2743,6 +2793,514 @@ index a0673f7..fef0b29 100644
 +    }
 +"""
 +
++# The batch (M=B) port of the exact-MoE megakernel: ROWS_ independent
++# decode rows through every proven recipe in ONE dispatch.  Differences
++# from the production source are purely structural:
++#   - the per-block shared normed vector becomes a global fp32+bf16 stage
++#     (phase 0 runs row-per-block, then a grid barrier) -- fp32/bf16
++#     round-trips through global memory are value-exact;
++#   - phase B runs its block-0 recipe on block r for row r;
++#   - the SwiGLU staging moves from per-block shared memory to a global
++#     bf16 stage behind one extra barrier (B*8*KD_ no longer fits shared);
++#   - every task grid gains a leading row factor.
++# Each row's arithmetic chains are untouched, so row r must equal the
++# production kernel run alone on row r bit for bit -- that is the gate
++# (benchmarks/maple_moe_batch_check.py).
++_MOE_BATCH_MEGAKERNEL_SOURCE = r"""
++    constexpr int WARP = 32;
++    constexpr int WARPS = THREADS_ / WARP;
++    constexpr int GS = 128;
++    const int tid = threadIdx.x;
++    const int lane = tid & (WARP - 1);
++    const int warp = tid >> 5;
++    const int blk = blockIdx.x;
++    const int wglobal = blk * WARPS + warp;
++
++    constexpr int OFF_IDX = 16;
++    constexpr int OFF_SCO = OFF_IDX + ROWS_ * 8;
++    constexpr int OFF_LOG = OFF_SCO + ROWS_ * 8;
++    constexpr int OFF_PRB = OFF_LOG + ROWS_ * NROUT_;
++    constexpr int OFF_XF = OFF_PRB + ROWS_ * NROUT_;
++    constexpr int OFF_XB = OFF_XF + ROWS_ * KH_;
++    constexpr int OFF_UGS = OFF_XB + ROWS_ * KH_ / 2;
++    constexpr int OFF_AST = OFF_UGS + ROWS_ * NEXP_ * 2 * KD_;
++    constexpr int OFF_DST = OFF_AST + ROWS_ * NEXP_ * KD_ / 2;
++    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
++    float* idxf = scratch + OFF_IDX;
++    float* scoref = scratch + OFF_SCO;
++    float* logits = scratch + OFF_LOG;
++    float* probs = scratch + OFF_PRB;
++    float* xf = scratch + OFF_XF;
++    __nv_bfloat16* xb = reinterpret_cast<__nv_bfloat16*>(scratch + OFF_XB);
++    float* ugstage = scratch + OFF_UGS;
++    __nv_bfloat16* astage = reinterpret_cast<__nv_bfloat16*>(scratch + OFF_AST);
++    float* dstage = scratch + OFF_DST;
++
++    __shared__ float red[WARPS];
++    __shared__ float gsum_s;
++
++    // ---- phase 0: add + RMSNorm, row r on block r, staged to global ------
++    if (blk < ROWS_) {
++        const int row = blk;
++        const T_* hrow = hin + (long long)row * KH_;
++        const T_* rrow = rin + (long long)row * KH_;
++        constexpr int VEC = KH_ / THREADS_;
++        const int base = tid * VEC;
++        float hb[VEC];
++        float ss = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const T_ rounded = static_cast<T_>(
++                static_cast<float>(hrow[base + i]) + static_cast<float>(rrow[base + i]));
++            hb[i] = static_cast<float>(rounded);
++            ss += hb[i] * hb[i];
++        }
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
++        if (lane == 0) red[warp] = ss;
++        __syncthreads();
++        float tot = (lane < WARPS) ? red[lane] : 0.0f;
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
++        if (tid == 0) gsum_s = tot;
++        __syncthreads();
++        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const int idx = base + i;
++            const float v = static_cast<float>(static_cast<T_>(
++                hb[i] * nscale * static_cast<float>(nw[idx])));
++            xf[(long long)row * KH_ + idx] = v;
++            xb[(long long)row * KH_ + idx] = __nv_bfloat16(v);
++        }
++    }
++
++    // ---- barrier 1 --------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[0], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[8], 1u);
++        else while (atomicAdd(&ctr[8], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase A: router logits, tasks (row, expert-row) ------------------
++    for (int task = wglobal; task < ROWS_ * NROUT_; task += GRID_ * WARPS) {
++        const int row = task / NROUT_;
++        const int rrow = task - row * NROUT_;
++        const float* xrow = xf + (long long)row * KH_;
++        const __nv_bfloat16* wrow = rw + (long long)rrow * KH_;
++        float sum = 0.0f;
++        for (int col = 4 * lane; col < KH_; col += 128) {
++            const __nv_bfloat162 wab =
++                *reinterpret_cast<const __nv_bfloat162*>(wrow + col);
++            const __nv_bfloat162 wcd =
++                *reinterpret_cast<const __nv_bfloat162*>(wrow + col + 2);
++            sum = fmaf(__bfloat162float(wab.x), xrow[col], sum);
++            sum = fmaf(__bfloat162float(wab.y), xrow[col + 1], sum);
++            sum = fmaf(__bfloat162float(wcd.x), xrow[col + 2], sum);
++            sum = fmaf(__bfloat162float(wcd.y), xrow[col + 3], sum);
++        }
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1)
++            sum += __shfl_down_sync(0xffffffffu, sum, o);
++        if (lane == 0) logits[(long long)row * NROUT_ + rrow] = sum;
++    }
++
++    // ---- barrier 2 --------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[1], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[9], 1u);
++        else while (atomicAdd(&ctr[9], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase B: softmax + top-8 + renorm, row r on block r --------------
++    __shared__ float local_max[2];
++    __shared__ float local_norm[2];
++    if (blk < ROWS_) {
++        const int row = blk;
++        float* rlog = logits + (long long)row * NROUT_;
++        float* rprb = probs + (long long)row * NROUT_;
++        float* ridx = idxf + row * 8;
++        float* rsco = scoref + row * 8;
++        constexpr int N_READS = 4;
++        constexpr int SWARPS = 2;  // 64 active threads
++        const bool active = tid < 64;
++        const int slane = tid & 31;
++        const int swarp = tid >> 5;
++        float vals[N_READS];
++        float maxval = -INFINITY;
++        float normalizer = 0.0f;
++        float prevmax;
++        if (active) {
++            #pragma unroll
++            for (int i = 0; i < N_READS; ++i)
++                vals[i] = rlog[tid * N_READS + i];
++            #pragma unroll
++            for (int i = 0; i < N_READS; ++i)
++                maxval = fmaxf(maxval, vals[i]);
++            #pragma unroll
++            for (int i = 0; i < N_READS; ++i)
++                normalizer = normalizer + __expf(vals[i] - maxval);
++            prevmax = maxval;
++            #pragma unroll
++            for (int o = 16; o > 0; o >>= 1)
++                maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffffu, maxval, o));
++            normalizer = normalizer * __expf(prevmax - maxval);
++            #pragma unroll
++            for (int o = 16; o > 0; o >>= 1)
++                normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
++            prevmax = maxval;
++            if (slane == 0) local_max[swarp] = maxval;
++        }
++        __syncthreads();
++        if (active) {
++            maxval = (slane < SWARPS) ? local_max[slane] : -INFINITY;
++            #pragma unroll
++            for (int o = 16; o > 0; o >>= 1)
++                maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffffu, maxval, o));
++            normalizer = normalizer * __expf(prevmax - maxval);
++            if (slane == 0) local_norm[swarp] = normalizer;
++        }
++        __syncthreads();
++        if (active) {
++            normalizer = (slane < SWARPS) ? local_norm[slane] : 0.0f;
++            #pragma unroll
++            for (int o = 16; o > 0; o >>= 1)
++                normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
++            normalizer = 1.0f / normalizer;
++            #pragma unroll
++            for (int i = 0; i < N_READS; ++i)
++                rprb[tid * N_READS + i] =
++                    __expf(vals[i] - maxval) * normalizer;
++        }
++        __syncthreads();
++
++        if (tid < 32) {
++            int chosen[NEXP_];
++            #pragma unroll
++            for (int k = 0; k < NEXP_; ++k) {
++                float bestv = -INFINITY;
++                int besti = -1;
++                for (int i = lane; i < NROUT_; i += 32) {
++                    bool taken = false;
++                    #pragma unroll
++                    for (int t = 0; t < NEXP_; ++t)
++                        if (t < k && chosen[t] == i) taken = true;
++                    if (taken) continue;
++                    const float v = rprb[i];
++                    if (v > bestv || (v == bestv && i > besti)) {
++                        bestv = v;
++                        besti = i;
++                    }
++                }
++                #pragma unroll
++                for (int o = 16; o > 0; o >>= 1) {
++                    const float ov = __shfl_down_sync(0xffffffffu, bestv, o);
++                    const int oi = __shfl_down_sync(0xffffffffu, besti, o);
++                    if (ov > bestv || (ov == bestv && oi > besti)) {
++                        bestv = ov;
++                        besti = oi;
++                    }
++                }
++                besti = __shfl_sync(0xffffffffu, besti, 0);
++                chosen[k] = besti;
++            }
++            if (tid == 0) {
++            #pragma unroll
++            for (int e = 0; e < NEXP_; ++e) {
++                const int src = NEXP_ - 1 - e;
++                ridx[e] = static_cast<float>(chosen[src]);
++                rsco[e] = rprb[chosen[src]];
++            }
++            const float lo = __fadd_rn(__fadd_rn(__fadd_rn(
++                rsco[0], rsco[1]), rsco[2]), rsco[3]);
++            const float hi = __fadd_rn(__fadd_rn(__fadd_rn(
++                rsco[4], rsco[5]), rsco[6]), rsco[7]);
++            const float sum = __fadd_rn(lo, hi);
++            const float denom = sum + 1e-20f;
++            #pragma unroll
++            for (int e = 0; e < NEXP_; ++e)
++                rsco[e] = __fdiv_rn(rsco[e], denom);
++            }
++        }
++    }
++
++    // ---- barrier 3 --------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[2], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[10], 1u);
++        else while (atomicAdd(&ctr[10], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase C: up_gate experts, tasks (row, expert, octet) -------------
++    {
++        constexpr int OCTS = 2 * KD_ / 8;
++        const long long wstride = (2LL * KD_) * (KH_ / 16);
++        const long long gstride = (2LL * KD_) * (KH_ / GS);
++        for (int task = wglobal; task < ROWS_ * NEXP_ * OCTS;
++             task += GRID_ * WARPS) {
++            const int row = task / (NEXP_ * OCTS);
++            const int rem = task - row * NEXP_ * OCTS;
++            const int e = rem / OCTS;
++            const int oct = rem - e * OCTS;
++            const int we = static_cast<int>(idxf[row * 8 + e]);
++            const unsigned int* wq =
++                reinterpret_cast<const unsigned int*>(ugw) + we * wstride;
++            const __nv_bfloat16* sc = ugs + we * gstride;
++            const __nv_bfloat16* bi = ugb + we * gstride;
++            const __nv_bfloat16* xrow = xb + (long long)row * KH_;
++            float o0 = 0.0f, o1 = 0.0f;
++            for (int kt = 0; kt < KH_ / 128; ++kt) {
++                qmm_tile(xrow, wq, sc, bi, KH_ / 16, KH_ / GS,
++                         oct * 8, kt * 128, GS, lane, o0, o1);
++            }
++            if ((lane >> 2) == 0) {
++                const int c = oct * 8 + 2 * (lane & 3);
++                float* ug = ugstage + ((long long)row * NEXP_ + e) * 2 * KD_;
++                ug[c] = __bfloat162float(__nv_bfloat16(o0));
++                ug[c + 1] = __bfloat162float(__nv_bfloat16(o1));
++            }
++        }
++    }
++
++    // ---- barrier 4 --------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[3], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[11], 1u);
++        else while (atomicAdd(&ctr[11], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase S: SwiGLU into the global bf16 stage -----------------------
++    // The production kernel recomputes this per block into shared memory;
++    // B*8*KD_ bf16 no longer fits, so it is computed once (same formula,
++    // same inputs, same bits) and staged globally behind one extra barrier.
++    for (int i = blk * THREADS_ + tid; i < ROWS_ * NEXP_ * KD_;
++         i += GRID_ * THREADS_) {
++        const int re = i / KD_;
++        const int c = i - re * KD_;
++        const float* ug = ugstage + (long long)re * 2 * KD_;
++        astage[i] = exact_swiglu(ug[KD_ + c], ug[c]);
++    }
++
++    // ---- barrier 5 --------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[4], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[12], 1u);
++        else while (atomicAdd(&ctr[12], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase D: down experts, tasks (row, expert, octet) ----------------
++    {
++        constexpr int OCTS = ND_ / 8;
++        const long long wstride = (long long)ND_ * (KD_ / 16);
++        const long long gstride = (long long)ND_ * (KD_ / GS);
++        for (int task = wglobal; task < ROWS_ * NEXP_ * OCTS;
++             task += GRID_ * WARPS) {
++            const int row = task / (NEXP_ * OCTS);
++            const int rem = task - row * NEXP_ * OCTS;
++            const int e = rem / OCTS;
++            const int oct = rem - e * OCTS;
++            const int we = static_cast<int>(idxf[row * 8 + e]);
++            const unsigned int* wq =
++                reinterpret_cast<const unsigned int*>(dnw) + we * wstride;
++            const __nv_bfloat16* sc = dns + we * gstride;
++            const __nv_bfloat16* bi = dnb + we * gstride;
++            const __nv_bfloat16* arow =
++                astage + ((long long)row * NEXP_ + e) * KD_;
++            float a0 = 0.0f, a1 = 0.0f;
++            for (int kt = 0; kt < KD_ / 128; ++kt) {
++                qmm_tile(arow, wq, sc, bi, KD_ / 16, KD_ / GS,
++                         oct * 8, kt * 128, GS, lane, a0, a1);
++            }
++            if ((lane >> 2) == 0) {
++                const int c = oct * 8 + 2 * (lane & 3);
++                float* ds = dstage + ((long long)row * NEXP_ + e) * ND_;
++                ds[c] = __bfloat162float(__nv_bfloat16(a0));
++                ds[c + 1] = __bfloat162float(__nv_bfloat16(a1));
++            }
++        }
++    }
++
++    // ---- barrier 6 --------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[5], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[13], 1u);
++        else while (atomicAdd(&ctr[13], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++    if (blk >= ROWS_) return;
++
++    // ---- phase E: aggregation + residual + next norm, row r on block r ----
++    {
++        const int row = blk;
++        const T_* hrow = hin + (long long)row * KH_;
++        const T_* rrow = rin + (long long)row * KH_;
++        T_* horow = hout + (long long)row * KH_;
++        T_* orow = out + (long long)row * KH_;
++        const float* rsco = scoref + row * 8;
++        const float* ds0 = dstage + (long long)row * NEXP_ * ND_;
++        constexpr int VEC = KH_ / THREADS_;
++        const int base = tid * VEC;
++        float sb[VEC];
++        float ss = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const int idx = base + i;
++            float agg = 0.0f;
++            #pragma unroll
++            for (int e = 0; e < NEXP_; ++e)
++                agg = __fadd_rn(agg,
++                    __fmul_rn(ds0[e * ND_ + idx], rsco[e]));
++            const float aggb = __bfloat162float(__nv_bfloat16(agg));
++            const T_ s = static_cast<T_>(
++                static_cast<float>(hrow[idx]) + static_cast<float>(rrow[idx]));
++            const T_ s2 = static_cast<T_>(static_cast<float>(s) + aggb);
++            horow[idx] = s2;
++            sb[i] = static_cast<float>(s2);
++            ss += sb[i] * sb[i];
++        }
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
++        if (lane == 0) red[warp] = ss;
++        __syncthreads();
++        float tot = (lane < WARPS) ? red[lane] : 0.0f;
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
++        if (tid == 0) gsum_s = tot;
++        __syncthreads();
++        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            const int idx = base + i;
++            orow[idx] = static_cast<T_>(
++                sb[i] * nscale * static_cast<float>(nw2[idx]));
++        }
++    }
++"""
++
++
++_moe_batch_megakernel_cache = {}
++
++
++def _moe_batch_megakernel(eps):
++    """The M=B research kernel; gated by maple_moe_batch_check.py before
++    any production wiring."""
++    kernel = _moe_batch_megakernel_cache.get(eps)
++    if kernel is None:
++        kernel = _moe_batch_megakernel_cache[eps] = mx.fast.cuda_kernel(
++            name="maple_moe_batch_megakernel",
++            input_names=["hin", "rin", "nw", "rw", "ugw", "ugs", "ugb",
++                         "dnw", "dns", "dnb", "nw2"],
++            output_names=["out", "hout", "scratch"],
++            source=_MOE_BATCH_MEGAKERNEL_SOURCE.replace(
++                "EPS_", f"{eps:.10e}f"),
++            header=_MOE_EXACT_MEGAKERNEL_HEADER,
++        )
++    return kernel
++
++
++def _moe_batch_megakernel_plan(block, ln, dtype, rows, grid=None,
++                               threads=512):
++    """Geometry for the batch kernel: the exact lane's gates plus the
++    row-count bound (every row-per-block phase needs rows <= grid)."""
++    base = _moe_exact_megakernel_plan(block, ln, dtype, grid=grid,
++                                      threads=threads)
++    if base is False:
++        return False
++    _, kwargs = base
++    grid = _moe_megakernel_grid() if grid is None else grid
++    if not (1 <= rows <= min(8, grid)):
++        return False
++    kh = block.switch_mlp.up_gate_proj.input_dims
++    kd = block.switch_mlp.down_proj.input_dims
++    nd = block.switch_mlp.down_proj.output_dims
++    ne = block.gate.top_k
++    nr = block.gate.num_experts
++    scratch = (16 + rows * 8 * 2 + rows * nr * 2 + rows * kh
++               + rows * kh // 2 + rows * ne * 2 * kd
++               + rows * ne * kd // 2 + rows * ne * nd)
++    return (
++        _moe_batch_megakernel(ln.eps),
++        {
++            "template": [t for t in kwargs["template"]
++                         if t[0] != "GRID_"] + [
++                ("GRID_", grid), ("ROWS_", rows)],
++            "grid": (grid * threads, 1, 1),
++            "threadgroup": (threads, 1, 1),
++            "output_shapes": [(rows, 1, nd), (rows, 1, kh), (scratch,)],
++            "output_dtypes": [dtype, dtype, mx.float32],
++            "init_value": 0,
++        },
++    )
++
++
++def _moe_batch_call(layer, h, r, ln, next_w):
++    """The M=B MoE step; same contract as `_moe_exact_megakernel_call`."""
++    block = layer.mlp
++    rows = h.shape[0]
++    plans = getattr(block, "_batch_megakernel_plans", None)
++    if plans is None:
++        plans = block._batch_megakernel_plans = {}
++    plan = plans.get(rows)
++    if plan is None:
++        # The batch kernel is register-heavier than the single-row one, so
++        # its residency ceiling is lower (192 deadlocks on 82 SMs where
++        # the production kernel runs it -- roughly 2 blocks/SM at 512
++        # threads).  Per-profile defaults clamp to the smallest class
++        # member (sm120: RTX 5080's 84 SMs -> 160); big hosts opt higher
++        # via env -- measured: 128 on the 3090 (-10..12%), 256 on the
++        # 5090 (-41..47%).
++        try:
++            grid = int(os.environ.get("MAPLE_BATCH_MOE_GRID", "0")) or None
++        except ValueError:
++            grid = None
++        if grid is None:
++            prof_name = _cuda_profile().name
++            grid = {"sm100": 160, "sm120": 160}.get(prof_name)
++        try:
++            plan = _moe_batch_megakernel_plan(block, ln, h.dtype, rows,
++                                              grid=grid)
++        except (AttributeError, RuntimeError, TypeError, ValueError):
++            plan = False
++        plans[rows] = plan
++    if plan is False:
++        return None
++    kernel, kwargs = plan
++    mlp = block.switch_mlp
++    ug, dp = mlp.up_gate_proj, mlp.down_proj
++    try:
++        hn, hout, _ = kernel(
++            inputs=[h, r, ln.weight, block.gate.weight, ug.weight, ug.scales,
++                    ug.biases, dp.weight, dp.scales, dp.biases, next_w],
++            **kwargs,
++        )
++    except (RuntimeError, TypeError, ValueError):
++        plans[rows] = False
++        return None
++    return hout, hn
++
 +
 +# The attention megakernel: the whole decode attention block -- qkv gemv,
 +# per-head RMSNorm + RoPE, the KV-cache append, single-token SDPA and the
@@ -3190,6 +3748,585 @@ index a0673f7..fef0b29 100644
 +"""
 +
 +
++_ATTN_VERIFY_AB_SOURCE = r"""
++    constexpr int WARP = 32;
++    constexpr int HD = 128;
++    constexpr int VPL = HD / WARP;
++    constexpr int NH = NQ_ + 2 * NKV_;
++    constexpr int QKVROWS = NH * HD;
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int blk = blockIdx.x;
++    const int wglobal = blk * (THREADS_ / 32) + warp;
++
++    constexpr int OFF_QKV = 16;
++    constexpr int OFF_Q = OFF_QKV + ROWS_ * QKVROWS;
++    constexpr int OFF_O = OFF_Q + ROWS_ * NQ_ * HD;
++    constexpr int OFF_HNF = OFF_O + ROWS_ * NQ_ * HD;
++    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
++    float* stq_kv = scratch + OFF_QKV;
++    float* stq = scratch + OFF_Q;
++    float* sto = scratch + OFF_O;
++    float* hnf = scratch + OFF_HNF;
++
++    float* live = const_cast<float*>(scalars);
++    const float pos0 = live[0];
++    const int kl0 = static_cast<int>(live[1]);
++    const int slot0 = static_cast<int>(live[2]);
++    constexpr float eps = EPS_;
++    constexpr float log2b = LOG2B_;
++
++    // ---- phase A0: stage the pack inputs as exact float(bf16) ----------
++    for (int i = blk * THREADS_ + tid; i < ROWS_ * KH_;
++         i += GRID_ * THREADS_) {
++        hnf[i] = static_cast<float>(hn[i]);
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old0 = atomicAdd(&ctr[3], 1u);
++        if (old0 == GRID_ - 1) atomicExch(&ctr[11], 1u);
++        else while (atomicAdd(&ctr[11], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase A: qkv for every pack row (the stock qmv recipe) --------
++    for (int task = wglobal; task < ROWS_ * QKVROWS;
++         task += GRID_ * (THREADS_ / 32)) {
++        const int r = task / QKVROWS;
++        const int qrow = task % QKVROWS;
++        const float sum = qmv_row(
++            hnf + (long long)r * KH_,
++            reinterpret_cast<const unsigned int*>(wqkv),
++            reinterpret_cast<const __nv_bfloat16*>(sqkv),
++            reinterpret_cast<const __nv_bfloat16*>(bqkv),
++            qrow, KH_, lane);
++        if (lane == 0)
++            stq_kv[(long long)r * QKVROWS + qrow] =
++                static_cast<float>(static_cast<T_>(sum));
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[0], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[8], 1u);
++        else while (atomicAdd(&ctr[8], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase B: split + QK norm + RoPE + cache append, per (row, head)
++    for (int task = wglobal; task < ROWS_ * NH;
++         task += GRID_ * (THREADS_ / 32)) {
++        const int r = task / NH;
++        const int head = task % NH;
++        const float* xh = stq_kv + (long long)r * QKVROWS + head * HD;
++        const float pos = RAGGED_ ? live[3 + r * 3 + 0]
++            : (BATCH_ ? pos0 : (pos0 + (float)r));
++        const int slot = RAGGED_ ? (int)live[3 + r * 3 + 2]
++            : (BATCH_ ? slot0 : (slot0 + r));
++        const long long bplane = (RAGGED_ || BATCH_)
++            ? (long long)r * NKV_ * CAP_ * HD : 0;
++        T_* kc = const_cast<T_*>(kcache) + bplane;
++        T_* vc = const_cast<T_*>(vcache) + bplane;
++        if (head >= NQ_ + NKV_) {
++            const int kvh = head - NQ_ - NKV_;
++            T_* vh = vc + ((long long)kvh * CAP_ + slot) * HD;
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                const int j = lane * VPL + i;
++                vh[j] = static_cast<T_>(xh[j]);
++            }
++        } else {
++            const T_* wh = wqk + head * HD;
++            float sum_sq = 0.0f;
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                const float value = xh[lane * VPL + i];
++                sum_sq += value * value;
++            }
++            #pragma unroll
++            for (int offset = 16; offset > 0; offset >>= 1)
++                sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, offset);
++            sum_sq = __shfl_sync(0xffffffffu, sum_sq, 0);
++            const float nscale = rsqrtf(sum_sq / (float)HD + eps);
++            float rope_cos[VPL], rope_sin[VPL];
++            if (ROPE_) {
++                #pragma unroll
++                for (int i = 0; i < VPL; ++i) {
++                    const int j = lane * VPL + i;
++                    if (j < RD_) {
++                        constexpr int rhalf = RD_ > 0 ? RD_ / 2 : 1;
++                        const int pp = (j < rhalf) ? j : j - rhalf;
++                        const float fraction = (float)pp / (float)(RD_ / 2);
++                        const float frequency = exp2f(-fraction * log2b);
++                        const float angle = pos * frequency;
++                        rope_cos[i] = cosf(angle);
++                        rope_sin[i] = sinf(angle);
++                    }
++                }
++            }
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                const int j = lane * VPL + i;
++                const T_ normalized = static_cast<T_>(
++                    xh[j] * nscale * static_cast<float>(wh[j]));
++                float value = static_cast<float>(normalized);
++                if (ROPE_ && j < RD_) {
++                    constexpr int rhalf = RD_ > 0 ? RD_ / 2 : 1;
++                    const int pair = j < rhalf ? j + rhalf : j - rhalf;
++                    const T_ paired_normalized = static_cast<T_>(
++                        xh[pair] * nscale * static_cast<float>(wh[pair]));
++                    const float paired = static_cast<float>(paired_normalized);
++                    value = (j < rhalf)
++                        ? value * rope_cos[i] - paired * rope_sin[i]
++                        : SECOND_HALF_;
++                }
++                const T_ out_b = static_cast<T_>(value);
++                if (head < NQ_) {
++                    stq[((long long)r * NQ_ + head) * HD + j] =
++                        static_cast<float>(out_b);
++                } else {
++                    const int kvh = head - NQ_;
++                    kc[((long long)kvh * CAP_ + slot) * HD + j] = out_b;
++                }
++            }
++        }
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[1], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[9], 1u);
++        else while (atomicAdd(&ctr[9], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++"""
++
++
++_ATTN_VERIFY_CD_SOURCE = r"""
++    constexpr int WARP = 32;
++    constexpr int HD = 128;
++    constexpr int VPL = HD / WARP;
++    constexpr int NH = NQ_ + 2 * NKV_;
++    constexpr int QKVROWS = NH * HD;
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int blk = blockIdx.x;
++    const int wglobal = blk * (THREADS_ / 32) + warp;
++
++    constexpr int OFF_QKV = 16;
++    constexpr int OFF_Q = OFF_QKV + ROWS_ * QKVROWS;
++    constexpr int OFF_O = OFF_Q + ROWS_ * NQ_ * HD;
++    constexpr int OFF_HNF = OFF_O + ROWS_ * NQ_ * HD;
++    constexpr int OFF_P = OFF_HNF + ROWS_ * KH_;   // 2-pass slab partials
++    constexpr int OFF_PS = OFF_P + ROWS_ * NQ_ * 32 * HD;
++    constexpr int OFF_PM = OFF_PS + ROWS_ * NQ_ * 32;
++    float* scratch_w = const_cast<float*>(scratch_in);
++    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch_w);
++    float* stq_kv = scratch_w + OFF_QKV;
++    float* stq = scratch_w + OFF_Q;
++    float* sto = scratch_w + OFF_O;
++    float* hnf = scratch_w + OFF_HNF;
++
++    float* live = const_cast<float*>(scalars);
++    const float pos0 = live[0];
++    const int kl0 = static_cast<int>(live[1]);
++    const int slot0 = static_cast<int>(live[2]);
++    constexpr float eps = EPS_;
++    constexpr float log2b = LOG2B_;
++    (void)pos0; (void)eps; (void)log2b; (void)hnf; (void)stq_kv;
++
++    // ---- phase C: SDPA per (head, row), causal via kL = kl0 + r ---------
++    // Each row runs the algorithm the stock dispatch would pick for its
++    // own kL: the 1-pass port at kL <= 1024, the 2-pass slab port past
++    // it.  Rows in 1-pass mode skip the slab sections (whole-block
++    // continue -- every thread of a block shares one task) and 2-pass
++    // rows skip the 1-pass loop; the slab barrier is unconditional.
++    {
++        __shared__ float outs[32][33];
++        __shared__ float maxs[32];
++        __shared__ float sums[32];
++        const float scale_log2 = SCALE_ * 1.44269504088896340736f;
++        for (int task = blk; task < NQ_ * ROWS_; task += GRID_) {
++            const int head = task / ROWS_;
++            const int r = task % ROWS_;
++            const int kvh = head / (NQ_ / NKV_);
++            const int kL = RAGGED_ ? (int)live[3 + r * 3 + 1] : (BATCH_ ? kl0 : (kl0 + r));
++            if (kL > 1024) continue;  // whole block: no divergence
++            float q[VPL], k[VPL], o[VPL];
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                q[i] = scale_log2
++                     * stq[((long long)r * NQ_ + head) * HD + VPL * lane + i];
++                o[i] = 0.0f;
++            }
++            float max_score = -3.402823466e38f;
++            float sum_exp = 0.0f;
++            const long long kh = (long long)kvh * CAP_ * HD
++                + ((RAGGED_ || BATCH_) ? (long long)r * NKV_ * CAP_ * HD : 0);
++            for (int i = warp; i < kL; i += 32) {
++                #pragma unroll
++                for (int j = 0; j < VPL; ++j)
++                    k[j] = static_cast<float>(
++                        kcache[kh + (long long)i * HD + VPL * lane + j]);
++                float score = 0.0f;
++                #pragma unroll
++                for (int j = 0; j < VPL; ++j) score += q[j] * k[j];
++                #pragma unroll
++                for (int off = 16; off > 0; off >>= 1)
++                    score += __shfl_xor_sync(0xffffffffu, score, off);
++                const float new_max = fmaxf(max_score, score);
++                const float factor = exp2f(max_score - new_max);
++                const float exp_score = exp2f(score - new_max);
++                max_score = new_max;
++                sum_exp = sum_exp * factor + exp_score;
++                #pragma unroll
++                for (int j = 0; j < VPL; ++j)
++                    o[j] = o[j] * factor + exp_score * static_cast<float>(
++                        vcache[kh + (long long)i * HD + VPL * lane + j]);
++            }
++            if (lane == 0) { maxs[warp] = max_score; sums[warp] = sum_exp; }
++            __syncthreads();
++            max_score = maxs[lane];
++            float new_max = max_score;
++            #pragma unroll
++            for (int off = 16; off > 0; off >>= 1)
++                new_max = fmaxf(new_max,
++                                __shfl_xor_sync(0xffffffffu, new_max, off));
++            const float factor = exp2f(max_score - new_max);
++            float se = sums[lane] * factor;
++            #pragma unroll
++            for (int off = 16; off > 0; off >>= 1)
++                se += __shfl_xor_sync(0xffffffffu, se, off);
++            se = (se == 0.0f) ? 0.0f : __frcp_rn(se);
++            #pragma unroll
++            for (int i = 0; i < VPL; ++i) {
++                outs[lane][warp] = o[i];
++                __syncthreads();
++                float ot = outs[warp][lane] * factor;
++                #pragma unroll
++                for (int off = 16; off > 0; off >>= 1)
++                    ot += __shfl_xor_sync(0xffffffffu, ot, off);
++                o[i] = ot * se;
++                __syncthreads();
++            }
++            if (lane == 0) {
++                #pragma unroll
++                for (int i = 0; i < VPL; ++i)
++                    sto[((long long)r * NQ_ + head) * HD + VPL * warp + i] =
++                        static_cast<float>(static_cast<T_>(o[i]));
++            }
++            __syncthreads();
++        }
++
++        // -- 2-pass pass 1: the production slab recipe with a row plane.
++        // Four 8-warp slabs per block; sub-warps of one block can sit on
++        // DIFFERENT rows, so the loop is wave-shaped: barriers run
++        // unconditionally, work is gated per slab (shared traffic stays
++        // inside each sub's own maxs/sums/outs slots).
++        {
++            constexpr int PHD = HD + 2;
++            float* partials = scratch_w + OFF_P;
++            float* psums = scratch_w + OFF_PS;
++            float* pmaxs = scratch_w + OFF_PM;
++            (void)partials; (void)psums; (void)pmaxs; (void)PHD;
++            const int sub = warp >> 3;
++            const int swrp = warp & 7;
++            const int total1 = ROWS_ * NQ_ * 32;
++            const int waves1 = (total1 + GRID_ * 4 - 1) / (GRID_ * 4);
++            for (int w = 0; w < waves1; ++w) {
++                const int vb = (w * GRID_ + blk) * 4 + sub;
++                int r = 0, head = 0, slab = 0, kL = 0;
++                bool act = vb < total1;
++                if (act) {
++                    r = vb / (NQ_ * 32);
++                    const int rem = vb - r * NQ_ * 32;
++                    head = rem >> 5;
++                    slab = rem & 31;
++                    kL = RAGGED_ ? (int)live[3 + r * 3 + 1] : (BATCH_ ? kl0 : (kl0 + r));
++                    act = kL > 1024;
++                }
++                const int kvh = head / (NQ_ / NKV_);
++                float q[VPL], k[VPL], o[VPL];
++                float max_score = -3.402823466e38f;
++                float sum_exp = 0.0f;
++                if (act) {
++                    #pragma unroll
++                    for (int i = 0; i < VPL; ++i) {
++                        q[i] = scale_log2 * stq[
++                            ((long long)r * NQ_ + head) * HD + VPL * lane + i];
++                        o[i] = 0.0f;
++                    }
++                    const long long kh = (long long)kvh * CAP_ * HD
++                        + ((RAGGED_ || BATCH_) ? (long long)r * NKV_ * CAP_ * HD : 0);
++                    for (int i = slab * 8 + swrp; i < kL; i += 256) {
++                        #pragma unroll
++                        for (int j = 0; j < VPL; ++j)
++                            k[j] = static_cast<float>(
++                                kcache[kh + (long long)i * HD + VPL * lane + j]);
++                        float score = 0.0f;
++                        #pragma unroll
++                        for (int j = 0; j < VPL; ++j) score += q[j] * k[j];
++                        #pragma unroll
++                        for (int off = 16; off > 0; off >>= 1)
++                            score += __shfl_xor_sync(0xffffffffu, score, off);
++                        const float new_max = fmaxf(max_score, score);
++                        const float factor = exp2f(max_score - new_max);
++                        const float exp_score = exp2f(score - new_max);
++                        max_score = new_max;
++                        sum_exp = sum_exp * factor + exp_score;
++                        #pragma unroll
++                        for (int j = 0; j < VPL; ++j)
++                            o[j] = o[j] * factor + exp_score * static_cast<float>(
++                                vcache[kh + (long long)i * HD + VPL * lane + j]);
++                    }
++                    if (lane == 0) {
++                        maxs[sub * 8 + swrp] = max_score;
++                        sums[sub * 8 + swrp] = sum_exp;
++                    }
++                }
++                __syncthreads();
++                float new_max = -3.402823466e38f;
++                if (act) {
++                    const float wmax = (lane < 8) ? maxs[sub * 8 + lane] : -1e9f;
++                    new_max = wmax;
++                    #pragma unroll
++                    for (int off = 16; off > 0; off >>= 1)
++                        new_max = fmaxf(new_max,
++                                        __shfl_xor_sync(0xffffffffu, new_max, off));
++                    const float factor = exp2f(wmax - new_max);
++                    float se = (lane < 8) ? sums[sub * 8 + lane] : 0.0f;
++                    se *= factor;
++                    #pragma unroll
++                    for (int off = 16; off > 0; off >>= 1)
++                        se += __shfl_xor_sync(0xffffffffu, se, off);
++                    const long long p = ((long long)r * NQ_ + head) * 32 + slab;
++                    if (swrp == 0 && lane == 0) {
++                        psums[p] = se;
++                        pmaxs[p] = new_max;
++                    }
++                }
++                const float ff = act
++                    ? exp2f(maxs[sub * 8 + swrp] - new_max) : 0.0f;
++                #pragma unroll
++                for (int i = 0; i < VPL; ++i) {
++                    if (act) outs[sub * 8 + swrp][lane] = o[i] * ff;
++                    __syncthreads();
++                    if (act && swrp == 0) {
++                        float ot = outs[sub * 8][lane];
++                        #pragma unroll
++                        for (int j = 1; j < 8; ++j)
++                            ot += outs[sub * 8 + j][lane];
++                        o[i] = ot;
++                    }
++                    __syncthreads();
++                }
++                if (act && swrp == 0) {
++                    const long long p = ((long long)r * NQ_ + head) * 32 + slab;
++                    #pragma unroll
++                    for (int i = 0; i < VPL; ++i)
++                        partials[p * HD + VPL * lane + i] = o[i];
++                }
++                __syncthreads();
++            }
++        }
++
++        // -- slab barrier ---------------------------------------------------
++        __threadfence();
++        __syncthreads();
++        if (tid == 0) {
++            // AB consumed counter pairs 0-3; the CD kernel shares the
++            // scratch, so its barriers live on fresh slots 4 and 5.
++            const unsigned int old = atomicAdd(&ctr[5], 1u);
++            if (old == GRID_ - 1) atomicExch(&ctr[13], 1u);
++            else while (atomicAdd(&ctr[13], 0u) == 0u) __nanosleep(48);
++        }
++        __syncthreads();
++        __threadfence();
++
++        // -- 2-pass pass 2: one 32x32 merge per (row, head), wave-shaped.
++        {
++            float* partials = scratch_w + OFF_P;
++            float* psums = scratch_w + OFF_PS;
++            float* pmaxs = scratch_w + OFF_PM;
++            const int total2 = ROWS_ * NQ_;
++            const int waves2 = (total2 + GRID_ - 1) / GRID_;
++            for (int w = 0; w < waves2; ++w) {
++                const int t = w * GRID_ + blk;
++                int r = 0, head = 0, kL = 0;
++                bool act = t < total2;
++                if (act) {
++                    r = t / NQ_;
++                    head = t - r * NQ_;
++                    kL = RAGGED_ ? (int)live[3 + r * 3 + 1] : (BATCH_ ? kl0 : (kl0 + r));
++                    act = kL > 1024;
++                }
++                float o[VPL];
++                float factor = 0.0f, se = 0.0f;
++                if (act) {
++                    const long long p0 = ((long long)r * NQ_ + head) * 32;
++                    const float bmax = pmaxs[p0 + lane];
++                    float new_max = bmax;
++                    #pragma unroll
++                    for (int off = 16; off > 0; off >>= 1)
++                        new_max = fmaxf(new_max,
++                                        __shfl_xor_sync(0xffffffffu, new_max, off));
++                    factor = exp2f(bmax - new_max);
++                    se = psums[p0 + lane] * factor;
++                    #pragma unroll
++                    for (int off = 16; off > 0; off >>= 1)
++                        se += __shfl_xor_sync(0xffffffffu, se, off);
++                    se = (se == 0.0f) ? 0.0f : __frcp_rn(se);
++                    #pragma unroll
++                    for (int i = 0; i < VPL; ++i)
++                        o[i] = partials[(p0 + warp) * HD + VPL * lane + i];
++                }
++                #pragma unroll
++                for (int i = 0; i < VPL; ++i) {
++                    if (act) outs[lane][warp] = o[i];
++                    __syncthreads();
++                    if (act) {
++                        float ot = outs[warp][lane] * factor;
++                        #pragma unroll
++                        for (int off = 16; off > 0; off >>= 1)
++                            ot += __shfl_xor_sync(0xffffffffu, ot, off);
++                        o[i] = ot * se;
++                    }
++                    __syncthreads();
++                }
++                if (act && lane == 0) {
++                    #pragma unroll
++                    for (int i = 0; i < VPL; ++i)
++                        sto[((long long)r * NQ_ + head) * HD + VPL * warp + i]
++                            = static_cast<float>(static_cast<T_>(o[i]));
++                }
++                __syncthreads();
++            }
++        }
++    }
++
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[4], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[12], 1u);
++        else while (atomicAdd(&ctr[12], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++
++    // ---- phase D: o_proj for every pack row -----------------------------
++    for (int task = wglobal; task < ROWS_ * KH_;
++         task += GRID_ * (THREADS_ / 32)) {
++        const int r = task / KH_;
++        const int orow = task % KH_;
++        const float sum = qmv_row(
++            sto + (long long)r * NQ_ * HD,
++            reinterpret_cast<const unsigned int*>(wo),
++            reinterpret_cast<const __nv_bfloat16*>(so_),
++            reinterpret_cast<const __nv_bfloat16*>(bo_),
++            orow, NQ_ * HD, lane);
++        if (lane == 0)
++            out[(long long)r * KH_ + orow] = static_cast<T_>(sum);
++    }
++
++    if (blk == 0 && tid == 0) {
++        if (RAGGED_) {
++            // every row advances its own counters, production clamp/wrap
++            for (int r = 0; r < ROWS_; ++r) {
++                const float pr = live[3 + r * 3 + 0];
++                const int kr = (int)live[3 + r * 3 + 1];
++                const int sr = (int)live[3 + r * 3 + 2];
++                live[3 + r * 3 + 0] = pr + 1.0f;
++                live[3 + r * 3 + 1] =
++                    (kr < CAP_) ? (float)(kr + 1) : (float)CAP_;
++                const int ns = sr + 1;
++                live[3 + r * 3 + 2] = (ns == CAP_) ? 0.0f : (float)ns;
++            }
++        } else if (BATCH_) {
++            // one token per stream: the counters advance like a single
++            // sequential step, shared by every row -- with the SAME
++            // clamp and ring wrap the production tail applies, or a
++            // wrapped sliding window walks its device counters off the
++            // buffer while the host counters stay sane.
++            live[0] = pos0 + 1.0f;
++            live[1] = (kl0 < CAP_) ? (float)(kl0 + 1) : (float)CAP_;
++            const int nslot = slot0 + 1;
++            live[2] = (nslot == CAP_) ? 0.0f : (float)nslot;
++        } else {
++            live[0] = pos0 + (float)ROWS_;
++            live[1] = (float)(kl0 + ROWS_);
++            live[2] = (float)(slot0 + ROWS_);
++        }
++    }
++"""
++
++
++_attn_verify_cache = {}
++
++
++def _attn_verify_kernels(profile_name, use_rope, scale, eps, log2b,
++                         batch=False, second_half_form=None):
++    if second_half_form is None:
++        # Bit-gated per profile: form 1 reproduces the production sm86
++        # compilation byte-for-byte (batch_kv_debug, 0 diffs x8); the
++        # Blackwell profiles pin form 0 in production already. Re-confirm
++        # on each new profile during scale-out.
++        second_half_form = 0 if profile_name in ("sm100", "sm120") else 1
++    key = (profile_name, use_rope, scale, eps, log2b, batch,
++           second_half_form)
++    pair = _attn_verify_cache.get(key)
++    if pair is None:
++        # The upper-half RoPE expression is contraction-sensitive (the
++        # sm100/sm120 story, chronicle #3): a fresh compilation of the
++        # same source can fma it differently from the production kernel.
++        # The verify pair therefore PINS the form; form 0/1 exist so the
++        # bit gate can select whichever reproduces production bytes on
++        # the profile at hand.
++        if profile_name in ("sm100", "sm120") or second_half_form == 0:
++            second_half = ("__fmaf_rn(value, rope_cos[i], "
++                           "__fmul_rn(paired, rope_sin[i]))")
++        else:
++            second_half = ("__fmaf_rn(paired, rope_sin[i], "
++                           "__fmul_rn(value, rope_cos[i]))")
++
++        def bake(src):
++            return (src
++                    .replace("SCALE_", f"{scale:.17e}f")
++                    .replace("EPS_", f"{eps:.10e}f")
++                    .replace("LOG2B_", f"{log2b:.17e}f")
++                    .replace("SECOND_HALF_", second_half))
++
++        suffix = "_batch" if batch else ""
++        ab = mx.fast.cuda_kernel(
++            name="maple_attn_verify_ab" + suffix,
++            input_names=["hn", "wqkv", "sqkv", "bqkv", "wqk",
++                         "kcache", "vcache", "scalars"],
++            output_names=["scratch"],
++            source=bake(_ATTN_VERIFY_AB_SOURCE),
++            header=_ATTN_MEGAKERNEL_HEADER,
++        )
++        cd = mx.fast.cuda_kernel(
++            name="maple_attn_verify_cd" + suffix,
++            input_names=["scratch_in", "wo", "so_", "bo_",
++                         "kcache", "vcache", "scalars"],
++            output_names=["out"],
++            source=bake(_ATTN_VERIFY_CD_SOURCE),
++            header=_ATTN_MEGAKERNEL_HEADER,
++        )
++        pair = _attn_verify_cache[key] = (ab, cd)
++    return pair
++
++
 +_attn_megakernel_cache = {}
 +
 +
@@ -3249,14 +4386,16 @@ index a0673f7..fef0b29 100644
 +    writes into the very input buffers the megakernel reads.
 +    """
 +
-+    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "synced_offset", "cache_ref")
++    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "rows", "synced_offset",
++                 "cache_ref")
 +
-+    def __init__(self, kv_heads, cap, dtype):
-+        self.kbuf = mx.zeros((1, kv_heads, cap, 128), dtype)
-+        self.vbuf = mx.zeros((1, kv_heads, cap, 128), dtype)
++    def __init__(self, kv_heads, cap, dtype, rows=1):
++        self.kbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
++        self.vbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
 +        self.ctr = mx.zeros((8,), mx.float32)
 +        mx.eval(self.kbuf, self.vbuf, self.ctr)
 +        self.cap = cap
++        self.rows = rows
 +        self.synced_offset = -1
 +        self.cache_ref = None
 +
@@ -3316,6 +4455,66 @@ index a0673f7..fef0b29 100644
 +    }
 +"""
 +
++# Row variant: seeds ONE row's plane of a ragged batch state and stamps
++# that row's counter triple at live[3 + row*3 .. +2] -- same const_cast
++# discipline (buffer pointers never move).
++_ATTN_SEED_ROW_SOURCE = r"""
++    constexpr int HD = 128;
++    const int n = static_cast<int>(meta[0]);
++    const int row = static_cast<int>(meta[4]);
++    T_* kd = const_cast<T_*>(kbuf) + (long long)row * KVH_ * CAP_ * HD;
++    T_* vd = const_cast<T_*>(vbuf) + (long long)row * KVH_ * CAP_ * HD;
++    const long long total = (long long)KVH_ * n * HD;
++    for (long long i = (long long)blockIdx.x * THREADS_ + threadIdx.x;
++         i < total; i += (long long)GRID_ * THREADS_) {
++        const int h = (int)(i / ((long long)n * HD));
++        const long long r = i - (long long)h * n * HD;
++        const int rw = (int)(r / HD);
++        const int j = (int)(r - (long long)rw * HD);
++        const long long dst = ((long long)h * CAP_ + rw) * HD + j;
++        kd[dst] = ks[i];
++        vd[dst] = vs[i];
++    }
++    if (blockIdx.x == 0 && threadIdx.x == 0) {
++        float* live = const_cast<float*>(ctr);
++        live[3 + row * 3 + 0] = meta[1];
++        live[3 + row * 3 + 1] = meta[2];
++        live[3 + row * 3 + 2] = meta[3];
++    }
++"""
++
++
++def _attn_seed_row_kernel():
++    kernel = _attn_seed_kernel_cache.get("row")
++    if kernel is None:
++        kernel = _attn_seed_kernel_cache["row"] = mx.fast.cuda_kernel(
++            name="maple_attn_seed_row",
++            input_names=["kbuf", "vbuf", "ctr", "ks", "vs", "meta"],
++            output_names=["ok"],
++            source=_ATTN_SEED_ROW_SOURCE,
++        )
++    return kernel
++
++
++def _attn_seed_row(state, row, keys_src, values_src, pos, kl, slot, dtype):
++    """Seed one plane of a ragged state; src is (1, kvh, n, 128)."""
++    n = keys_src.shape[2] if keys_src is not None else 0
++    if n == 0:
++        keys_src = mx.zeros((1, state.kbuf.shape[1], 1, 128), dtype)
++        values_src = keys_src
++    meta = mx.array([float(n), float(pos), float(kl), float(slot),
++                     float(row)], mx.float32)
++    (ok,) = _attn_seed_row_kernel()(
++        inputs=[state.kbuf, state.vbuf, state.ctr,
++                keys_src.astype(dtype), values_src.astype(dtype), meta],
++        template=[("T_", dtype), ("KVH_", int(state.kbuf.shape[1])),
++                  ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
++        grid=(64 * 256, 1, 1), threadgroup=(256, 1, 1),
++        output_shapes=[(1,)], output_dtypes=[mx.float32],
++    )
++    mx.eval(ok)
++
++
 +_attn_seed_kernel_cache = {}
 +
 +
@@ -3340,10 +4539,13 @@ index a0673f7..fef0b29 100644
 +        n = 0
 +    meta = mx.array([float(n), float(pos), float(kl), float(slot)],
 +                    mx.float32)
++    # The copy is a flat walk over (rows*kv_heads, n, 128) planes, so a
++    # batch state simply fuses its leading axes into the plane index.
 +    (ok,) = _attn_seed_kernel()(
 +        inputs=[state.kbuf, state.vbuf, state.ctr,
 +                keys_src.astype(dtype), values_src.astype(dtype), meta],
-+        template=[("T_", dtype), ("KVH_", int(state.kbuf.shape[1])),
++        template=[("T_", dtype),
++                  ("KVH_", int(state.kbuf.shape[0] * state.kbuf.shape[1])),
 +                  ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
 +        grid=(64 * 256, 1, 1), threadgroup=(256, 1, 1),
 +        output_shapes=[(1,)], output_dtypes=[mx.float32],
@@ -3384,6 +4586,12 @@ index a0673f7..fef0b29 100644
 +        return None
 +
 +    state = getattr(attn, "_mega_state", None)
++    if state is not None and state.rows != 1:
++        # A batch-lane state: its buffers carry B planes the single-row
++        # kernel would misindex. Materialize and rebuild.
++        state.materialize_old()
++        state = None
++        attn._mega_state = None
 +    if state is not None:
 +        state.bind(c)
 +    if rotating:
@@ -3520,6 +4728,501 @@ index a0673f7..fef0b29 100644
 +    c.values = state.vbuf[..., :phys, :]
 +    state.synced_offset = offset + 1  # our buffers are current for this offset
 +    return out
++
++
++def _attn_mega_call_batch(layer, hn, c):
++    """The M=B decode attention step through the AB/CD pair, or None.
++
++    Mirrors `_attn_mega_call`'s state discipline exactly -- persistent
++    buffers seeded kernel-side, stock counters in lockstep, live zero-copy
++    views published each step -- with a leading batch axis everywhere.
++    The pair carries the 1-pass SDPA port only, so kL must stay <= 1024;
++    a layer past that writes back and declines (stock takes the step).
++    """
++    attn = layer.self_attn
++    qkv = attn.qkv_proj
++    op = attn.o_proj
++    B = hn.shape[0]
++    if (
++        _cuda_profile() is None
++        or hn.dtype != mx.bfloat16
++        or attn.head_dim != 128
++        or not attn.use_qk_norm
++        or not attn._can_fuse_qk
++        or attn._fused_qk is not True
++        or getattr(qkv, "bits", None) != 2
++        or getattr(op, "bits", None) != 2
++        or getattr(qkv, "group_size", None) != 128
++        or getattr(op, "group_size", None) != 128
++        or getattr(qkv, "mode", "affine") != "affine"
++        or getattr(qkv, "biases", None) is None
++        or getattr(op, "biases", None) is None
++        or "bias" in qkv or "bias" in op
++        or hn.shape[-1] % 512 != 0
++        or (attn.num_attention_heads * 128) % 512 != 0
++    ):
++        return None
++    from mlx_lm.models.cache import KVCache, RotatingKVCache
++
++    rotating = isinstance(c, RotatingKVCache)
++    if not rotating and not isinstance(c, KVCache):
++        return None
++    if rotating and (c.keep != 0 or c.max_size is None):
++        return None
++
++    state = getattr(attn, "_mega_state", None)
++    if state is not None and state.rows != B:
++        state.materialize_old()
++        state = None
++        attn._mega_state = None
++    if state is not None:
++        state.bind(c)
++    if rotating:
++        cap = c.max_size
++        if cap > 1024:
++            return None
++        if state is None or state.cap != cap:
++            state = _AttnMegaState(attn.num_key_value_heads, cap,
++                                   hn.dtype, rows=B)
++            attn._mega_state = state
++            state.bind(c)
++    else:
++        # Full-attention layers grow 1024 -> 8192 exactly like the B=1
++        # lane; the CD kernel's 2-pass branch covers every kL past 1024.
++        needed = c.offset + 1
++        if needed > 8192:
++            _attn_mega_writeback(attn, c)
++            return None
++        if state is None:
++            cap = 1024
++            while cap < needed:
++                cap *= 2
++            state = _AttnMegaState(attn.num_key_value_heads, cap,
++                                   hn.dtype, rows=B)
++            attn._mega_state = state
++            state.bind(c)
++        elif needed > state.cap:
++            cap = state.cap
++            while cap < needed:
++                cap *= 2
++            grown = _AttnMegaState(attn.num_key_value_heads, cap,
++                                   hn.dtype, rows=B)
++            if state.synced_offset == c.offset and state.synced_offset > 0:
++                n = min(state.synced_offset, state.cap)
++                _attn_seed(grown, state.kbuf[..., :n, :],
++                           state.vbuf[..., :n, :],
++                           c.offset, c.offset + 1, c.offset, hn.dtype)
++                grown.synced_offset = c.offset
++            grown.cache_ref = state.cache_ref
++            state = grown
++            attn._mega_state = state
++        cap = state.cap
++
++    offset = c.offset
++    concat_tail = (
++        rotating and state.synced_offset != offset
++        and c.keys is not None and c.keys.shape[2] > cap)
++    if rotating:
++        if concat_tail:
++            idx = 0
++        else:
++            idx = c._idx
++            if idx == c.max_size:
++                idx = 0
++        kl_after = min(offset + 1, cap)
++        slot = idx
++    else:
++        slot = offset
++        kl_after = offset + 1
++    if kl_after > cap:
++        _attn_mega_writeback(attn, c)
++        return None
++
++    if state.synced_offset != offset:
++        ks = vs = None
++        if c.keys is not None and offset > 0:
++            if concat_tail:
++                n_phys = c.keys.shape[2]
++                ks = c.keys[..., n_phys - cap:, :]
++                vs = c.values[..., n_phys - cap:, :]
++            else:
++                n = min(c.keys.shape[2], cap)
++                ks = c.keys[..., :n, :]
++                vs = c.values[..., :n, :]
++        _attn_seed(state, ks, vs, offset, kl_after, slot, hn.dtype)
++        state.synced_offset = offset
++
++    if attn._qk_w is None:
++        attn._ensure_qk_constants()
++
++    ab, cd = _attn_verify_kernels(
++        _cuda_profile().name, attn.use_rope, float(attn.scale),
++        float(attn._eps), float(attn._rope_log2_base), batch=True,
++    )
++    kh = hn.shape[-1]
++    nq = attn.num_attention_heads
++    nkv = attn.num_key_value_heads
++    # Grid residency bounds the CD kernel (1024 threads: ONE block per SM
++    # on consumer parts).  Per-profile defaults are clamped to the
++    # smallest member of each class (sm86: RTX 3080's 68 SMs -> 64;
++    # sm120: RTX 5080's 84 SMs -> 80); big hosts opt higher via env --
++    # measured: 80 on the 3090 (-6..11%), 160 on the 5090 (-39..44%).
++    try:
++        grid = int(os.environ.get("MAPLE_BATCH_ATTENTION_GRID", "0"))
++    except ValueError:
++        grid = 0
++    if not grid:
++        prof = _cuda_profile().name
++        grid = {"sm100": 80, "sm120": 80}.get(prof, 0)
++    grid = grid or _attn_megakernel_grid()
++    tmpl = [
++        ("T_", hn.dtype), ("KH_", kh), ("NQ_", nq), ("NKV_", nkv),
++        ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
++        ("RD_", getattr(attn, "_rope_dim", 0) if attn.use_rope else 0),
++        ("ROWS_", B), ("BATCH_", 1), ("RAGGED_", 0),
++        ("GRID_", grid),
++    ]
++    try:
++        (scr,) = ab(
++            inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
++                    attn._qk_w, state.kbuf, state.vbuf, state.ctr],
++            template=tmpl + [("THREADS_", 512)],
++            grid=(grid * 512, 1, 1), threadgroup=(512, 1, 1),
++            output_shapes=[(16 + B * ((nq + 2 * nkv) * 128
++                                      + nq * 128 * 2 + kh
++                                      + nq * 32 * (128 + 2)),)],
++            output_dtypes=[mx.float32],
++            init_value=0,
++        )
++        (out,) = cd(
++            inputs=[scr, op.weight, op.scales, op.biases,
++                    state.kbuf, state.vbuf, state.ctr],
++            template=tmpl + [("THREADS_", 1024)],
++            grid=(grid * 1024, 1, 1), threadgroup=(1024, 1, 1),
++            output_shapes=[(B, kh)],
++            output_dtypes=[hn.dtype],
++        )
++    except (RuntimeError, TypeError, ValueError):
++        return None
++
++    c.offset = offset + 1
++    if rotating:
++        c._idx = slot + 1
++    phys = _stock_phys_rows(kl_after, cap)
++    c.keys = state.kbuf[..., :phys, :]
++    c.values = state.vbuf[..., :phys, :]
++    state.synced_offset = offset + 1
++    return out.reshape(B, 1, kh)
++
++
++class _AttnRaggedState:
++    """B-plane persistent buffers with PER-ROW sync: each plane mirrors a
++    different request's cache at its own offset. Same pointer discipline
++    as _AttnMegaState -- all (re)seeding is kernel-side."""
++
++    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "rows", "synced",
++                 "cache_refs")
++
++    def __init__(self, kv_heads, cap, dtype, rows):
++        self.kbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
++        self.vbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
++        self.ctr = mx.zeros((3 + 3 * rows,), mx.float32)
++        mx.eval(self.kbuf, self.vbuf, self.ctr)
++        self.cap = cap
++        self.rows = rows
++        self.synced = [-1] * rows
++        self.cache_refs = [None] * rows
++
++    def materialize_row(self, r):
++        ref = self.cache_refs[r]
++        old = ref() if ref is not None else None
++        if old is not None and self.synced[r] > 0:
++            n = min(self.synced[r], self.cap)
++            phys = _stock_phys_rows(n, self.cap)
++            old.keys = mx.contiguous(self.kbuf[r:r + 1, :, :phys, :])
++            old.values = mx.contiguous(self.vbuf[r:r + 1, :, :phys, :])
++            mx.eval(old.keys, old.values)
++
++    def bind_row(self, r, c):
++        ref = self.cache_refs[r]
++        if ref is not None and ref() is c:
++            return
++        self.materialize_row(r)
++        self.synced[r] = -1
++        self.cache_refs[r] = weakref.ref(c)
++
++    def materialize_all(self):
++        for r in range(self.rows):
++            self.materialize_row(r)
++            self.synced[r] = -1
++
++
++def _attn_mega_call_ragged(layer, hn, caches):
++    """One-dispatch-pair decode attention for B requests at DIFFERENT
++    offsets (their per-layer caches in `caches`), or None for stock."""
++    attn = layer.self_attn
++    qkv = attn.qkv_proj
++    op = attn.o_proj
++    B = hn.shape[0]
++    if (
++        _cuda_profile() is None
++        or hn.dtype != mx.bfloat16
++        or attn.head_dim != 128
++        or not attn.use_qk_norm
++        or not attn._can_fuse_qk
++        or attn._fused_qk is not True
++        or getattr(qkv, "bits", None) != 2
++        or getattr(op, "bits", None) != 2
++        or getattr(qkv, "group_size", None) != 128
++        or getattr(op, "group_size", None) != 128
++        or getattr(qkv, "mode", "affine") != "affine"
++        or getattr(qkv, "biases", None) is None
++        or getattr(op, "biases", None) is None
++        or "bias" in qkv or "bias" in op
++        or hn.shape[-1] % 512 != 0
++        or (attn.num_attention_heads * 128) % 512 != 0
++    ):
++        return None
++    from mlx_lm.models.cache import KVCache, RotatingKVCache
++
++    rotating = isinstance(caches[0], RotatingKVCache)
++    for c in caches:
++        if rotating != isinstance(c, RotatingKVCache):
++            return None
++        if not rotating and not isinstance(c, KVCache):
++            return None
++        if rotating and (c.keep != 0 or c.max_size is None):
++            return None
++
++    state = getattr(attn, "_ragged_state", None)
++    if state is not None and state.rows != B:
++        state.materialize_all()
++        state = None
++        attn._ragged_state = None
++    if rotating:
++        cap = caches[0].max_size
++        if cap > 1024 or any(c.max_size != cap for c in caches):
++            return None
++        if state is None or state.cap != cap:
++            if state is not None:
++                state.materialize_all()
++            state = _AttnRaggedState(attn.num_key_value_heads, cap,
++                                     hn.dtype, B)
++            attn._ragged_state = state
++    else:
++        needed = max(c.offset for c in caches) + 1
++        if needed > 8192:
++            if state is not None:
++                state.materialize_all()
++                attn._ragged_state = None
++            return None
++        if state is None or needed > state.cap:
++            cap = 1024 if state is None else state.cap
++            while cap < needed:
++                cap *= 2
++            if state is not None:
++                # simplest correct growth: push every plane back to its
++                # stock cache, rebuild, reseed below from stock
++                state.materialize_all()
++            state = _AttnRaggedState(attn.num_key_value_heads, cap,
++                                     hn.dtype, B)
++            attn._ragged_state = state
++        cap = state.cap
++
++    metas = []
++    for r, c in enumerate(caches):
++        state.bind_row(r, c)
++        offset = c.offset
++        concat_tail = (
++            rotating and state.synced[r] != offset
++            and c.keys is not None and c.keys.shape[2] > cap)
++        if rotating:
++            if concat_tail:
++                idx = 0
++            else:
++                idx = c._idx
++                if idx == c.max_size:
++                    idx = 0
++            kl_after = min(offset + 1, cap)
++            slot = idx
++        else:
++            slot = offset
++            kl_after = offset + 1
++        if kl_after > cap:
++            state.materialize_all()
++            attn._ragged_state = None
++            return None
++        if state.synced[r] != offset:
++            ks = vs = None
++            if c.keys is not None and offset > 0:
++                if concat_tail:
++                    n_phys = c.keys.shape[2]
++                    ks = c.keys[..., n_phys - cap:, :]
++                    vs = c.values[..., n_phys - cap:, :]
++                else:
++                    n = min(c.keys.shape[2], cap)
++                    ks = c.keys[..., :n, :]
++                    vs = c.values[..., :n, :]
++            _attn_seed_row(state, r, ks, vs, offset, kl_after, slot,
++                           hn.dtype)
++            state.synced[r] = offset
++        metas.append((offset, kl_after, slot))
++
++    if attn._qk_w is None:
++        attn._ensure_qk_constants()
++
++    ab, cd = _attn_verify_kernels(
++        _cuda_profile().name, attn.use_rope, float(attn.scale),
++        float(attn._eps), float(attn._rope_log2_base), batch=True,
++    )
++    kh = hn.shape[-1]
++    nq = attn.num_attention_heads
++    nkv = attn.num_key_value_heads
++    try:
++        grid = int(os.environ.get("MAPLE_BATCH_ATTENTION_GRID", "0"))
++    except ValueError:
++        grid = 0
++    if not grid:
++        grid = {"sm100": 80, "sm120": 80}.get(_cuda_profile().name, 0)
++    grid = grid or _attn_megakernel_grid()
++    tmpl = [
++        ("T_", hn.dtype), ("KH_", kh), ("NQ_", nq), ("NKV_", nkv),
++        ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
++        ("RD_", getattr(attn, "_rope_dim", 0) if attn.use_rope else 0),
++        ("ROWS_", B), ("BATCH_", 0), ("RAGGED_", 1), ("GRID_", grid),
++    ]
++    try:
++        (scr,) = ab(
++            inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
++                    attn._qk_w, state.kbuf, state.vbuf, state.ctr],
++            template=tmpl + [("THREADS_", 512)],
++            grid=(grid * 512, 1, 1), threadgroup=(512, 1, 1),
++            output_shapes=[(16 + B * ((nq + 2 * nkv) * 128
++                                      + nq * 128 * 2 + kh
++                                      + nq * 32 * (128 + 2)),)],
++            output_dtypes=[mx.float32],
++            init_value=0,
++        )
++        (out,) = cd(
++            inputs=[scr, op.weight, op.scales, op.biases,
++                    state.kbuf, state.vbuf, state.ctr],
++            template=tmpl + [("THREADS_", 1024)],
++            grid=(grid * 1024, 1, 1), threadgroup=(1024, 1, 1),
++            output_shapes=[(B, kh)],
++            output_dtypes=[hn.dtype],
++        )
++    except (RuntimeError, TypeError, ValueError):
++        return None
++
++    for r, (c, (offset, kl_after, slot)) in enumerate(zip(caches, metas)):
++        c.offset = offset + 1
++        if rotating:
++            c._idx = slot + 1
++        phys = _stock_phys_rows(kl_after, cap)
++        c.keys = state.kbuf[r:r + 1, :, :phys, :]
++        c.values = state.vbuf[r:r + 1, :, :phys, :]
++        state.synced[r] = offset + 1
++    return out.reshape(B, 1, kh)
++
++
++def ragged_decode_step(model, y, request_caches):
++    """One decode step for B requests at DIFFERENT offsets in ONE pass.
++
++    `y` is (B, 1) token ids; `request_caches` is a list of B per-request
++    prompt caches (each the usual per-layer list). Every row's bits equal
++    its solo decode step -- the serving contract. Returns (B, 1, vocab)
++    logits. The caller owns sampling and cache lifecycles.
++    """
++    inner = model.model
++    B = y.shape[0]
++    h = inner.word_embeddings(y)
++    fuse = None
++    if _use_fused_add_rms:
++        if inner._exact_add_norm is None:
++            inner._exact_add_norm = _exact_add_rms_ok(
++                h.shape[-1], h.dtype, inner.norm.weight, inner.norm.eps)
++        if inner._exact_add_norm:
++            fuse = _exact_add_rms_norm
++
++    def bfuse(hh, rr, w, eps):
++        if fuse is None:
++            ss = (hh + rr).astype(hh.dtype)
++            return ss, mx.fast.rms_norm(ss, w, eps)
++        parts = [fuse(hh[b:b + 1], rr[b:b + 1], w, eps) for b in range(B)]
++        return (mx.concatenate([pp[0] for pp in parts], axis=0),
++                mx.concatenate([pp[1] for pp in parts], axis=0))
++
++    r = mx.zeros(h.shape, h.dtype)
++    hn = None
++    mega_next = inner._megakernel_next_norms()
++    for i, (layer, layer_type) in enumerate(
++        zip(inner.layers, inner.layer_types)
++    ):
++        layer_caches = [rc[i] for rc in request_caches]
++        if hn is None:
++            ln = layer.input_layernorm
++            h, hn = bfuse(h, r, ln.weight, ln.eps)
++        r = _attn_mega_call_ragged(layer, hn, layer_caches)
++        if r is None:
++            r = mx.concatenate(
++                [layer.self_attn(hn[b:b + 1], None, layer_caches[b])
++                 for b in range(B)], axis=0)
++        hn = None
++        ln = layer.post_attention_layernorm
++        fused = _moe_batch_call(layer, h, r, ln, mega_next[i])
++        if fused is not None:
++            h, hn = fused
++            continue
++        h, hn2 = bfuse(h, r, ln.weight, ln.eps)
++        r = layer.mlp(hn2)
++    if hn is None:
++        h, hn = bfuse(h, r, inner.norm.weight, inner.norm.eps)
++    out = hn
++    if B > 4:
++        return mx.concatenate(
++            [model.lm_head(out[b:b + 1]) for b in range(B)], axis=0)
++    return model.lm_head(out)
++
++
++def _attn_mega_rollback(attn, c, to_offset):
++    """Rewind a fused layer's cache to an earlier offset (speculation).
++
++    Rejected draft tokens live only in slots past `to_offset` of the
++    persistent buffers; the next accepted token overwrites them, so a
++    rollback is purely counter surgery: reseed the on-device counters
++    through the seed kernel (n=0 copies nothing) and rewind the stock
++    counters in lockstep. Bit-safety: verified tokens' K/V at slots
++    < to_offset were written by the same recipes a sequential decode
++    would have used, so the resumed stream is the sequential stream.
++    Only valid while the state is bound and synced past `to_offset`.
++    """
++    state = getattr(attn, "_mega_state", None)
++    if state is None or not state.bound_to(c):
++        return False
++    if state.synced_offset < to_offset:
++        return False
++    from mlx_lm.models.cache import RotatingKVCache
++
++    rotating = isinstance(c, RotatingKVCache)
++    if rotating:
++        if c.offset >= c.max_size or to_offset >= c.max_size:
++            # A wrapped ring cannot rewind by counters alone: rejected
++            # slots may have overwritten live history.
++            return False
++        slot = to_offset
++        kl_after = min(to_offset + 1, state.cap)
++    else:
++        slot = to_offset
++        kl_after = to_offset + 1
++    # The counters describe the NEXT step: pos to write, kL after its
++    # append, and the slot it lands in -- same contract as the resync.
++    _attn_seed(state, None, None, to_offset, kl_after, slot,
++               state.kbuf.dtype)
++    c.offset = to_offset
++    if rotating:
++        c._idx = to_offset
++    state.synced_offset = to_offset
++    return True
 +
 +
 +def _attn_mega_writeback(attn, c):
@@ -3836,18 +5539,18 @@ index a0673f7..fef0b29 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +4270,86 @@ class MapleModel(nn.Module):
+@@ -792,29 +5956,133 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
 +        self._exact_add_norm = None  # None = unprobed, then True/False
          self._zero = None
 +        self._mega_next = None  # None = unbuilt, False = eps mismatch, or list
- 
--    def _decode_fused(self, h, cache, full_mask, swa_mask):
++
 +    def _megakernel_next_norms(self):
 +        """Per-layer (next input norm weight | final norm weight) for the tail.
-+
+ 
+-    def _decode_fused(self, h, cache, full_mask, swa_mask):
 +        The megakernel's phase E norms with the *next* layer's weight, and the
 +        kernel bakes a single eps, so a model whose norms disagree on eps must
 +        not take the megakernel at all.  Built once; weights are fixed.
@@ -3866,6 +5569,53 @@ index a0673f7..fef0b29 100644
 +                nxt = False
 +            self._mega_next = nxt
 +        return nxt if nxt is not False else None
++
++    def _decode_batch_fused(self, h, cache, full_mask, swa_mask, fuse=None):
++        """The B<=8 decode step through the M=B megakernels.
++
++        Same (h, r, hn) carry as `_decode_fused`.  Boundary fuses MUST be
++        bit-equal per row to whatever the solo stream uses -- and the solo
++        stream's `_exact_add_rms_norm` is NOT bit-equal to the plain
++        add+rms pair (nor row-safe at B>1), so when a fuse is given it is
++        applied per row; only a fuse-less solo baseline uses the stock
++        pair.  Each megakernel lane falls back to the stock computation
++        per layer when its plan declines.
++        """
++        B = h.shape[0]
++
++        def bfuse(hh, rr, w, eps):
++            if fuse is None:
++                s = (hh + rr).astype(hh.dtype)
++                return s, mx.fast.rms_norm(s, w, eps)
++            parts = [fuse(hh[b:b + 1], rr[b:b + 1], w, eps)
++                     for b in range(B)]
++            return (mx.concatenate([p[0] for p in parts], axis=0),
++                    mx.concatenate([p[1] for p in parts], axis=0))
++
++        r = mx.zeros(h.shape, h.dtype)
++        hn = None
++        mega_next = self._megakernel_next_norms()
++        for i, (layer, c, layer_type) in enumerate(
++            zip(self.layers, cache, self.layer_types)
++        ):
++            mask = full_mask if layer_type == "full_attention" else swa_mask
++            if hn is None:
++                ln = layer.input_layernorm
++                h, hn = bfuse(h, r, ln.weight, ln.eps)
++            r = _attn_mega_call_batch(layer, hn, c)
++            if r is None:
++                r = layer.self_attn(hn, mask, c)
++            hn = None
++            ln = layer.post_attention_layernorm
++            fused = _moe_batch_call(layer, h, r, ln, mega_next[i])
++            if fused is not None:
++                h, hn = fused
++                continue
++            h, hn2 = bfuse(h, r, ln.weight, ln.eps)
++            r = layer.mlp(hn2)
++        if hn is not None:
++            return hn
++        return bfuse(h, r, self.norm.weight, self.norm.eps)[1]
 +
 +    def _decode_fused(self, h, cache, full_mask, swa_mask, fuse):
          """Decode loop with residual adds folded into the norms.
@@ -3931,9 +5681,28 @@ index a0673f7..fef0b29 100644
  
      def __call__(
          self,
-@@ -836,12 +4371,29 @@ class MapleModel(nn.Module):
+@@ -835,13 +6103,48 @@ class MapleModel(nn.Module):
+                 h, cache[self.swa_idx], window_size=self.window_size
              )
  
++        if (
++            h.ndim == 3
++            and h.shape[1] == 1
++            and 2 <= h.shape[0] <= _batch_megakernel_max_rows()
++        ):
++            # Boundary fuse: the SAME lane the solo stream would pick, so
++            # each batched row's boundary bits match its solo run.
++            fuse = None
++            if _use_fused_add_rms:
++                if self._exact_add_norm is None:
++                    self._exact_add_norm = _exact_add_rms_ok(
++                        h.shape[-1], h.dtype, self.norm.weight, self.norm.eps
++                    )
++                if self._exact_add_norm:
++                    fuse = _exact_add_rms_norm
++            return self._decode_batch_fused(
++                h, cache, full_mask, swa_mask, fuse)
++
          if h.size == h.shape[-1]:
 -            if self._fused_add_norm is None:
 +            # Strict lane first: the corrected kernel reproduces
@@ -3963,7 +5732,26 @@ index a0673f7..fef0b29 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -1021,6 +4573,32 @@ class Model(nn.Module):
+@@ -987,6 +6290,18 @@ class Model(nn.Module):
+             and getattr(self.lm_head, "mode", "affine") == "affine"
+         ):
+             return self.lm_head_flash(out, self.lm_head)
++        if (
++            out.ndim == 3
++            and out.shape[1] == 1
++            and 4 < out.shape[0] <= _batch_megakernel_max_rows()
++        ):
++            # The quantized-matmul head switches algorithms past M=4 and
++            # stops being row-invariant at the bit level (measured at M=8:
++            # every row differs from its solo run).  The batch lane's
++            # solo-exact contract therefore runs the head per row here.
++            return mx.concatenate(
++                [self.lm_head(out[b:b + 1]) for b in range(out.shape[0])],
++                axis=0)
+         return self.lm_head(out)
+ 
+     def sanitize(self, weights):
+@@ -1021,6 +6336,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -3996,7 +5784,7 @@ index a0673f7..fef0b29 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +4617,8 @@ class Model(nn.Module):
+@@ -1039,8 +6380,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
