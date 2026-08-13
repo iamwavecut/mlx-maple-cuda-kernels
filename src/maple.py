@@ -4582,10 +4582,14 @@ _ATTN_VERIFY_CD_SOURCE = r"""
     if (blk == 0 && tid == 0) {
         if (BATCH_) {
             // one token per stream: the counters advance like a single
-            // sequential step, shared by every row.
+            // sequential step, shared by every row -- with the SAME
+            // clamp and ring wrap the production tail applies, or a
+            // wrapped sliding window walks its device counters off the
+            // buffer while the host counters stay sane.
             live[0] = pos0 + 1.0f;
-            live[1] = (float)(kl0 + 1);
-            live[2] = (float)(slot0 + 1);
+            live[1] = (kl0 < CAP_) ? (float)(kl0 + 1) : (float)CAP_;
+            const int nslot = slot0 + 1;
+            live[2] = (nslot == CAP_) ? 0.0f : (float)nslot;
         } else {
             live[0] = pos0 + (float)ROWS_;
             live[1] = (float)(kl0 + ROWS_);

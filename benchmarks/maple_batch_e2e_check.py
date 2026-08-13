@@ -35,10 +35,20 @@ def toks(tok, p):
         [{"role": "user", "content": p}], add_generation_prompt=True)
 
 
+def chunked_prefill(model, rows, cache, chunk=256):
+    """Prefill in chunks so the logits tensor never spans the prompt."""
+    ids = mx.array(rows)
+    n = ids.shape[1]
+    out = None
+    for s0 in range(0, n, chunk):
+        out = model(ids[:, s0:s0 + chunk], cache=cache)
+        mx.eval(out)
+    return out
+
+
 def solo_stream(model, ids, steps):
     cache = make_prompt_cache(model)
-    out = model(mx.array([ids]), cache=cache)
-    mx.eval(out)
+    out = chunked_prefill(model, [ids], cache)
     y = mx.argmax(out[:, -1, :], axis=-1, keepdims=True)
     mx.eval(y)
     got = [int(y.item())]
@@ -51,6 +61,7 @@ def solo_stream(model, ids, steps):
 
 
 def merged_solo_prefill(model, ids_rows):
+    mx.clear_cache()
     """Prefill each row SOLO (bit-equal to its solo run by construction),
     then assemble one batch cache: concat per-layer K/V on the batch axis.
     Equal prompt lengths keep offsets/_idx shared."""
@@ -58,8 +69,7 @@ def merged_solo_prefill(model, ids_rows):
     solo_caches, first_ys = [], []
     for ids in ids_rows:
         cache = make_prompt_cache(model)
-        out = model(mx.array([ids]), cache=cache)
-        mx.eval(out)
+        out = chunked_prefill(model, [ids], cache)
         y = mx.argmax(out[:, -1, :], axis=-1, keepdims=True)
         mx.eval(y)
         first_ys.append(int(y.item()))
@@ -76,6 +86,8 @@ def merged_solo_prefill(model, ids_rows):
         mc.offset = parts[0].offset
         if isinstance(mc, RotatingKVCache):
             mc._idx = parts[0]._idx
+        for pt in parts:  # free layer by layer: long B=8 packs OOM else
+            pt.keys = pt.values = None
     return merged, first_ys
 
 
@@ -102,6 +114,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="model-cuda")
     ap.add_argument("--steps", type=int, default=48)
+    ap.add_argument("--long", action="store_true",
+                    help="inflate prompts past 1200 tokens so the "
+                         "full-attention layers decode in the 2-pass "
+                         "branch and the cap-growth path runs live")
     args = ap.parse_args()
 
     model, tok = load(
@@ -113,13 +129,21 @@ def main():
 
     report = {}
     all_ok = True
-    for B in (2, 4, 8):
-        rows = [toks(tok, p) for p in PROMPTS[:B]]
+    prompts = PROMPTS
+    if args.long:
+        filler = (" The ledger shows " +
+                  ", ".join(f"entry {i} at {i * 7 % 100} units"
+                            for i in range(220)) + ".")
+        prompts = [p + filler + " Answer briefly." for p in PROMPTS]
+    sizes = (2, 4) if args.long else (2, 4, 8)
+    for B in sizes:
+        rows = [toks(tok, p) for p in prompts[:B]]
         cut = min(len(x) for x in rows)
         rows = [list(x)[:cut] for x in rows]
 
         maple._use_batch_megakernels = False
         refs = [solo_stream(model, ids, args.steps) for ids in rows]
+        mx.clear_cache()
 
         maple._use_batch_megakernels = False
         stock_b, stock_tps = batch_stream(model, rows, args.steps)

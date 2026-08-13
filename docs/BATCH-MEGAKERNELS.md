@@ -196,3 +196,14 @@ surfaced a latent race: AB consumes all four barrier-counter pairs of
 the shared scratch, so CD's old C→D barrier was a pass-through that had
 been green by luck — both CD barriers moved to fresh slots. Full
 battery re-run green.
+
+### Long-context E2E (2026-08-13, night): PASS after a tail fix
+
+The live long path exposed what neither the short E2E nor the direct
+72/72 gate could: the pair's BATCH_ tail self-advanced device counters
+without the production clamp/wrap, so a wrapped sliding ring walked off
+its buffer on the second step. Fixed to production semantics (kl clamps
+to CAP, slot wraps). `--long` E2E (prompts >1200 tokens, chunked
+prefill): PASS 2/2, 4/4 — stock control 1/2, 3/4. Long-context batch
+throughput still trails stock at B4 (284 vs 366 on the noisy farm
+host); the 2-pass perf pass is future work.
