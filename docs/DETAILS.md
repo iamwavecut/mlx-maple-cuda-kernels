@@ -351,6 +351,25 @@ honestly killed: bits identical at every L, but against the stock async
 double-buffer it loses (351.5 vs 296-348) — after the two-dispatch layer
 the wall is GPU time, and host-side batching is exhausted.
 
+### 20. The batch front: solo-exact batched decode on all four profiles (2026-08-13/14)
+
+Both megakernels grew an M=B port, bit-proven kernel-vs-kernel (attention
+108/108 with per-profile contraction pins; MoE 162/162 behind six grid
+barriers and global staging). The lane behind them
+(`_decode_batch_fused`) holds a contract stock batching cannot: every
+batched row reproduces its solo stream bit for bit (stock's own rows
+drift through batch-variant GEMM tails — down to 1/2, 2/4, 5/8 on the
+4090). Three real bugs were found only by live E2E gates: the boundary
+fuse is neither pair-equal nor row-safe (fixed: per-row fuse), the stock
+lm_head loses bit row-invariance past M=4 (fixed: per-row head), and the
+pair's tail advanced counters without the ring clamp/wrap (fixed to
+production semantics). The 2-pass SDPA moved into the pair (72/72),
+lifting the kL≤1024 scope, and exposed a latent pass-through barrier
+(AB consumes all four counter pairs; CD's barriers moved to fresh
+slots). Defaults are data-driven per profile — sm86≤8, sm89≤4, sm90≤4,
+sm120≤8 — with quiet-host curves of +41%/+23% (4090, B=1/2) and +22%
+(5090, B=4) over stock. Full map: `docs/BATCH-MEGAKERNELS.md`.
+
 ## Known limitations
 
 - Claims apply to the exact representative SKU, driver, MLX/CUDA version,
