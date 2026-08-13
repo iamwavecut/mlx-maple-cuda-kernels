@@ -463,3 +463,20 @@ its auto-off stands. The attention lane's data-driven default is
 restored: on for sm86/sm89, off elsewhere, env always wins. The
 acceptance corpus grew to 24 streams the same day: mean 1.592, code
 traffic 2.6–4.9 — the L-row speculation ports are a go.
+
+### 19. 2026-08-13 — the day of honest negatives and the batch front
+
+The continuous cycle produced three verdicts. Speculation closed on
+economics: packs of consecutive tokens share too few experts
+(unique fractions 0.75→0.43 for L=4→16), so full verification costs
+2.7–8× a step against live acceptance of 1.1–1.9 — everything built en
+route (the M=L verify pair at 108/108, rollback, the harness) stays in
+the toolbox. The bandwidth front reframed itself: the expert recipe is
+compute-bound (185 GB/s bare load vs 77 under the real HFMA chain), so
+cp.async buys nothing (+1.5% noise); the hfma2 packing won ×1.85 in a
+probe and then LOST 8% inside the production kernel — all bit gates
+green, perf gate red, not merged. Lesson enshrined: probe wins must
+re-prove inside the real kernel. And the batch curve exposed the largest
+untouched front: B≥2 falls off every fused lane (236@2 < 289@1 while
+stock scales to 642@8) — the work map for B ≤ 8 megakernels lands in
+`BATCH-MEGAKERNELS.md`, riding the per-row bit pins already proven.
