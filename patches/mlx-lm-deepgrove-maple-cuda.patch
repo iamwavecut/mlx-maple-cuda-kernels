@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..14380c8 100644
+index a0673f7..fef0b29 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,8 @@
@@ -11,7 +11,7 @@ index a0673f7..14380c8 100644
  from dataclasses import dataclass
  from functools import partial
  from typing import Any, List, Optional
-@@ -17,32 +20,241 @@ from mlx_lm.models.base import (
+@@ -17,32 +20,242 @@ from mlx_lm.models.base import (
  )
  from mlx_lm.models.cache import KVCache, RotatingKVCache
  from mlx_lm.models.rope_utils import initialize_rope
@@ -115,15 +115,14 @@ index a0673f7..14380c8 100644
 +# therefore data-driven: on where the lane is measured faster, off
 +# elsewhere until profiled.  An explicit MAPLE_ATTENTION_MEGAKERNEL=0/1
 +# always wins over the auto choice.
-+# OPT-IN until the LRU physical-shape invariant lands: serving stacks that
-+# store, deep-copy and trim cache objects between requests (mlx-lm's
-+# LRUPromptCache) pick code paths off the PHYSICAL buffer shape, and the
-+# lane's materialized/viewed buffers are exact-length rather than
-+# stock-shaped (grown in 256-row blocks).  Every fused computation is
-+# bit-exact in isolation -- the boundary, rotation, stream and multi-turn
-+# suites are green -- but the cross-request LRU repro
-+# (benchmarks/maple_lru_service_repro.py) still diverges, and a lane that
-+# can interact with request isolation stays off until that repro is green.
++# Data-driven per-architecture default.  The lane is auto-on where it is
++# measured faster (sm86 +20.6%, sm89 +42.9% / 357->439 on the fix build)
++# and auto-off elsewhere (sm90/sm120 measured slower on healthy-CPU
++# hosts).  Request isolation against serving LRU caches is gated by
++# benchmarks/maple_lru_service_repro.py -- green 3/3 after the
++# materialize-on-any-detach fix (chronicle #18): stored caches get real
++# copies the moment the lane detaches from them, on EVERY detach path.
++# An explicit MAPLE_ATTENTION_MEGAKERNEL=0/1 always wins.
 +_ATTENTION_MEGAKERNEL_FAST_PROFILES = ("sm86", "sm89")
 +_use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", None)
 +
@@ -131,7 +130,9 @@ index a0673f7..14380c8 100644
 +def _attention_megakernel_enabled():
 +    if _use_attention_megakernel is not None:
 +        return _use_attention_megakernel
-+    return False
++    profile = _cuda_profile()
++    return (profile is not None
++            and profile.name in _ATTENTION_MEGAKERNEL_FAST_PROFILES)
 +
 +
 +def _kernel_backend():
@@ -266,7 +267,7 @@ index a0673f7..14380c8 100644
      """
      try:
          got, want = fast(), reference()
-@@ -51,9 +263,8 @@ def _matches(fast, reference, tol=2e-2):
+@@ -51,9 +264,8 @@ def _matches(fast, reference, tol=2e-2):
          return False
      return len(got) == len(want) and all(
          g.shape == w.shape
@@ -278,7 +279,7 @@ index a0673f7..14380c8 100644
          for g, w in zip(got, want)
      )
  
-@@ -123,24 +334,129 @@ def _make_add_rms_norm_kernel(eps):
+@@ -123,24 +335,129 @@ def _make_add_rms_norm_kernel(eps):
      )
  
  
@@ -415,7 +416,7 @@ index a0673f7..14380c8 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -154,6 +470,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
+@@ -154,6 +471,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
      )
  
  
@@ -545,7 +546,7 @@ index a0673f7..14380c8 100644
  # Inlined rather than imported from switch_layers: those helpers are private
  # (underscore-prefixed), and this file must keep loading against whatever
  # mlx-lm a user has installed when it ships inside a checkpoint.
-@@ -226,7 +665,7 @@ def _make_qk_norm_rope_kernel():
+@@ -226,7 +666,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -554,7 +555,7 @@ index a0673f7..14380c8 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +702,244 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +703,244 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -800,7 +801,7 @@ index a0673f7..14380c8 100644
  
  
  class MapleAttention(nn.Module):
-@@ -293,15 +969,23 @@ class MapleAttention(nn.Module):
+@@ -293,15 +970,23 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -824,7 +825,7 @@ index a0673f7..14380c8 100644
              self.rope = initialize_rope(
                  rope_dim,
                  args.rope_theta,
-@@ -310,45 +994,61 @@ class MapleAttention(nn.Module):
+@@ -310,45 +995,61 @@ class MapleAttention(nn.Module):
                  max_position_embeddings=args.max_position_embeddings,
              )
  
@@ -914,7 +915,7 @@ index a0673f7..14380c8 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -369,20 +1069,48 @@ class MapleAttention(nn.Module):
+@@ -369,20 +1070,48 @@ class MapleAttention(nn.Module):
      ) -> mx.array:
          B, L, _ = x.shape
  
@@ -966,7 +967,7 @@ index a0673f7..14380c8 100644
              out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
              queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
              keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-@@ -409,6 +1137,9 @@ class MapleAttention(nn.Module):
+@@ -409,6 +1138,9 @@ class MapleAttention(nn.Module):
                  queries = self.rope(queries, offset=offset)
                  keys = self.rope(keys, offset=offset)
  
@@ -976,7 +977,7 @@ index a0673f7..14380c8 100644
          if cache is not None:
              keys, values = cache.update_and_fetch(keys, values)
  
-@@ -419,6 +1150,48 @@ class MapleAttention(nn.Module):
+@@ -419,6 +1151,48 @@ class MapleAttention(nn.Module):
          output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
          return self.o_proj(output)
  
@@ -1025,7 +1026,7 @@ index a0673f7..14380c8 100644
  
  class MapleMLP(nn.Module):
      def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-@@ -618,7 +1391,335 @@ def _make_fused_router_kernel():
+@@ -618,7 +1392,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -1362,7 +1363,7 @@ index a0673f7..14380c8 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1734,84 @@ class MapleGate(nn.Module):
+@@ -633,23 +1735,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -1417,7 +1418,7 @@ index a0673f7..14380c8 100644
 +            (self.num_experts // 32) * 256
 +            if backend == "metal"
 +            else _cuda_router_grid_size(self.num_experts, profile)
-         )
++        )
 +        template = [
 +            ("T_", self.weight.dtype),
 +            ("NEXP", self.num_experts),
@@ -1429,7 +1430,7 @@ index a0673f7..14380c8 100644
 +            mx.uint32
 +            if backend == "cuda" and _cuda_router_indices_uint32
 +            else mx.int32
-+        )
+         )
 +        if backend == "cuda":
 +            # The multi-block completion counter is a zero-initialized output,
 +            # not hidden mutable input state.  This makes graph dependencies
@@ -1461,7 +1462,7 @@ index a0673f7..14380c8 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -659,6 +1821,19 @@ class MapleGate(nn.Module):
+@@ -659,6 +1822,19 @@ class MapleGate(nn.Module):
          gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
          return group_expert_select(gates, self.top_k)
  
@@ -1481,7 +1482,7 @@ index a0673f7..14380c8 100644
      def _probe(self, x):
          # Not _matches(): the two paths may order the selected experts
          # differently, and an exact tie at the top-k boundary may legitimately
-@@ -670,13 +1845,34 @@ class MapleGate(nn.Module):
+@@ -670,13 +1846,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -1519,7 +1520,7 @@ index a0673f7..14380c8 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,6 +1891,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,6 +1892,143 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -1663,7 +1664,7 @@ index a0673f7..14380c8 100644
  class MapleSwitchGLU(nn.Module):
      """SwitchGLU with the up and gate projections fused into one gather
      matmul; sanitize() concatenates the checkpoint's split tensors."""
-@@ -705,8 +2038,78 @@ class MapleSwitchGLU(nn.Module):
+@@ -705,8 +2039,78 @@ class MapleSwitchGLU(nn.Module):
              input_dims, 2 * hidden_dims, num_experts, bias=bias
          )
          self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
@@ -1742,7 +1743,7 @@ index a0673f7..14380c8 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,16 +2118,2063 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2119,2090 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -3219,6 +3220,21 @@ index a0673f7..14380c8 100644
 +    return kernel
 +
 +
++def _stock_phys_rows(n, cap):
++    """The PHYSICAL row count the stock cache would hold for n live rows.
++
++    Stock caches grow in 256-row blocks (both KVCache and the rotating
++    cache) and downstream cache code branches on the physical shape, not
++    just the logical offset -- the LRU repro caught exact-length buffers
++    changing those paths. Everything the lane publishes therefore carries
++    the stock-grown shape; rows past the logical offset are padding that
++    no stock path reads.
++    """
++    if n <= 0:
++        return 0
++    return min(cap, ((n + 255) // 256) * 256)
++
++
 +class _AttnMegaState:
 +    """Caller-owned contiguous KV buffers mirroring the stock cache.
 +
@@ -3247,20 +3263,27 @@ index a0673f7..14380c8 100644
 +    def bound_to(self, c):
 +        return self.cache_ref is not None and self.cache_ref() is c
 +
-+    def bind(self, c):
-+        if self.bound_to(c):
-+            return
-+        # A different cache object means a different request. Two duties:
-+        # the OLD cache may live on (the service's LRU stores it) and its
-+        # keys are zero-copy views into our buffers, which the new request
-+        # is about to overwrite -- materialize its history first. And our
-+        # sync is meaningless for the new cache -- resync from it instead.
++    def materialize_old(self):
++        """Turn the previously-bound cache's zero-copy views into real
++        copies. MUST run before synced_offset is cleared on ANY detach
++        path: a stored cache (the service's LRU) that keeps views into
++        these buffers would otherwise silently mutate as the next request
++        overwrites them -- that exact ordering gap rotted stored histories
++        when the multi-turn guard cleared the sync before bind() ran."""
 +        old = self.cache_ref() if self.cache_ref is not None else None
 +        if old is not None and self.synced_offset > 0:
 +            n = min(self.synced_offset, self.cap)
-+            old.keys = mx.contiguous(self.kbuf[..., :n, :])
-+            old.values = mx.contiguous(self.vbuf[..., :n, :])
++            phys = _stock_phys_rows(n, self.cap)
++            old.keys = mx.contiguous(self.kbuf[..., :phys, :])
++            old.values = mx.contiguous(self.vbuf[..., :phys, :])
 +            mx.eval(old.keys, old.values)
++
++    def bind(self, c):
++        if self.bound_to(c):
++            return
++        # A different cache object means a different request: materialize
++        # the old cache's views, then resync from the new one.
++        self.materialize_old()
 +        self.synced_offset = -1
 +        self.cache_ref = weakref.ref(c)
 +
@@ -3492,8 +3515,9 @@ index a0673f7..14380c8 100644
 +    c.offset = offset + 1
 +    if rotating:
 +        c._idx = slot + 1
-+    c.keys = state.kbuf[..., :kl_after, :]
-+    c.values = state.vbuf[..., :kl_after, :]
++    phys = _stock_phys_rows(kl_after, cap)
++    c.keys = state.kbuf[..., :phys, :]
++    c.values = state.vbuf[..., :phys, :]
 +    state.synced_offset = offset + 1  # our buffers are current for this offset
 +    return out
 +
@@ -3512,13 +3536,17 @@ index a0673f7..14380c8 100644
 +        # A fresh request reuses the module but not the cache object; our
 +        # buffers belong to the previous conversation. Writing them here
 +        # is exactly the way one user's context leaks into another's
-+        # answer -- drop the sync instead.
++        # answer. Materialize the PREVIOUS cache's views first -- clearing
++        # the sync without doing so leaves any stored copy of it aliased
++        # to buffers the new request will overwrite -- then drop the sync.
++        state.materialize_old()
 +        state.synced_offset = -1
 +        return
 +    n = min(state.synced_offset, state.cap)
 +    if n > 0:
-+        c.keys = state.kbuf[..., :n, :]
-+        c.values = state.vbuf[..., :n, :]
++        phys = _stock_phys_rows(n, state.cap)
++        c.keys = state.kbuf[..., :phys, :]
++        c.values = state.vbuf[..., :phys, :]
 +        mx.eval(c.keys, c.values)
 +    state.synced_offset = -1
 +
@@ -3808,7 +3836,7 @@ index a0673f7..14380c8 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +4242,86 @@ class MapleModel(nn.Module):
+@@ -792,29 +4270,86 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -3903,7 +3931,7 @@ index a0673f7..14380c8 100644
  
      def __call__(
          self,
-@@ -836,12 +4343,29 @@ class MapleModel(nn.Module):
+@@ -836,12 +4371,29 @@ class MapleModel(nn.Module):
              )
  
          if h.size == h.shape[-1]:
@@ -3935,7 +3963,7 @@ index a0673f7..14380c8 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -1021,6 +4545,32 @@ class Model(nn.Module):
+@@ -1021,6 +4573,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -3968,7 +3996,7 @@ index a0673f7..14380c8 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +4589,8 @@ class Model(nn.Module):
+@@ -1039,8 +4617,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
