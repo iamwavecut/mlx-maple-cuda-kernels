@@ -87,3 +87,20 @@ Order: land 0/A/B(+dedup) as one kernel with bit gates against B solo
 runs; C/D as the second (the gather is the only genuinely new code);
 E rides the existing recipe. Then the gate swap in `MapleModel.__call__`
 (`h.shape[-2] == 1 and h.shape[0] <= 8`), per-B suites, and the curve.
+
+## Status burndown (2026-08-13)
+
+- [x] Batch attention M=B: **108/108** bit-proven (`maple_attn_batch_check.py`),
+  RoPE contraction pinned per profile.
+- [x] Batch exact-MoE M=B: **162/162** bit-proven kernel-vs-kernel
+  (`maple_moe_batch_check.py`) — out, hout and the routing tail across
+  layers 0/3/7 x B in {2,4,8} x 6 seeds. No contraction pins needed.
+- [x] Per-layer perf probes (sm86, sync loop, graphs off — ratios are the
+  signal): MoE batch beats B sequential megakernels x1.7–2.0 AND the stock
+  batched MoE by −22% (B4) / −19% (B8); attention pair beats sequential by
+  −5% (B2) → −36% (B8).
+- [ ] E2E wiring: batch cache state (B-plane persistent buffers, shared
+  counters), the `MapleModel.__call__` gate swap, batched lm_head tail.
+- [ ] Per-B service suites (LRU isolation at B>1) before any default.
+- [ ] The end-to-end curve — the judge is aggregate tok/s vs stock
+  (289/472/642 at B=1/4/8 on sm89).
