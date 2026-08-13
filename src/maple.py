@@ -3113,6 +3113,468 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     }
 """
 
+# The batch (M=B) port of the exact-MoE megakernel: ROWS_ independent
+# decode rows through every proven recipe in ONE dispatch.  Differences
+# from the production source are purely structural:
+#   - the per-block shared normed vector becomes a global fp32+bf16 stage
+#     (phase 0 runs row-per-block, then a grid barrier) -- fp32/bf16
+#     round-trips through global memory are value-exact;
+#   - phase B runs its block-0 recipe on block r for row r;
+#   - the SwiGLU staging moves from per-block shared memory to a global
+#     bf16 stage behind one extra barrier (B*8*KD_ no longer fits shared);
+#   - every task grid gains a leading row factor.
+# Each row's arithmetic chains are untouched, so row r must equal the
+# production kernel run alone on row r bit for bit -- that is the gate
+# (benchmarks/maple_moe_batch_check.py).
+_MOE_BATCH_MEGAKERNEL_SOURCE = r"""
+    constexpr int WARP = 32;
+    constexpr int WARPS = THREADS_ / WARP;
+    constexpr int GS = 128;
+    const int tid = threadIdx.x;
+    const int lane = tid & (WARP - 1);
+    const int warp = tid >> 5;
+    const int blk = blockIdx.x;
+    const int wglobal = blk * WARPS + warp;
+
+    constexpr int OFF_IDX = 16;
+    constexpr int OFF_SCO = OFF_IDX + ROWS_ * 8;
+    constexpr int OFF_LOG = OFF_SCO + ROWS_ * 8;
+    constexpr int OFF_PRB = OFF_LOG + ROWS_ * NROUT_;
+    constexpr int OFF_XF = OFF_PRB + ROWS_ * NROUT_;
+    constexpr int OFF_XB = OFF_XF + ROWS_ * KH_;
+    constexpr int OFF_UGS = OFF_XB + ROWS_ * KH_ / 2;
+    constexpr int OFF_AST = OFF_UGS + ROWS_ * NEXP_ * 2 * KD_;
+    constexpr int OFF_DST = OFF_AST + ROWS_ * NEXP_ * KD_ / 2;
+    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
+    float* idxf = scratch + OFF_IDX;
+    float* scoref = scratch + OFF_SCO;
+    float* logits = scratch + OFF_LOG;
+    float* probs = scratch + OFF_PRB;
+    float* xf = scratch + OFF_XF;
+    __nv_bfloat16* xb = reinterpret_cast<__nv_bfloat16*>(scratch + OFF_XB);
+    float* ugstage = scratch + OFF_UGS;
+    __nv_bfloat16* astage = reinterpret_cast<__nv_bfloat16*>(scratch + OFF_AST);
+    float* dstage = scratch + OFF_DST;
+
+    __shared__ float red[WARPS];
+    __shared__ float gsum_s;
+
+    // ---- phase 0: add + RMSNorm, row r on block r, staged to global ------
+    if (blk < ROWS_) {
+        const int row = blk;
+        const T_* hrow = hin + (long long)row * KH_;
+        const T_* rrow = rin + (long long)row * KH_;
+        constexpr int VEC = KH_ / THREADS_;
+        const int base = tid * VEC;
+        float hb[VEC];
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const T_ rounded = static_cast<T_>(
+                static_cast<float>(hrow[base + i]) + static_cast<float>(rrow[base + i]));
+            hb[i] = static_cast<float>(rounded);
+            ss += hb[i] * hb[i];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+        if (lane == 0) red[warp] = ss;
+        __syncthreads();
+        float tot = (lane < WARPS) ? red[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
+        if (tid == 0) gsum_s = tot;
+        __syncthreads();
+        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const int idx = base + i;
+            const float v = static_cast<float>(static_cast<T_>(
+                hb[i] * nscale * static_cast<float>(nw[idx])));
+            xf[(long long)row * KH_ + idx] = v;
+            xb[(long long)row * KH_ + idx] = __nv_bfloat16(v);
+        }
+    }
+
+    // ---- barrier 1 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[0], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[8], 1u);
+        else while (atomicAdd(&ctr[8], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase A: router logits, tasks (row, expert-row) ------------------
+    for (int task = wglobal; task < ROWS_ * NROUT_; task += GRID_ * WARPS) {
+        const int row = task / NROUT_;
+        const int rrow = task - row * NROUT_;
+        const float* xrow = xf + (long long)row * KH_;
+        const __nv_bfloat16* wrow = rw + (long long)rrow * KH_;
+        float sum = 0.0f;
+        for (int col = 4 * lane; col < KH_; col += 128) {
+            const __nv_bfloat162 wab =
+                *reinterpret_cast<const __nv_bfloat162*>(wrow + col);
+            const __nv_bfloat162 wcd =
+                *reinterpret_cast<const __nv_bfloat162*>(wrow + col + 2);
+            sum = fmaf(__bfloat162float(wab.x), xrow[col], sum);
+            sum = fmaf(__bfloat162float(wab.y), xrow[col + 1], sum);
+            sum = fmaf(__bfloat162float(wcd.x), xrow[col + 2], sum);
+            sum = fmaf(__bfloat162float(wcd.y), xrow[col + 3], sum);
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, o);
+        if (lane == 0) logits[(long long)row * NROUT_ + rrow] = sum;
+    }
+
+    // ---- barrier 2 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[1], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[9], 1u);
+        else while (atomicAdd(&ctr[9], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase B: softmax + top-8 + renorm, row r on block r --------------
+    __shared__ float local_max[2];
+    __shared__ float local_norm[2];
+    if (blk < ROWS_) {
+        const int row = blk;
+        float* rlog = logits + (long long)row * NROUT_;
+        float* rprb = probs + (long long)row * NROUT_;
+        float* ridx = idxf + row * 8;
+        float* rsco = scoref + row * 8;
+        constexpr int N_READS = 4;
+        constexpr int SWARPS = 2;  // 64 active threads
+        const bool active = tid < 64;
+        const int slane = tid & 31;
+        const int swarp = tid >> 5;
+        float vals[N_READS];
+        float maxval = -INFINITY;
+        float normalizer = 0.0f;
+        float prevmax;
+        if (active) {
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                vals[i] = rlog[tid * N_READS + i];
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                maxval = fmaxf(maxval, vals[i]);
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                normalizer = normalizer + __expf(vals[i] - maxval);
+            prevmax = maxval;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffffu, maxval, o));
+            normalizer = normalizer * __expf(prevmax - maxval);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
+            prevmax = maxval;
+            if (slane == 0) local_max[swarp] = maxval;
+        }
+        __syncthreads();
+        if (active) {
+            maxval = (slane < SWARPS) ? local_max[slane] : -INFINITY;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffffu, maxval, o));
+            normalizer = normalizer * __expf(prevmax - maxval);
+            if (slane == 0) local_norm[swarp] = normalizer;
+        }
+        __syncthreads();
+        if (active) {
+            normalizer = (slane < SWARPS) ? local_norm[slane] : 0.0f;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
+            normalizer = 1.0f / normalizer;
+            #pragma unroll
+            for (int i = 0; i < N_READS; ++i)
+                rprb[tid * N_READS + i] =
+                    __expf(vals[i] - maxval) * normalizer;
+        }
+        __syncthreads();
+
+        if (tid < 32) {
+            int chosen[NEXP_];
+            #pragma unroll
+            for (int k = 0; k < NEXP_; ++k) {
+                float bestv = -INFINITY;
+                int besti = -1;
+                for (int i = lane; i < NROUT_; i += 32) {
+                    bool taken = false;
+                    #pragma unroll
+                    for (int t = 0; t < NEXP_; ++t)
+                        if (t < k && chosen[t] == i) taken = true;
+                    if (taken) continue;
+                    const float v = rprb[i];
+                    if (v > bestv || (v == bestv && i > besti)) {
+                        bestv = v;
+                        besti = i;
+                    }
+                }
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    const float ov = __shfl_down_sync(0xffffffffu, bestv, o);
+                    const int oi = __shfl_down_sync(0xffffffffu, besti, o);
+                    if (ov > bestv || (ov == bestv && oi > besti)) {
+                        bestv = ov;
+                        besti = oi;
+                    }
+                }
+                besti = __shfl_sync(0xffffffffu, besti, 0);
+                chosen[k] = besti;
+            }
+            if (tid == 0) {
+            #pragma unroll
+            for (int e = 0; e < NEXP_; ++e) {
+                const int src = NEXP_ - 1 - e;
+                ridx[e] = static_cast<float>(chosen[src]);
+                rsco[e] = rprb[chosen[src]];
+            }
+            const float lo = __fadd_rn(__fadd_rn(__fadd_rn(
+                rsco[0], rsco[1]), rsco[2]), rsco[3]);
+            const float hi = __fadd_rn(__fadd_rn(__fadd_rn(
+                rsco[4], rsco[5]), rsco[6]), rsco[7]);
+            const float sum = __fadd_rn(lo, hi);
+            const float denom = sum + 1e-20f;
+            #pragma unroll
+            for (int e = 0; e < NEXP_; ++e)
+                rsco[e] = __fdiv_rn(rsco[e], denom);
+            }
+        }
+    }
+
+    // ---- barrier 3 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[2], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[10], 1u);
+        else while (atomicAdd(&ctr[10], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase C: up_gate experts, tasks (row, expert, octet) -------------
+    {
+        constexpr int OCTS = 2 * KD_ / 8;
+        const long long wstride = (2LL * KD_) * (KH_ / 16);
+        const long long gstride = (2LL * KD_) * (KH_ / GS);
+        for (int task = wglobal; task < ROWS_ * NEXP_ * OCTS;
+             task += GRID_ * WARPS) {
+            const int row = task / (NEXP_ * OCTS);
+            const int rem = task - row * NEXP_ * OCTS;
+            const int e = rem / OCTS;
+            const int oct = rem - e * OCTS;
+            const int we = static_cast<int>(idxf[row * 8 + e]);
+            const unsigned int* wq =
+                reinterpret_cast<const unsigned int*>(ugw) + we * wstride;
+            const __nv_bfloat16* sc = ugs + we * gstride;
+            const __nv_bfloat16* bi = ugb + we * gstride;
+            const __nv_bfloat16* xrow = xb + (long long)row * KH_;
+            float o0 = 0.0f, o1 = 0.0f;
+            for (int kt = 0; kt < KH_ / 128; ++kt) {
+                qmm_tile(xrow, wq, sc, bi, KH_ / 16, KH_ / GS,
+                         oct * 8, kt * 128, GS, lane, o0, o1);
+            }
+            if ((lane >> 2) == 0) {
+                const int c = oct * 8 + 2 * (lane & 3);
+                float* ug = ugstage + ((long long)row * NEXP_ + e) * 2 * KD_;
+                ug[c] = __bfloat162float(__nv_bfloat16(o0));
+                ug[c + 1] = __bfloat162float(__nv_bfloat16(o1));
+            }
+        }
+    }
+
+    // ---- barrier 4 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[3], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[11], 1u);
+        else while (atomicAdd(&ctr[11], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase S: SwiGLU into the global bf16 stage -----------------------
+    // The production kernel recomputes this per block into shared memory;
+    // B*8*KD_ bf16 no longer fits, so it is computed once (same formula,
+    // same inputs, same bits) and staged globally behind one extra barrier.
+    for (int i = blk * THREADS_ + tid; i < ROWS_ * NEXP_ * KD_;
+         i += GRID_ * THREADS_) {
+        const int re = i / KD_;
+        const int c = i - re * KD_;
+        const float* ug = ugstage + (long long)re * 2 * KD_;
+        astage[i] = exact_swiglu(ug[KD_ + c], ug[c]);
+    }
+
+    // ---- barrier 5 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[4], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[12], 1u);
+        else while (atomicAdd(&ctr[12], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+
+    // ---- phase D: down experts, tasks (row, expert, octet) ----------------
+    {
+        constexpr int OCTS = ND_ / 8;
+        const long long wstride = (long long)ND_ * (KD_ / 16);
+        const long long gstride = (long long)ND_ * (KD_ / GS);
+        for (int task = wglobal; task < ROWS_ * NEXP_ * OCTS;
+             task += GRID_ * WARPS) {
+            const int row = task / (NEXP_ * OCTS);
+            const int rem = task - row * NEXP_ * OCTS;
+            const int e = rem / OCTS;
+            const int oct = rem - e * OCTS;
+            const int we = static_cast<int>(idxf[row * 8 + e]);
+            const unsigned int* wq =
+                reinterpret_cast<const unsigned int*>(dnw) + we * wstride;
+            const __nv_bfloat16* sc = dns + we * gstride;
+            const __nv_bfloat16* bi = dnb + we * gstride;
+            const __nv_bfloat16* arow =
+                astage + ((long long)row * NEXP_ + e) * KD_;
+            float a0 = 0.0f, a1 = 0.0f;
+            for (int kt = 0; kt < KD_ / 128; ++kt) {
+                qmm_tile(arow, wq, sc, bi, KD_ / 16, KD_ / GS,
+                         oct * 8, kt * 128, GS, lane, a0, a1);
+            }
+            if ((lane >> 2) == 0) {
+                const int c = oct * 8 + 2 * (lane & 3);
+                float* ds = dstage + ((long long)row * NEXP_ + e) * ND_;
+                ds[c] = __bfloat162float(__nv_bfloat16(a0));
+                ds[c + 1] = __bfloat162float(__nv_bfloat16(a1));
+            }
+        }
+    }
+
+    // ---- barrier 6 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[5], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[13], 1u);
+        else while (atomicAdd(&ctr[13], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+    if (blk >= ROWS_) return;
+
+    // ---- phase E: aggregation + residual + next norm, row r on block r ----
+    {
+        const int row = blk;
+        const T_* hrow = hin + (long long)row * KH_;
+        const T_* rrow = rin + (long long)row * KH_;
+        T_* horow = hout + (long long)row * KH_;
+        T_* orow = out + (long long)row * KH_;
+        const float* rsco = scoref + row * 8;
+        const float* ds0 = dstage + (long long)row * NEXP_ * ND_;
+        constexpr int VEC = KH_ / THREADS_;
+        const int base = tid * VEC;
+        float sb[VEC];
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const int idx = base + i;
+            float agg = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < NEXP_; ++e)
+                agg = __fadd_rn(agg,
+                    __fmul_rn(ds0[e * ND_ + idx], rsco[e]));
+            const float aggb = __bfloat162float(__nv_bfloat16(agg));
+            const T_ s = static_cast<T_>(
+                static_cast<float>(hrow[idx]) + static_cast<float>(rrow[idx]));
+            const T_ s2 = static_cast<T_>(static_cast<float>(s) + aggb);
+            horow[idx] = s2;
+            sb[i] = static_cast<float>(s2);
+            ss += sb[i] * sb[i];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+        if (lane == 0) red[warp] = ss;
+        __syncthreads();
+        float tot = (lane < WARPS) ? red[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
+        if (tid == 0) gsum_s = tot;
+        __syncthreads();
+        const float nscale = rsqrtf(gsum_s / static_cast<float>(KH_) + EPS_);
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            const int idx = base + i;
+            orow[idx] = static_cast<T_>(
+                sb[i] * nscale * static_cast<float>(nw2[idx]));
+        }
+    }
+"""
+
+
+_moe_batch_megakernel_cache = {}
+
+
+def _moe_batch_megakernel(eps):
+    """The M=B research kernel; gated by maple_moe_batch_check.py before
+    any production wiring."""
+    kernel = _moe_batch_megakernel_cache.get(eps)
+    if kernel is None:
+        kernel = _moe_batch_megakernel_cache[eps] = mx.fast.cuda_kernel(
+            name="maple_moe_batch_megakernel",
+            input_names=["hin", "rin", "nw", "rw", "ugw", "ugs", "ugb",
+                         "dnw", "dns", "dnb", "nw2"],
+            output_names=["out", "hout", "scratch"],
+            source=_MOE_BATCH_MEGAKERNEL_SOURCE.replace(
+                "EPS_", f"{eps:.10e}f"),
+            header=_MOE_EXACT_MEGAKERNEL_HEADER,
+        )
+    return kernel
+
+
+def _moe_batch_megakernel_plan(block, ln, dtype, rows, grid=None,
+                               threads=512):
+    """Geometry for the batch kernel: the exact lane's gates plus the
+    row-count bound (every row-per-block phase needs rows <= grid)."""
+    base = _moe_exact_megakernel_plan(block, ln, dtype, grid=grid,
+                                      threads=threads)
+    if base is False:
+        return False
+    _, kwargs = base
+    grid = _moe_megakernel_grid() if grid is None else grid
+    if not (1 <= rows <= min(8, grid)):
+        return False
+    kh = block.switch_mlp.up_gate_proj.input_dims
+    kd = block.switch_mlp.down_proj.input_dims
+    nd = block.switch_mlp.down_proj.output_dims
+    ne = block.gate.top_k
+    nr = block.gate.num_experts
+    scratch = (16 + rows * 8 * 2 + rows * nr * 2 + rows * kh
+               + rows * kh // 2 + rows * ne * 2 * kd
+               + rows * ne * kd // 2 + rows * ne * nd)
+    return (
+        _moe_batch_megakernel(ln.eps),
+        {
+            "template": [t for t in kwargs["template"]
+                         if t[0] != "GRID_"] + [
+                ("GRID_", grid), ("ROWS_", rows)],
+            "grid": (grid * threads, 1, 1),
+            "threadgroup": (threads, 1, 1),
+            "output_shapes": [(rows, 1, nd), (rows, 1, kh), (scratch,)],
+            "output_dtypes": [dtype, dtype, mx.float32],
+            "init_value": 0,
+        },
+    )
+
 
 # The attention megakernel: the whole decode attention block -- qkv gemv,
 # per-head RMSNorm + RoPE, the KV-cache append, single-token SDPA and the
