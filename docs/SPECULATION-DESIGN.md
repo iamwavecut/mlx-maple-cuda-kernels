@@ -107,3 +107,18 @@ exactness trade anywhere.
    seed-kernel discipline, emit tokens.
 5. Then fold verify into the megakernels (`ROWS_` template) for the
    dispatch-count win; bit gates extend the existing suites.
+
+## The verdict (2026-08-13): closed by expert geometry
+
+The missing number was expert sharing, and it came in low: packs of L
+consecutive tokens route to 0.68-0.75 (L=4) down to 0.43-0.50 (L=16)
+unique-expert fractions, so MoE verification costs 2.7-8x a single step
+while live acceptance is 1.1-1.9 tokens/pass. Full-model speculation
+loses on Maple's top-8-of-256 geometry — the neighbours simply don't
+share enough experts. Everything built along the way survives on its own
+merits: the attention verify pair (108/108 sequential-exact, 2 dispatches
+for a pack), the rollback machinery, and the acceptance harness — all
+directly reusable for batch decode and for models with higher expert
+sharing. The optimization cycle turns to the positive-economics fronts:
+batch decode (aggregate 523 tok/s at batch 4 vs 256 at batch 1) and the
+expert-read memory gap (203 vs 743 GB/s).
