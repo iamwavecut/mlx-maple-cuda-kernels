@@ -119,18 +119,28 @@ _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 # until scale-out.  MAPLE_BATCH_MEGAKERNELS=0/1 always wins.  Covers
 # kL <= 1024 (the pair carries the 1-pass SDPA port); layers past that
 # fall back to the stock path per step with an exact writeback.
-_BATCH_MEGAKERNEL_PROVEN_PROFILES = ("sm86", "sm120")
+# Per-profile default ceiling on the batch size the lane takes: the full
+# battery ran everywhere below, and the aggregate curve decides the cap
+# (sm90 measured +32%/+13%/par at B=1/2/4 but -22% at B8, where the 132
+# SMs make stock batching genuinely strong -- so its default stops at 4).
+_BATCH_MEGAKERNEL_PROVEN_PROFILES = {"sm86": 8, "sm120": 8, "sm90": 4}
 _use_batch_megakernels = (
     _env_flag("MAPLE_BATCH_MEGAKERNELS", False)
     if "MAPLE_BATCH_MEGAKERNELS" in os.environ else None
 )
 
 
-def _batch_megakernels_enabled():
+def _batch_megakernel_max_rows():
     if _use_batch_megakernels is not None:
-        return _use_batch_megakernels
+        return 8 if _use_batch_megakernels else 0
     prof = _cuda_profile()
-    return prof is not None and prof.name in _BATCH_MEGAKERNEL_PROVEN_PROFILES
+    if prof is None:
+        return 0
+    return _BATCH_MEGAKERNEL_PROVEN_PROFILES.get(prof.name, 0)
+
+
+def _batch_megakernels_enabled():
+    return _batch_megakernel_max_rows() > 0
 
 # The one-dispatch decode attention block.  The full bit battery is green
 # on sm86/sm89/sm90 (stream identity, the window-rotation boundary, the
@@ -5749,10 +5759,9 @@ class MapleModel(nn.Module):
             )
 
         if (
-            _batch_megakernels_enabled()
-            and h.ndim == 3
+            h.ndim == 3
             and h.shape[1] == 1
-            and 2 <= h.shape[0] <= 8
+            and 2 <= h.shape[0] <= _batch_megakernel_max_rows()
         ):
             # Boundary fuse: the SAME lane the solo stream would pick, so
             # each batched row's boundary bits match its solo run.
@@ -5937,10 +5946,9 @@ class Model(nn.Module):
         ):
             return self.lm_head_flash(out, self.lm_head)
         if (
-            _batch_megakernels_enabled()
-            and out.ndim == 3
+            out.ndim == 3
             and out.shape[1] == 1
-            and 4 < out.shape[0] <= 8
+            and 4 < out.shape[0] <= _batch_megakernel_max_rows()
         ):
             # The quantized-matmul head switches algorithms past M=4 and
             # stops being row-invariant at the bit level (measured at M=8:

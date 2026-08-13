@@ -207,3 +207,15 @@ to CAP, slot wraps). `--long` E2E (prompts >1200 tokens, chunked
 prefill): PASS 2/2, 4/4 — stock control 1/2, 3/4. Long-context batch
 throughput still trails stock at B4 (284 vs 366 on the noisy farm
 host); the 2-pass perf pass is future work.
+
+## sm90 scale-out (2026-08-14, rented H100 NVL, noisy-CPU host)
+
+Full bit battery green (attn all 6/6, MoE 162/162, E2E solo-exact PASS
+with stock control at 2/4 and 4/8, LRU PASS, 2-pass 72/72, long E2E
+PASS). The curve is B-dependent: **+32% at B1, +13% at B2, parity at
+B4, −22% at B8** — 132 SMs make stock batching genuinely strong at
+large B. The lane's default therefore carries a per-profile batch-size
+ceiling: **B≤4 on sm90**, B≤8 on sm86/sm120; `MAPLE_BATCH_MEGAKERNELS=1`
+lifts any profile to 8. Grid tunes for the profile: attention 96, MoE
+128 (residency: 132 SMs × 2 blocks at 1024 threads on Hopper).
+Remaining: sm89 (4090 rental still unavailable after 4 attempts).
