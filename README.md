@@ -42,6 +42,14 @@ including in-flight growth. Bit-exactness is not sampled, it is gated: live
 per-layer probes at load, screened-prompt stream equality, and an 846-token
 quality suite that reproduces the reference NLL to the last digit.
 
+Batched decode (2-8 concurrent streams) has an experimental lane
+(`MAPLE_BATCH_MEGAKERNELS=1`): every batched row reproduces its solo
+stream bit for bit — a contract stock batching itself does not hold (its
+rows drift via batch-variant GEMM tails, down to 2/8 matching on a
+5090) — and on a quiet RTX 5090 it beats stock at every batch size
+(aggregate 853 vs 697 tok/s at B=4). Details and per-arch grid tuning:
+[`docs/BATCH-MEGAKERNELS.md`](docs/BATCH-MEGAKERNELS.md).
+
 Defaults are data-driven per architecture: the attention lane is auto-on
 where measured faster (sm86/sm89) and auto-off elsewhere (H100/5090
 measured slower on healthy-CPU hosts). Cross-request isolation against
