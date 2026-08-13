@@ -3595,12 +3595,18 @@ def _moe_batch_call(layer, h, r, ln, next_w):
     if plan is None:
         # The batch kernel is register-heavier than the single-row one, so
         # its residency ceiling is lower (192 deadlocks on 82 SMs where
-        # the production kernel runs it); measured sm86 gains ~10-12% at
-        # 128 -- opt in per host, default to the production grid.
+        # the production kernel runs it -- roughly 2 blocks/SM at 512
+        # threads).  Per-profile defaults clamp to the smallest class
+        # member (sm120: RTX 5080's 84 SMs -> 160); big hosts opt higher
+        # via env -- measured: 128 on the 3090 (-10..12%), 256 on the
+        # 5090 (-41..47%).
         try:
             grid = int(os.environ.get("MAPLE_BATCH_MOE_GRID", "0")) or None
         except ValueError:
             grid = None
+        if grid is None:
+            prof_name = _cuda_profile().name
+            grid = {"sm100": 160, "sm120": 160}.get(prof_name)
         try:
             plan = _moe_batch_megakernel_plan(block, ln, h.dtype, rows,
                                               grid=grid)
@@ -4893,12 +4899,17 @@ def _attn_mega_call_batch(layer, hn, c):
     nq = attn.num_attention_heads
     nkv = attn.num_key_value_heads
     # Grid residency bounds the CD kernel (1024 threads: ONE block per SM
-    # on consumer parts), so the default stays at the universally-safe 64;
-    # measured sm86 (82 SMs) gains ~6-11% at 80 -- opt in per host.
+    # on consumer parts).  Per-profile defaults are clamped to the
+    # smallest member of each class (sm86: RTX 3080's 68 SMs -> 64;
+    # sm120: RTX 5080's 84 SMs -> 80); big hosts opt higher via env --
+    # measured: 80 on the 3090 (-6..11%), 160 on the 5090 (-39..44%).
     try:
         grid = int(os.environ.get("MAPLE_BATCH_ATTENTION_GRID", "0"))
     except ValueError:
         grid = 0
+    if not grid:
+        prof = _cuda_profile().name
+        grid = {"sm100": 80, "sm120": 80}.get(prof, 0)
     grid = grid or _attn_megakernel_grid()
     tmpl = [
         ("T_", hn.dtype), ("KH_", kh), ("NQ_", nq), ("NKV_", nkv),

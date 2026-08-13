@@ -170,3 +170,18 @@ intervention on the same modules and continues bit-equal to an
 uninterrupted run — the materialize-on-detach discipline holds through
 row-count rebinds. Remaining before any default: a clean-host curve
 (GPU0 neighbor makes farm walls noisy) and multi-arch scale-out.
+
+## sm120 scale-out (2026-08-13, rented RTX 5090, quiet host)
+
+Bits: the full battery is green — attention pair all 6/6 (the predicted
+`second_half_form=0` pin held on first try), MoE 162/162, E2E solo-exact
+2/2 4/4 8/8, LRU PASS. The stock control collapses here: its own batched
+rows match solo only 1/2, 3/4, **2/8**. Grids scale much further on 170
+SMs — attention 302→168µs (B8, g64→g160), MoE 277→148µs (g64→g256) —
+and with them the lane **beats or matches stock at every B**: curve
+333/500/853/930 vs stock 308/495/697/918 (B4 **+22%**). Per-profile safe
+grid defaults landed (sm100/sm120 → 80/160, clamped to the smallest
+class member); big hosts opt higher via the env tunes. Ops scar for the
+book: CUDA-12.4 pod images + the new MLX wheel hit the ≥12.8-headers
+nvrtc trap — pip `nvidia-cuda-runtime-cu12==12.9.*` + a CUDA_HOME
+symlink fixes it without a toolkit install.
