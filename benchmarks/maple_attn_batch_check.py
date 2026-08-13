@@ -90,7 +90,7 @@ for lname, lidx in (("rope_sliding", 0), ("nope_full", 3)):
             tmpl = [("T_", hns.dtype), ("KH_", kh), ("NQ_", nq),
                     ("NKV_", nkv), ("CAP_", cap),
                     ("ROPE_", 1 if attn.use_rope else 0), ("RD_", rd),
-                    ("ROWS_", B), ("BATCH_", 1), ("GRID_", 64)]
+                    ("ROWS_", B), ("BATCH_", 1), ("RAGGED_", 0), ("GRID_", 64)]
             scr_shape = (16 + B * ((nq + 2 * nkv) * 128
                                    + nq * 128 * 2 + kh
                                    + nq * 32 * (128 + 2)),)

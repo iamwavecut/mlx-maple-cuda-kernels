@@ -104,7 +104,7 @@ def main():
                 tmpl = [("T_", hns.dtype), ("KH_", kh), ("NQ_", nq),
                         ("NKV_", nkv), ("CAP_", cap),
                         ("ROPE_", 1 if attn.use_rope else 0),
-                        ("RD_", rd), ("ROWS_", B),
+                        ("RD_", rd), ("ROWS_", B), ("RAGGED_", 0),
                         ("BATCH_", 1 if batch_mode else 0), ("GRID_", 64)]
                 scr_shape = (16 + B * ((nq + 2 * nkv) * 128
                                        + nq * 128 * 2 + kh

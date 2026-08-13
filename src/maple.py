@@ -4178,9 +4178,11 @@ _ATTN_VERIFY_AB_SOURCE = r"""
         const int r = task / NH;
         const int head = task % NH;
         const float* xh = stq_kv + (long long)r * QKVROWS + head * HD;
-        const float pos = BATCH_ ? pos0 : (pos0 + (float)r);
-        const int slot = BATCH_ ? slot0 : (slot0 + r);
-        const long long bplane = BATCH_
+        const float pos = RAGGED_ ? live[3 + r * 3 + 0]
+            : (BATCH_ ? pos0 : (pos0 + (float)r));
+        const int slot = RAGGED_ ? (int)live[3 + r * 3 + 2]
+            : (BATCH_ ? slot0 : (slot0 + r));
+        const long long bplane = (RAGGED_ || BATCH_)
             ? (long long)r * NKV_ * CAP_ * HD : 0;
         T_* kc = const_cast<T_*>(kcache) + bplane;
         T_* vc = const_cast<T_*>(vcache) + bplane;
@@ -4311,7 +4313,7 @@ _ATTN_VERIFY_CD_SOURCE = r"""
             const int head = task / ROWS_;
             const int r = task % ROWS_;
             const int kvh = head / (NQ_ / NKV_);
-            const int kL = BATCH_ ? kl0 : (kl0 + r);
+            const int kL = RAGGED_ ? (int)live[3 + r * 3 + 1] : (BATCH_ ? kl0 : (kl0 + r));
             if (kL > 1024) continue;  // whole block: no divergence
             float q[VPL], k[VPL], o[VPL];
             #pragma unroll
@@ -4323,7 +4325,7 @@ _ATTN_VERIFY_CD_SOURCE = r"""
             float max_score = -3.402823466e38f;
             float sum_exp = 0.0f;
             const long long kh = (long long)kvh * CAP_ * HD
-                + (BATCH_ ? (long long)r * NKV_ * CAP_ * HD : 0);
+                + ((RAGGED_ || BATCH_) ? (long long)r * NKV_ * CAP_ * HD : 0);
             for (int i = warp; i < kL; i += 32) {
                 #pragma unroll
                 for (int j = 0; j < VPL; ++j)
@@ -4403,7 +4405,7 @@ _ATTN_VERIFY_CD_SOURCE = r"""
                     const int rem = vb - r * NQ_ * 32;
                     head = rem >> 5;
                     slab = rem & 31;
-                    kL = BATCH_ ? kl0 : (kl0 + r);
+                    kL = RAGGED_ ? (int)live[3 + r * 3 + 1] : (BATCH_ ? kl0 : (kl0 + r));
                     act = kL > 1024;
                 }
                 const int kvh = head / (NQ_ / NKV_);
@@ -4418,7 +4420,7 @@ _ATTN_VERIFY_CD_SOURCE = r"""
                         o[i] = 0.0f;
                     }
                     const long long kh = (long long)kvh * CAP_ * HD
-                        + (BATCH_ ? (long long)r * NKV_ * CAP_ * HD : 0);
+                        + ((RAGGED_ || BATCH_) ? (long long)r * NKV_ * CAP_ * HD : 0);
                     for (int i = slab * 8 + swrp; i < kL; i += 256) {
                         #pragma unroll
                         for (int j = 0; j < VPL; ++j)
@@ -4518,7 +4520,7 @@ _ATTN_VERIFY_CD_SOURCE = r"""
                 if (act) {
                     r = t / NQ_;
                     head = t - r * NQ_;
-                    kL = BATCH_ ? kl0 : (kl0 + r);
+                    kL = RAGGED_ ? (int)live[3 + r * 3 + 1] : (BATCH_ ? kl0 : (kl0 + r));
                     act = kL > 1024;
                 }
                 float o[VPL];
@@ -4591,7 +4593,19 @@ _ATTN_VERIFY_CD_SOURCE = r"""
     }
 
     if (blk == 0 && tid == 0) {
-        if (BATCH_) {
+        if (RAGGED_) {
+            // every row advances its own counters, production clamp/wrap
+            for (int r = 0; r < ROWS_; ++r) {
+                const float pr = live[3 + r * 3 + 0];
+                const int kr = (int)live[3 + r * 3 + 1];
+                const int sr = (int)live[3 + r * 3 + 2];
+                live[3 + r * 3 + 0] = pr + 1.0f;
+                live[3 + r * 3 + 1] =
+                    (kr < CAP_) ? (float)(kr + 1) : (float)CAP_;
+                const int ns = sr + 1;
+                live[3 + r * 3 + 2] = (ns == CAP_) ? 0.0f : (float)ns;
+            }
+        } else if (BATCH_) {
             // one token per stream: the counters advance like a single
             // sequential step, shared by every row -- with the SAME
             // clamp and ring wrap the production tail applies, or a
@@ -5158,7 +5172,8 @@ def _attn_mega_call_batch(layer, hn, c):
         ("T_", hn.dtype), ("KH_", kh), ("NQ_", nq), ("NKV_", nkv),
         ("CAP_", cap), ("ROPE_", 1 if attn.use_rope else 0),
         ("RD_", getattr(attn, "_rope_dim", 0) if attn.use_rope else 0),
-        ("ROWS_", B), ("BATCH_", 1), ("GRID_", grid),
+        ("ROWS_", B), ("BATCH_", 1), ("RAGGED_", 0),
+        ("GRID_", grid),
     ]
     try:
         (scr,) = ab(

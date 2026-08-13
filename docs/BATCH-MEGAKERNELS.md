@@ -231,3 +231,16 @@ lifts to 128/128 on 4090 hosts. All four profiles of the batch lane are
 now bit-proven with data-driven defaults: sm86 ≤8, sm89 ≤4, sm90 ≤4,
 sm120 ≤8. Ops note: vast.ai had 4090s instantly ($0.28–0.35/hr) after a
 day of RunPod drought — first stop for consumer cards from now on.
+
+## The ragged front (2026-08-14): per-row counters proven — 60/60
+
+Continuous batching needs rows at DIFFERENT offsets in one dispatch, and
+the lane's shared-counter contract forbade that. The pair now carries a
+`RAGGED_` mode: each row reads its own (pos, kL, slot) from a per-row
+counter array and advances it independently (production clamp/wrap).
+Gate: 60/60 vs per-row-seeded production dispatches — sliding unwrapped,
+wrapped-ring mixes, full-geometry rows straddling the 1024 2-pass
+boundary, and B=8. MoE needs nothing (offset-free). Remaining for the
+serving story: the ragged lane plumbing (per-request caches → B-plane
+seeding on composition changes), the ragged E2E gate, then the service
+engine's micro-batch scheduler.
