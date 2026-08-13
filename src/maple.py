@@ -3637,10 +3637,12 @@ _ATTN_VERIFY_AB_SOURCE = r"""
         const int r = task / NH;
         const int head = task % NH;
         const float* xh = stq_kv + (long long)r * QKVROWS + head * HD;
-        const float pos = pos0 + (float)r;
-        const int slot = slot0 + r;
-        T_* kc = const_cast<T_*>(kcache);
-        T_* vc = const_cast<T_*>(vcache);
+        const float pos = BATCH_ ? pos0 : (pos0 + (float)r);
+        const int slot = BATCH_ ? slot0 : (slot0 + r);
+        const long long bplane = BATCH_
+            ? (long long)r * NKV_ * CAP_ * HD : 0;
+        T_* kc = const_cast<T_*>(kcache) + bplane;
+        T_* vc = const_cast<T_*>(vcache) + bplane;
         if (head >= NQ_ + NKV_) {
             const int kvh = head - NQ_ - NKV_;
             T_* vh = vc + ((long long)kvh * CAP_ + slot) * HD;
@@ -3760,7 +3762,7 @@ _ATTN_VERIFY_CD_SOURCE = r"""
             const int head = task / ROWS_;
             const int r = task % ROWS_;
             const int kvh = head / (NQ_ / NKV_);
-            const int kL = kl0 + r;
+            const int kL = BATCH_ ? kl0 : (kl0 + r);
             float q[VPL], k[VPL], o[VPL];
             #pragma unroll
             for (int i = 0; i < VPL; ++i) {
@@ -3770,7 +3772,8 @@ _ATTN_VERIFY_CD_SOURCE = r"""
             }
             float max_score = -3.402823466e38f;
             float sum_exp = 0.0f;
-            const long long kh = (long long)kvh * CAP_ * HD;
+            const long long kh = (long long)kvh * CAP_ * HD
+                + (BATCH_ ? (long long)r * NKV_ * CAP_ * HD : 0);
             for (int i = warp; i < kL; i += 32) {
                 #pragma unroll
                 for (int j = 0; j < VPL; ++j)
@@ -3853,9 +3856,17 @@ _ATTN_VERIFY_CD_SOURCE = r"""
     }
 
     if (blk == 0 && tid == 0) {
-        live[0] = pos0 + (float)ROWS_;
-        live[1] = (float)(kl0 + ROWS_);
-        live[2] = (float)(slot0 + ROWS_);
+        if (BATCH_) {
+            // one token per stream: the counters advance like a single
+            // sequential step, shared by every row.
+            live[0] = pos0 + 1.0f;
+            live[1] = (float)(kl0 + 1);
+            live[2] = (float)(slot0 + 1);
+        } else {
+            live[0] = pos0 + (float)ROWS_;
+            live[1] = (float)(kl0 + ROWS_);
+            live[2] = (float)(slot0 + ROWS_);
+        }
     }
 """
 
@@ -3863,15 +3874,30 @@ _ATTN_VERIFY_CD_SOURCE = r"""
 _attn_verify_cache = {}
 
 
-def _attn_verify_kernels(profile_name, use_rope, scale, eps, log2b):
-    key = (profile_name, use_rope, scale, eps, log2b)
+def _attn_verify_kernels(profile_name, use_rope, scale, eps, log2b,
+                         batch=False, second_half_form=None):
+    if second_half_form is None:
+        # Bit-gated per profile: form 1 reproduces the production sm86
+        # compilation byte-for-byte (batch_kv_debug, 0 diffs x8); the
+        # Blackwell profiles pin form 0 in production already. Re-confirm
+        # on each new profile during scale-out.
+        second_half_form = 0 if profile_name in ("sm100", "sm120") else 1
+    key = (profile_name, use_rope, scale, eps, log2b, batch,
+           second_half_form)
     pair = _attn_verify_cache.get(key)
     if pair is None:
-        second_half = (
-            "__fmaf_rn(value, rope_cos[i], "
-            "__fmul_rn(paired, rope_sin[i]))"
-            if profile_name in ("sm100", "sm120")
-            else "value * rope_cos[i] + paired * rope_sin[i]")
+        # The upper-half RoPE expression is contraction-sensitive (the
+        # sm100/sm120 story, chronicle #3): a fresh compilation of the
+        # same source can fma it differently from the production kernel.
+        # The verify pair therefore PINS the form; form 0/1 exist so the
+        # bit gate can select whichever reproduces production bytes on
+        # the profile at hand.
+        if profile_name in ("sm100", "sm120") or second_half_form == 0:
+            second_half = ("__fmaf_rn(value, rope_cos[i], "
+                           "__fmul_rn(paired, rope_sin[i]))")
+        else:
+            second_half = ("__fmaf_rn(paired, rope_sin[i], "
+                           "__fmul_rn(value, rope_cos[i]))")
 
         def bake(src):
             return (src
@@ -3880,8 +3906,9 @@ def _attn_verify_kernels(profile_name, use_rope, scale, eps, log2b):
                     .replace("LOG2B_", f"{log2b:.17e}f")
                     .replace("SECOND_HALF_", second_half))
 
+        suffix = "_batch" if batch else ""
         ab = mx.fast.cuda_kernel(
-            name="maple_attn_verify_ab",
+            name="maple_attn_verify_ab" + suffix,
             input_names=["hn", "wqkv", "sqkv", "bqkv", "wqk",
                          "kcache", "vcache", "scalars"],
             output_names=["scratch"],
@@ -3889,7 +3916,7 @@ def _attn_verify_kernels(profile_name, use_rope, scale, eps, log2b):
             header=_ATTN_MEGAKERNEL_HEADER,
         )
         cd = mx.fast.cuda_kernel(
-            name="maple_attn_verify_cd",
+            name="maple_attn_verify_cd" + suffix,
             input_names=["scratch_in", "wo", "so_", "bo_",
                          "kcache", "vcache", "scalars"],
             output_names=["out"],
