@@ -119,15 +119,14 @@ _use_moe_megakernel_exact = _env_flag("MAPLE_MOE_MEGAKERNEL_EXACT", True)
 # therefore data-driven: on where the lane is measured faster, off
 # elsewhere until profiled.  An explicit MAPLE_ATTENTION_MEGAKERNEL=0/1
 # always wins over the auto choice.
-# OPT-IN until the LRU physical-shape invariant lands: serving stacks that
-# store, deep-copy and trim cache objects between requests (mlx-lm's
-# LRUPromptCache) pick code paths off the PHYSICAL buffer shape, and the
-# lane's materialized/viewed buffers are exact-length rather than
-# stock-shaped (grown in 256-row blocks).  Every fused computation is
-# bit-exact in isolation -- the boundary, rotation, stream and multi-turn
-# suites are green -- but the cross-request LRU repro
-# (benchmarks/maple_lru_service_repro.py) still diverges, and a lane that
-# can interact with request isolation stays off until that repro is green.
+# Data-driven per-architecture default.  The lane is auto-on where it is
+# measured faster (sm86 +20.6%, sm89 +42.9% / 357->439 on the fix build)
+# and auto-off elsewhere (sm90/sm120 measured slower on healthy-CPU
+# hosts).  Request isolation against serving LRU caches is gated by
+# benchmarks/maple_lru_service_repro.py -- green 3/3 after the
+# materialize-on-any-detach fix (chronicle #18): stored caches get real
+# copies the moment the lane detaches from them, on EVERY detach path.
+# An explicit MAPLE_ATTENTION_MEGAKERNEL=0/1 always wins.
 _ATTENTION_MEGAKERNEL_FAST_PROFILES = ("sm86", "sm89")
 _use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", None)
 
@@ -135,7 +134,9 @@ _use_attention_megakernel = _env_flag("MAPLE_ATTENTION_MEGAKERNEL", None)
 def _attention_megakernel_enabled():
     if _use_attention_megakernel is not None:
         return _use_attention_megakernel
-    return False
+    profile = _cuda_profile()
+    return (profile is not None
+            and profile.name in _ATTENTION_MEGAKERNEL_FAST_PROFILES)
 
 
 def _kernel_backend():
@@ -3632,14 +3633,13 @@ class _AttnMegaState:
     def bound_to(self, c):
         return self.cache_ref is not None and self.cache_ref() is c
 
-    def bind(self, c):
-        if self.bound_to(c):
-            return
-        # A different cache object means a different request. Two duties:
-        # the OLD cache may live on (the service's LRU stores it) and its
-        # keys are zero-copy views into our buffers, which the new request
-        # is about to overwrite -- materialize its history first. And our
-        # sync is meaningless for the new cache -- resync from it instead.
+    def materialize_old(self):
+        """Turn the previously-bound cache's zero-copy views into real
+        copies. MUST run before synced_offset is cleared on ANY detach
+        path: a stored cache (the service's LRU) that keeps views into
+        these buffers would otherwise silently mutate as the next request
+        overwrites them -- that exact ordering gap rotted stored histories
+        when the multi-turn guard cleared the sync before bind() ran."""
         old = self.cache_ref() if self.cache_ref is not None else None
         if old is not None and self.synced_offset > 0:
             n = min(self.synced_offset, self.cap)
@@ -3647,6 +3647,13 @@ class _AttnMegaState:
             old.keys = mx.contiguous(self.kbuf[..., :phys, :])
             old.values = mx.contiguous(self.vbuf[..., :phys, :])
             mx.eval(old.keys, old.values)
+
+    def bind(self, c):
+        if self.bound_to(c):
+            return
+        # A different cache object means a different request: materialize
+        # the old cache's views, then resync from the new one.
+        self.materialize_old()
         self.synced_offset = -1
         self.cache_ref = weakref.ref(c)
 
@@ -3899,7 +3906,10 @@ def _attn_mega_writeback(attn, c):
         # A fresh request reuses the module but not the cache object; our
         # buffers belong to the previous conversation. Writing them here
         # is exactly the way one user's context leaks into another's
-        # answer -- drop the sync instead.
+        # answer. Materialize the PREVIOUS cache's views first -- clearing
+        # the sync without doing so leaves any stored copy of it aliased
+        # to buffers the new request will overwrite -- then drop the sync.
+        state.materialize_old()
         state.synced_offset = -1
         return
     n = min(state.synced_offset, state.cap)

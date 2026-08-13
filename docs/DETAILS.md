@@ -447,3 +447,19 @@ generated token with every per-layer shadow bit-clean. The lane is
 the fix direction is a physical-shape invariant — publish views and
 materializations at the stock-grown shape. All other suites stay green
 and the sm89 A/B holds 390→440 with the views in place.
+
+### 18. 2026-08-13 — the gate goes green; the default comes back
+
+Microscope3 pinned the last channel: the stored LRU entry was bit-equal
+at insert time and dirty at fetch time — the multi-turn guard cleared
+`synced_offset` on foreign caches *before* `bind()` could materialize the
+previously-bound cache's zero-copy views, so the stored cache stayed
+aliased to the lane's buffers and rotted under the next request. The fix
+makes `materialize_old()` run on **every** detach path. Verification:
+the LRU gate 3/3 all-identical, boundary A–F green, all legacy suites
+green, sm89 A/B 357→439 (+23%); sm120 joined the bit-validated set
+(boundary A–F identical) with mixed perf (short +2.8%, long −8…−15%) so
+its auto-off stands. The attention lane's data-driven default is
+restored: on for sm86/sm89, off elsewhere, env always wins. The
+acceptance corpus grew to 24 streams the same day: mean 1.592, code
+traffic 2.6–4.9 — the L-row speculation ports are a go.

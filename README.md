@@ -30,8 +30,8 @@ processes; each row is one rented host, so compare within rows:
 
 | GPU | portable MLX | this patch | speedup | token stream |
 | --- | ---: | ---: | ---: | --- |
-| RTX 4090 | 157.7 | 318.8 (**455.7** with the opt-in attention lane) | ×2.0 (**×2.9**) | bit-identical, 8/8 prompts |
-| RTX 3090 | 152.3 | 345.2 (+20.6% with the opt-in lane) | ×2.3 (×2.7) | bit-identical, 8/8 |
+| RTX 4090 | 157.7 | **455.7** | **×2.9** | bit-identical, 8/8 prompts |
+| RTX 3090 | 152.3 | ~415 (345.2 + 20.6%) | ×2.7 | bit-identical, 8/8 |
 | H100 80GB | 206.8 | 388.6 | ×1.9 | bit-identical, 8/8 |
 | RTX 5090 | 242.6 | 381.6 | ×1.6 | bit-identical, 8/8 |
 | B200 | 141.9 | 358.0 | ×2.5 | bit-identical, 8/8 |
@@ -42,15 +42,14 @@ including in-flight growth. Bit-exactness is not sampled, it is gated: live
 per-layer probes at load, screened-prompt stream equality, and an 846-token
 quality suite that reproduces the reference NLL to the last digit.
 
-The MoE megakernel is the default everywhere; the **attention lane is
-currently opt-in** (`MAPLE_ATTENTION_MEGAKERNEL=1`): its own suites are
-bit-exact, but serving stacks that store/deep-copy/trim cache objects
-between requests exposed a physical-shape interaction
-(`benchmarks/maple_lru_service_repro.py`, chronicle #17) and the lane
-stays off by default until that repro is green. Every lane falls back to
-portable MLX on any mismatch; `MAPLE_MOE_MEGAKERNEL_EXACT=0
-MAPLE_MOE_MEGAKERNEL=0` steps down to the strict two-fusion lane (+7%
-over portable, also bit-identical).
+Defaults are data-driven per architecture: the attention lane is auto-on
+where measured faster (sm86/sm89) and auto-off elsewhere (H100/5090
+measured slower on healthy-CPU hosts). Cross-request isolation against
+serving LRU caches is gated by `benchmarks/maple_lru_service_repro.py` —
+green 3/3 (chronicles #17-18). Every lane falls back to portable MLX on
+any mismatch; `MAPLE_ATTENTION_MEGAKERNEL=0/1` forces the lane,
+`MAPLE_MOE_MEGAKERNEL_EXACT=0 MAPLE_MOE_MEGAKERNEL=0` steps down to the
+strict two-fusion lane (+7% over portable, also bit-identical).
 
 ## Use it
 
