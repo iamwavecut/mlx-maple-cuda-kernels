@@ -77,10 +77,19 @@ real streams before kernel work starts. Side effect of collecting them:
 the cross-request isolation incident (chronicle #17) — found, mitigated,
 and gated behind the LRU repro.
 
+## Corpus round two (2026-08-13, 24 streams / 2767 tokens)
+
+Best mean **1.592 tokens/pass** (k=2, L=16), median 1.205. The shape is
+the story: code edits 2.6-4.9 (refactor 4.93, add-logging 3.11,
+typehints 2.59), log→JSON 3.16, regex 1.82 — while Q&A/diagnosis sit at
+exactly 1.0. Speculation pays >1.4 precisely on the copy-heavy agent
+traffic Maple serves, and costs nothing to skip elsewhere (the drafter
+simply finds no match and the pass degenerates to a single step). Verdict:
+build the L-row ports.
+
 ## Order of work for the next cycle
 
-1. Extend the acceptance corpus to dozens of real service streams (the
-   collection+tokenize+simulate pipeline exists).
+1. ~~Extend the acceptance corpus~~ done (24 streams; see above).
 2. If A clears ~1.5 on real traffic: build the L-row router/qmv ports and
    pin their bits (the recipes are per-token independent — expect clean
    ports).
