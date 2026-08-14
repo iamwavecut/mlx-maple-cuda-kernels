@@ -3554,6 +3554,157 @@ _MOE_BATCH_MEGAKERNEL_SOURCE = r"""
 """
 
 
+# Fused lm_head + materialized-vocabulary mask + argmax: temp-0 serving
+# never needs 151936 materialized logits, only the argmax index. Phase A
+# runs the PINNED stock 4-bit gs=64 qmv recipe (paired bf162
+# accumulators, UNFUSED hmul2+hadd2 dequant, ept=16, fp32 fold, warp
+# reduce -- probe 6/6 on the real head) and reduces 8 rows per block to
+# one (value, min-index) candidate; phase B reduces the block candidates.
+# Ties break to the SMALLEST index, matching mx.argmax's first-maximum.
+_HEAD_ARGMAX_A_SOURCE = r"""
+    const int lane = threadIdx.x & 31;
+    const int wrp = threadIdx.x >> 5;
+    const int gw = blockIdx.x * 8 + wrp;
+    __shared__ float svals[8];
+    __shared__ int sidx[8];
+    float logit = -INFINITY;
+    if (gw < N_) {
+        const unsigned int* wrow =
+            reinterpret_cast<const unsigned int*>(wq)
+            + (long long)gw * (K_ >> 3);
+        const __nv_bfloat16* srow =
+            reinterpret_cast<const __nv_bfloat16*>(sc)
+            + (long long)gw * (K_ >> 6);
+        const __nv_bfloat16* brow =
+            reinterpret_cast<const __nv_bfloat16*>(bi)
+            + (long long)gw * (K_ >> 6);
+        __nv_bfloat162 sums2[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            sums2[i] = __halves2bfloat162(__nv_bfloat16(0.0f),
+                                          __nv_bfloat16(0.0f));
+        for (int base = lane * 16; base < K_; base += 512) {
+            const uint2 ww = __ldg(reinterpret_cast<const uint2*>(
+                wrow + (base >> 3)));
+            const unsigned int w0 = ww.x;
+            const unsigned int w1 = ww.y;
+            const __nv_bfloat16 s1 = srow[base >> 6];
+            const __nv_bfloat16 b1 = brow[base >> 6];
+            const __nv_bfloat162 s2 = __halves2bfloat162(s1, s1);
+            const __nv_bfloat162 b2 = __halves2bfloat162(b1, b1);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const unsigned int word = (i < 4) ? w0 : w1;
+                const int j = (i & 3) * 2;
+                const __nv_bfloat162 qv = __halves2bfloat162(
+                    __nv_bfloat16(float((word >> (4 * j)) & 15)),
+                    __nv_bfloat16(float((word >> (4 * (j + 1))) & 15)));
+                const __nv_bfloat162 wdq = __hadd2(__hmul2(qv, s2), b2);
+                const __nv_bfloat162 xv =
+                    *reinterpret_cast<const __nv_bfloat162*>(
+                        x + base + 2 * i);
+                sums2[i] = __hfma2(xv, wdq, sums2[i]);
+            }
+        }
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            sum += __bfloat162float(__low2bfloat16(sums2[i]));
+            sum += __bfloat162float(__high2bfloat16(sums2[i]));
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        // bf16 logit exactly as the stock head emits, then the mask
+        logit = mask[gw]
+            ? __bfloat162float(__nv_bfloat16(sum)) : -INFINITY;
+    }
+    if (lane == 0) {
+        svals[wrp] = logit;
+        sidx[wrp] = gw;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float best = svals[0];
+        int bi_ = sidx[0];
+        #pragma unroll
+        for (int i = 1; i < 8; ++i) {
+            if (svals[i] > best) { best = svals[i]; bi_ = sidx[i]; }
+        }
+        cand[blockIdx.x * 2] = best;
+        cand[blockIdx.x * 2 + 1] = __int_as_float(bi_);
+    }
+"""
+
+_HEAD_ARGMAX_B_SOURCE = r"""
+    __shared__ float svals[THREADS_];
+    __shared__ int sidx[THREADS_];
+    float best = -INFINITY;
+    int bi_ = 2147483647;
+    for (int i = threadIdx.x; i < NB_; i += THREADS_) {
+        const float v = cand[i * 2];
+        const int ix = __float_as_int(cand[i * 2 + 1]);
+        if (v > best || (v == best && ix < bi_)) { best = v; bi_ = ix; }
+    }
+    svals[threadIdx.x] = best;
+    sidx[threadIdx.x] = bi_;
+    __syncthreads();
+    for (int o = THREADS_ / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) {
+            const float ov = svals[threadIdx.x + o];
+            const int oi = sidx[threadIdx.x + o];
+            if (ov > svals[threadIdx.x]
+                || (ov == svals[threadIdx.x] && oi < sidx[threadIdx.x])) {
+                svals[threadIdx.x] = ov;
+                sidx[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = (unsigned int)sidx[0];
+"""
+
+
+_head_argmax_cache = {}
+
+
+def _head_argmax_kernels():
+    kernels = _head_argmax_cache.get("k")
+    if kernels is None:
+        a = mx.fast.cuda_kernel(
+            name="maple_head_argmax_a",
+            input_names=["x", "wq", "sc", "bi", "mask"],
+            output_names=["cand"], source=_HEAD_ARGMAX_A_SOURCE)
+        b = mx.fast.cuda_kernel(
+            name="maple_head_argmax_b", input_names=["cand"],
+            output_names=["out"], source=_HEAD_ARGMAX_B_SOURCE)
+        kernels = _head_argmax_cache["k"] = (a, b)
+    return kernels
+
+
+def head_argmax(hn, head, mask):
+    """Temp-0 pick: argmax over the masked lm_head WITHOUT materializing
+    the logits. hn is the final-normed hidden (..., K); mask is the bool
+    materialized-vocabulary mask (N,). Returns a uint32 scalar array.
+    Bit contract: each logit is the pinned stock recipe's bf16 value;
+    ties take the smallest index, matching mx.argmax."""
+    a, b = _head_argmax_kernels()
+    n, k = head.weight.shape[0], hn.shape[-1]
+    nb = (n + 7) // 8
+    (cand,) = a(
+        inputs=[hn.reshape(-1).astype(mx.bfloat16), head.weight,
+                head.scales, head.biases, mask],
+        template=[("N_", n), ("K_", k), ("THREADS_", 256)],
+        grid=(nb * 256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(nb * 2,)], output_dtypes=[mx.float32])
+    (out,) = b(
+        inputs=[cand],
+        template=[("NB_", nb), ("THREADS_", 1024)],
+        grid=(1024, 1, 1), threadgroup=(1024, 1, 1),
+        output_shapes=[(1,)], output_dtypes=[mx.uint32])
+    return out
+
+
 _moe_batch_megakernel_cache = {}
 
 
