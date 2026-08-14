@@ -33,8 +33,18 @@ def toks(tok, p):
 
 
 def solo_stream(model, ids, steps, eos):
+    # The reference MUST prefill through the same branch as pooled
+    # admission (chunk prompt[:-1], last token as an S=1 decode step):
+    # the last prompt slot's K/V differ AT THE BIT between the prefill
+    # and decode branches across all layers, so a whole-prompt reference
+    # diverges legitimately -- that mismatch is branch inconsistency of
+    # the HARNESS, not a pool bug.
     cache = make_prompt_cache(model)
-    out = model(mx.array([ids]), cache=cache)
+    n = len(ids)
+    for s0 in range(0, n - 1, 2048):
+        mx.eval(model(mx.array([ids[s0:min(s0 + 2048, n - 1)]]),
+                      cache=cache))
+    out = model(mx.array([ids[n - 1:]]), cache=cache)
     mx.eval(out)
     y = mx.argmax(out[:, -1, :], axis=-1, keepdims=True)
     mx.eval(y)

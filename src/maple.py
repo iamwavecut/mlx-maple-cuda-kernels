@@ -4855,11 +4855,17 @@ def _attn_seed_row(state, row, keys_src, values_src, pos, kl, slot, dtype):
     if n == 0:
         keys_src = mx.zeros((1, state.kbuf.shape[1], 1, 128), dtype)
         values_src = keys_src
+    # The kernel walks the source LINEARLY as (kvh, n, 128); a temporal
+    # slice of a cache whose physical rows exceed n (the stock 256-block
+    # growth) is NOT contiguous, and astype at the same dtype does not
+    # copy -- heads 1.. would read shifted rows. Force real copies.
+    keys_src = mx.contiguous(keys_src.astype(dtype))
+    values_src = mx.contiguous(values_src.astype(dtype))
     meta = mx.array([float(n), float(pos), float(kl), float(slot),
                      float(row)], mx.float32)
     (ok,) = _attn_seed_row_kernel()(
         inputs=[state.kbuf, state.vbuf, state.ctr,
-                keys_src.astype(dtype), values_src.astype(dtype), meta],
+                keys_src, values_src, meta],
         template=[("T_", dtype), ("KVH_", int(state.kbuf.shape[1])),
                   ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
         grid=(64 * 256, 1, 1), threadgroup=(256, 1, 1),
@@ -4896,7 +4902,8 @@ def _attn_seed(state, keys_src, values_src, pos, kl, slot, dtype):
     # batch state simply fuses its leading axes into the plane index.
     (ok,) = _attn_seed_kernel()(
         inputs=[state.kbuf, state.vbuf, state.ctr,
-                keys_src.astype(dtype), values_src.astype(dtype), meta],
+                mx.contiguous(keys_src.astype(dtype)),
+                mx.contiguous(values_src.astype(dtype)), meta],
         template=[("T_", dtype),
                   ("KVH_", int(state.kbuf.shape[0] * state.kbuf.shape[1])),
                   ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
@@ -5274,7 +5281,7 @@ class _AttnRaggedState:
     as _AttnMegaState -- all (re)seeding is kernel-side."""
 
     __slots__ = ("kbuf", "vbuf", "ctr", "cap", "rows", "synced",
-                 "cache_refs")
+                 "cache_refs", "comp")
 
     def __init__(self, kv_heads, cap, dtype, rows):
         self.kbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
@@ -5285,6 +5292,7 @@ class _AttnRaggedState:
         self.rows = rows
         self.synced = [-1] * rows
         self.cache_refs = [None] * rows
+        self.comp = None
 
     def materialize_row(self, r):
         ref = self.cache_refs[r]
@@ -5349,6 +5357,16 @@ def _attn_mega_call_ragged(layer, hn, caches):
 
     state = getattr(attn, "_ragged_state", None)
     if state is not None and state.rows != B:
+        state.materialize_all()
+        state = None
+        attn._ragged_state = None
+    # Any change in WHICH caches occupy the rows tears the state down
+    # for a full rebuild: the incremental rebind cascade across shifted
+    # planes proved bit-rotten on its first post-shift step (see the
+    # composition-change gate), and composition changes are rare enough
+    # that a full reseed is noise.
+    comp = tuple(id(c) for c in caches)
+    if state is not None and state.comp != comp:
         state.materialize_all()
         state = None
         attn._ragged_state = None
@@ -5475,6 +5493,7 @@ def _attn_mega_call_ragged(layer, hn, caches):
         c.keys = state.kbuf[r:r + 1, :, :phys, :]
         c.values = state.vbuf[r:r + 1, :, :phys, :]
         state.synced[r] = offset + 1
+    state.comp = comp
     return out.reshape(B, 1, kh)
 
 
