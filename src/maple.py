@@ -5360,16 +5360,29 @@ def _attn_mega_call_ragged(layer, hn, caches):
         state.materialize_all()
         state = None
         attn._ragged_state = None
-    # Any change in WHICH caches occupy the rows tears the state down
-    # for a full rebuild: the incremental rebind cascade across shifted
-    # planes proved bit-rotten on its first post-shift step (see the
-    # composition-change gate), and composition changes are rare enough
-    # that a full reseed is noise.
+    # A composition change rebuilds ONLY the planes whose occupant
+    # changed, in two strict phases: (A) materialize every such plane
+    # into its old cache -- so every displaced cache holds REAL copies,
+    # never views into planes about to be rewritten -- then (B) mark
+    # those rows for reseed from the (materialized) caches. Rows keeping
+    # their cache on their plane stay untouched. The one-pass rebind
+    # cascade this replaces interleaved materialize and seed across
+    # shifting planes and rotted the last shifted row (the
+    # composition-change gate caught it); the two-phase order is safe by
+    # construction because seeds read caches, not planes.
     comp = tuple(id(c) for c in caches)
     if state is not None and state.comp != comp:
-        state.materialize_all()
-        state = None
-        attn._ragged_state = None
+        changed = []
+        for r, c in enumerate(caches):
+            ref = state.cache_refs[r]
+            if ref is None or ref() is not c:
+                changed.append(r)
+        for r in changed:
+            state.materialize_row(r)
+        for r in changed:
+            state.synced[r] = -1
+            state.cache_refs[r] = None
+        state.comp = comp
     if rotating:
         cap = caches[0].max_size
         if cap > 1024 or any(c.max_size != cap for c in caches):
