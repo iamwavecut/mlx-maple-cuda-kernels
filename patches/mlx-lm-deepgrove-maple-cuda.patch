@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..a51974b 100644
+index a0673f7..90c472b 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,8 @@
@@ -1553,7 +1553,7 @@ index a0673f7..a51974b 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,36 +1925,3989 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,36 +1925,4002 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -5007,16 +5007,29 @@ index a0673f7..a51974b 100644
 +        state.materialize_all()
 +        state = None
 +        attn._ragged_state = None
-+    # Any change in WHICH caches occupy the rows tears the state down
-+    # for a full rebuild: the incremental rebind cascade across shifted
-+    # planes proved bit-rotten on its first post-shift step (see the
-+    # composition-change gate), and composition changes are rare enough
-+    # that a full reseed is noise.
++    # A composition change rebuilds ONLY the planes whose occupant
++    # changed, in two strict phases: (A) materialize every such plane
++    # into its old cache -- so every displaced cache holds REAL copies,
++    # never views into planes about to be rewritten -- then (B) mark
++    # those rows for reseed from the (materialized) caches. Rows keeping
++    # their cache on their plane stay untouched. The one-pass rebind
++    # cascade this replaces interleaved materialize and seed across
++    # shifting planes and rotted the last shifted row (the
++    # composition-change gate caught it); the two-phase order is safe by
++    # construction because seeds read caches, not planes.
 +    comp = tuple(id(c) for c in caches)
 +    if state is not None and state.comp != comp:
-+        state.materialize_all()
-+        state = None
-+        attn._ragged_state = None
++        changed = []
++        for r, c in enumerate(caches):
++            ref = state.cache_refs[r]
++            if ref is None or ref() is not c:
++                changed.append(r)
++        for r in changed:
++            state.materialize_row(r)
++        for r in changed:
++            state.synced[r] = -1
++            state.cache_refs[r] = None
++        state.comp = comp
 +    if rotating:
 +        cap = caches[0].max_size
 +        if cap > 1024 or any(c.max_size != cap for c in caches):
@@ -5558,7 +5571,7 @@ index a0673f7..a51974b 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +5975,133 @@ class MapleModel(nn.Module):
+@@ -792,29 +5988,133 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -5700,7 +5713,7 @@ index a0673f7..a51974b 100644
  
      def __call__(
          self,
-@@ -835,13 +6122,48 @@ class MapleModel(nn.Module):
+@@ -835,13 +6135,48 @@ class MapleModel(nn.Module):
                  h, cache[self.swa_idx], window_size=self.window_size
              )
  
@@ -5751,7 +5764,7 @@ index a0673f7..a51974b 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -987,6 +6309,18 @@ class Model(nn.Module):
+@@ -987,6 +6322,18 @@ class Model(nn.Module):
              and getattr(self.lm_head, "mode", "affine") == "affine"
          ):
              return self.lm_head_flash(out, self.lm_head)
@@ -5770,7 +5783,7 @@ index a0673f7..a51974b 100644
          return self.lm_head(out)
  
      def sanitize(self, weights):
-@@ -1021,6 +6355,32 @@ class Model(nn.Module):
+@@ -1021,6 +6368,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -5803,7 +5816,7 @@ index a0673f7..a51974b 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +6399,8 @@ class Model(nn.Module):
+@@ -1039,8 +6412,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
