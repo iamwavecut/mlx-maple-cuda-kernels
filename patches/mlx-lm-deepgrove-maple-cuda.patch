@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..820224c 100644
+index a0673f7..a51974b 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,8 @@
@@ -1553,7 +1553,7 @@ index a0673f7..820224c 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,36 +1925,3970 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,36 +1925,3989 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
@@ -4502,11 +4502,17 @@ index a0673f7..820224c 100644
 +    if n == 0:
 +        keys_src = mx.zeros((1, state.kbuf.shape[1], 1, 128), dtype)
 +        values_src = keys_src
++    # The kernel walks the source LINEARLY as (kvh, n, 128); a temporal
++    # slice of a cache whose physical rows exceed n (the stock 256-block
++    # growth) is NOT contiguous, and astype at the same dtype does not
++    # copy -- heads 1.. would read shifted rows. Force real copies.
++    keys_src = mx.contiguous(keys_src.astype(dtype))
++    values_src = mx.contiguous(values_src.astype(dtype))
 +    meta = mx.array([float(n), float(pos), float(kl), float(slot),
 +                     float(row)], mx.float32)
 +    (ok,) = _attn_seed_row_kernel()(
 +        inputs=[state.kbuf, state.vbuf, state.ctr,
-+                keys_src.astype(dtype), values_src.astype(dtype), meta],
++                keys_src, values_src, meta],
 +        template=[("T_", dtype), ("KVH_", int(state.kbuf.shape[1])),
 +                  ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
 +        grid=(64 * 256, 1, 1), threadgroup=(256, 1, 1),
@@ -4543,7 +4549,8 @@ index a0673f7..820224c 100644
 +    # batch state simply fuses its leading axes into the plane index.
 +    (ok,) = _attn_seed_kernel()(
 +        inputs=[state.kbuf, state.vbuf, state.ctr,
-+                keys_src.astype(dtype), values_src.astype(dtype), meta],
++                mx.contiguous(keys_src.astype(dtype)),
++                mx.contiguous(values_src.astype(dtype)), meta],
 +        template=[("T_", dtype),
 +                  ("KVH_", int(state.kbuf.shape[0] * state.kbuf.shape[1])),
 +                  ("CAP_", state.cap), ("THREADS_", 256), ("GRID_", 64)],
@@ -4921,7 +4928,7 @@ index a0673f7..820224c 100644
 +    as _AttnMegaState -- all (re)seeding is kernel-side."""
 +
 +    __slots__ = ("kbuf", "vbuf", "ctr", "cap", "rows", "synced",
-+                 "cache_refs")
++                 "cache_refs", "comp")
 +
 +    def __init__(self, kv_heads, cap, dtype, rows):
 +        self.kbuf = mx.zeros((rows, kv_heads, cap, 128), dtype)
@@ -4932,6 +4939,7 @@ index a0673f7..820224c 100644
 +        self.rows = rows
 +        self.synced = [-1] * rows
 +        self.cache_refs = [None] * rows
++        self.comp = None
 +
 +    def materialize_row(self, r):
 +        ref = self.cache_refs[r]
@@ -4996,6 +5004,16 @@ index a0673f7..820224c 100644
 +
 +    state = getattr(attn, "_ragged_state", None)
 +    if state is not None and state.rows != B:
++        state.materialize_all()
++        state = None
++        attn._ragged_state = None
++    # Any change in WHICH caches occupy the rows tears the state down
++    # for a full rebuild: the incremental rebind cascade across shifted
++    # planes proved bit-rotten on its first post-shift step (see the
++    # composition-change gate), and composition changes are rare enough
++    # that a full reseed is noise.
++    comp = tuple(id(c) for c in caches)
++    if state is not None and state.comp != comp:
 +        state.materialize_all()
 +        state = None
 +        attn._ragged_state = None
@@ -5122,6 +5140,7 @@ index a0673f7..820224c 100644
 +        c.keys = state.kbuf[r:r + 1, :, :phys, :]
 +        c.values = state.vbuf[r:r + 1, :, :phys, :]
 +        state.synced[r] = offset + 1
++    state.comp = comp
 +    return out.reshape(B, 1, kh)
 +
 +
@@ -5539,7 +5558,7 @@ index a0673f7..820224c 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +5956,133 @@ class MapleModel(nn.Module):
+@@ -792,29 +5975,133 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -5681,7 +5700,7 @@ index a0673f7..820224c 100644
  
      def __call__(
          self,
-@@ -835,13 +6103,48 @@ class MapleModel(nn.Module):
+@@ -835,13 +6122,48 @@ class MapleModel(nn.Module):
                  h, cache[self.swa_idx], window_size=self.window_size
              )
  
@@ -5732,7 +5751,7 @@ index a0673f7..820224c 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -987,6 +6290,18 @@ class Model(nn.Module):
+@@ -987,6 +6309,18 @@ class Model(nn.Module):
              and getattr(self.lm_head, "mode", "affine") == "affine"
          ):
              return self.lm_head_flash(out, self.lm_head)
@@ -5751,7 +5770,7 @@ index a0673f7..820224c 100644
          return self.lm_head(out)
  
      def sanitize(self, weights):
-@@ -1021,6 +6336,32 @@ class Model(nn.Module):
+@@ -1021,6 +6355,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -5784,7 +5803,7 @@ index a0673f7..820224c 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +6380,8 @@ class Model(nn.Module):
+@@ -1039,8 +6399,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
