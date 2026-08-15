@@ -553,6 +553,65 @@ _EXACT_ADD_RMS_SOURCE = r"""
     }
 """
 
+# The embedding table ships 4-bit gs=64 quantized; the lookup dequant
+# recipe is PINNED as pure bf16 ops (hmul+hadd) -- 5/5 against
+# mx.dequantize on the real table (fp32 forms miss 1/5).
+_EXACT_EMB_RMS_SOURCE = r"""
+    constexpr int VEC = 4;
+    constexpr int WARPS = THREADS_ / 32;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int base = tid * VEC;
+    const int tok = static_cast<int>(tokid[0]);
+    const unsigned int* wrow =
+        reinterpret_cast<const unsigned int*>(wq)
+        + (long long)tok * (DIM_ >> 3);
+    const __nv_bfloat16* srow =
+        reinterpret_cast<const __nv_bfloat16*>(sc)
+        + (long long)tok * (DIM_ >> 6);
+    const __nv_bfloat16* brow =
+        reinterpret_cast<const __nv_bfloat16*>(bi)
+        + (long long)tok * (DIM_ >> 6);
+
+    float hb[VEC];
+    float ss = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < VEC; ++i) {
+        const int idx = base + i;
+        const unsigned int word = wrow[idx >> 3];
+        const int q = (word >> (4 * (idx & 7))) & 15;
+        const T_ xv = __hadd(
+            __hmul(__nv_bfloat16(float(q)), srow[idx >> 6]),
+            brow[idx >> 6]);
+        const T_ rounded = static_cast<T_>(
+            static_cast<float>(xv) + static_cast<float>(r[base + i]));
+        h_out[base + i] = rounded;
+        hb[i] = static_cast<float>(rounded);
+        ss += hb[i] * hb[i];
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+
+    __shared__ float temp[WARPS];
+    if (lane == 0) temp[warp] = ss;
+    __syncthreads();
+    float tot = (lane < WARPS) ? temp[lane] : 0.0f;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
+    __shared__ float total_s;
+    if (tid == 0) total_s = tot;
+    __syncthreads();
+
+    const float scale = rsqrtf(total_s / static_cast<float>(DIM_) + EPS_);
+    #pragma unroll
+    for (int i = 0; i < VEC; ++i) {
+        hn_out[base + i] = static_cast<T_>(
+            hb[i] * scale * static_cast<float>(w[base + i]));
+    }
+"""
+
+
 _exact_add_rms_kernels = {}
 _exact_add_rms_plans = {}
 
@@ -575,6 +634,51 @@ def _exact_add_rms_supported(dim):
         return False
     threads = dim // 4
     return dim % 4 == 0 and threads % 32 == 0 and 32 <= threads <= 1024
+
+
+_exact_emb_rms_plans = {}
+
+
+def _exact_emb_rms_kernel(eps):
+    key = ("emb", eps)
+    kernel = _exact_add_rms_kernels.get(key)
+    if kernel is None:
+        kernel = _exact_add_rms_kernels[key] = mx.fast.cuda_kernel(
+            name="maple_exact_emb_rms",
+            input_names=["wq", "sc", "bi", "tokid", "r", "w"],
+            output_names=["h_out", "hn_out"],
+            source=_EXACT_EMB_RMS_SOURCE.replace("EPS_", f"{eps:.10e}f"),
+        )
+    return kernel
+
+
+def _exact_emb_rms_norm(we, tokid, r, w, eps):
+    """Quantized-embedding lookup + (x + r, rmsnorm(x + r) * w) in one
+    dispatch. The in-kernel dequant is the pinned bf16 recipe, so the
+    looked-up row is bit-identical to word_embeddings(tok)."""
+    dim = we.weight.shape[-1] * 8
+    key = (dim, w.dtype, eps)
+    plan = _exact_emb_rms_plans.get(key)
+    if plan is None:
+        threads = dim // 4
+        plan = _exact_emb_rms_plans[key] = (
+            _exact_emb_rms_kernel(eps),
+            {
+                "template": [
+                    ("T_", mx.bfloat16), ("W_", w.dtype), ("DIM_", dim),
+                    ("THREADS_", threads),
+                ],
+                "grid": (threads, 1, 1),
+                "threadgroup": (threads, 1, 1),
+                "output_shapes": [(1, 1, dim), (1, 1, dim)],
+                "output_dtypes": [mx.bfloat16, mx.bfloat16],
+            },
+        )
+    kernel, kwargs = plan
+    return kernel(
+        inputs=[we.weight, we.scales, we.biases,
+                tokid.reshape(-1).astype(mx.uint32), r, w],
+        **kwargs)
 
 
 def _exact_add_rms_norm(h, r, w, eps):
@@ -6212,7 +6316,7 @@ class MapleModel(nn.Module):
             return hn
         return bfuse(h, r, self.norm.weight, self.norm.eps)[1]
 
-    def _decode_fused(self, h, cache, full_mask, swa_mask, fuse):
+    def _decode_fused(self, h, cache, full_mask, swa_mask, fuse, tok=None):
         """Decode loop with residual adds folded into the norms.
 
         Carries (h, r) instead of adding r back each step, so every
@@ -6230,6 +6334,12 @@ class MapleModel(nn.Module):
             mx.eval(self._zero)
         r = self._zero  # x + 0 is exact in bf16
         hn = None
+        # NOTE: an embedding+fuse merge was built and measured bit-exact
+        # (48-step E2E equal), but the merged single-block kernel runs
+        # ~190us/step SLOWER than the stock gather + fuse pair -- the
+        # lookup is already overlapped in the stream. Kept as
+        # _exact_emb_rms_norm for reference; not wired.
+        del tok
         mega_next = (
             self._megakernel_next_norms()
             if (_use_moe_megakernel or _use_moe_megakernel_exact)
@@ -6314,7 +6424,8 @@ class MapleModel(nn.Module):
                     )
                 if self._exact_add_norm:
                     return self._decode_fused(
-                        h, cache, full_mask, swa_mask, _exact_add_rms_norm
+                        h, cache, full_mask, swa_mask, _exact_add_rms_norm,
+                        tok=inputs,
                     )
             # Historical approximate carrier: its thread mapping differs from
             # mx.fast.rms_norm, so it stays an explicit semantic lane.
