@@ -53,17 +53,21 @@ def main():
                 pkernel, pkwargs = pplan
                 mlp0 = block.switch_mlp
                 ug0, dp0 = mlp0.up_gate_proj, mlp0.down_proj
+                pkw = dict(pkwargs)
+                scratch_size = pkw.pop("scratch_size")
                 refs = []
                 for row in range(B):
-                    got = pkernel(
+                    pscr = mx.zeros((scratch_size,), mx.float32)
+                    mx.eval(pscr)
+                    out_r, hout_r = pkernel(
                         inputs=[h[row].reshape(1, 1, -1),
                                 r[row].reshape(1, 1, -1), ln.weight,
                                 block.gate.weight, ug0.weight, ug0.scales,
                                 ug0.biases, dp0.weight, dp0.scales,
-                                dp0.biases, next_w],
-                        **pkwargs,
+                                dp0.biases, next_w, pscr],
+                        **pkw,
                     )
-                    refs.append(got)  # (out, hout, scratch)
+                    refs.append((out_r, hout_r, pscr))
                 mx.eval(*[a for trip in refs for a in trip])
 
                 plan = maple._moe_batch_megakernel_plan(

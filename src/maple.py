@@ -3204,7 +3204,10 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     }
     __syncthreads();
     __threadfence();
-    if (blk != 0) return;
+    if (blk != 0) {
+        if (tid == 0) atomicAdd(&ctr[6], 1u);
+        return;
+    }
 
     // ---- phase E: aggregation + residual fold + next norm -----------------
     // Aggregation is col_reduce_small's linear loop with the multiply
@@ -3247,6 +3250,18 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
             out[idx] = static_cast<T_>(
                 sb[i] * nscale * static_cast<float>(nw2[idx]));
         }
+    }
+    // Self-clean: reset the barrier counters so persistent scratch
+    // never needs an init_value fill. Non-zero blocks punched the
+    // exit ticket (ctr[6]) after barrier 4; block 0 waits for all
+    // of them to be OUT of their spins before zeroing.
+    __syncthreads();
+    if (tid == 0) {
+        while (atomicAdd(&ctr[6], 0u) < (unsigned int)(GRID_ - 1))
+            __nanosleep(48);
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) ctr[i] = 0u;
+        __threadfence();
     }
 """
 
@@ -3607,7 +3622,10 @@ _MOE_BATCH_MEGAKERNEL_SOURCE = r"""
     }
     __syncthreads();
     __threadfence();
-    if (blk >= ROWS_) return;
+    if (blk >= ROWS_) {
+        if (tid == 0) atomicAdd(&ctr[6], 1u);
+        return;
+    }
 
     // ---- phase E: aggregation + residual + next norm, row r on block r ----
     {
@@ -3653,6 +3671,21 @@ _MOE_BATCH_MEGAKERNEL_SOURCE = r"""
             const int idx = base + i;
             orow[idx] = static_cast<T_>(
                 sb[i] * nscale * static_cast<float>(nw2[idx]));
+        }
+    }
+    // Self-clean (batch): rows 1..ROWS_-1 punch the exit ticket
+    // after phase E; only block 0 waits for GRID_-1 tickets and
+    // zeroes the counters.
+    __syncthreads();
+    if (tid == 0) {
+        if (blk != 0) {
+            atomicAdd(&ctr[6], 1u);
+        } else {
+            while (atomicAdd(&ctr[6], 0u) < (unsigned int)(GRID_ - 1))
+                __nanosleep(48);
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) ctr[i] = 0u;
+            __threadfence();
         }
     }
 """
@@ -5903,9 +5936,10 @@ def _moe_exact_megakernel(eps):
         kernel = _moe_exact_megakernel_cache[eps] = mx.fast.cuda_kernel(
             name="maple_moe_exact_megakernel",
             input_names=["hin", "rin", "nw", "rw", "ugw", "ugs", "ugb",
-                         "dnw", "dns", "dnb", "nw2"],
-            output_names=["out", "hout", "scratch"],
-            source=_MOE_EXACT_MEGAKERNEL_SOURCE.replace(
+                         "dnw", "dns", "dnb", "nw2", "scratch_in"],
+            output_names=["out", "hout"],
+            source="    float* scratch = const_cast<float*>(scratch_in);\n"
+            + _MOE_EXACT_MEGAKERNEL_SOURCE.replace(
                 "EPS_", f"{eps:.10e}f"),
             header=_MOE_EXACT_MEGAKERNEL_HEADER,
         )
@@ -5958,13 +5992,11 @@ def _moe_exact_megakernel_plan(block, ln, dtype, grid=None, threads=512):
             ],
             "grid": (grid * threads, 1, 1),
             "threadgroup": (threads, 1, 1),
-            "output_shapes": [
-                (1, 1, nd), (1, 1, kh),
-                (16 + 8 + 8 + 2 * block.gate.num_experts
-                 + block.gate.top_k * 2 * kd + block.gate.top_k * nd,),
-            ],
-            "output_dtypes": [dtype, dtype, mx.float32],
-            "init_value": 0,
+            "output_shapes": [(1, 1, nd), (1, 1, kh)],
+            "output_dtypes": [dtype, dtype],
+            "scratch_size": (16 + 8 + 8 + 2 * block.gate.num_experts
+                             + block.gate.top_k * 2 * kd
+                             + block.gate.top_k * nd),
         },
     )
 
@@ -5982,12 +6014,20 @@ def _moe_exact_megakernel_call(layer, h, r, ln, next_w):
     if plan is False:
         return None
     kernel, kwargs = plan
+    kwargs = dict(kwargs)
+    scratch_size = kwargs.pop("scratch_size")
+    scratch = getattr(block, "_exact_scratch", None)
+    if scratch is None or scratch.shape[0] != scratch_size:
+        scratch = mx.zeros((scratch_size,), mx.float32)
+        mx.eval(scratch)
+        block._exact_scratch = scratch
     mlp = block.switch_mlp
     ug, dp = mlp.up_gate_proj, mlp.down_proj
     try:
-        hn, hout, _ = kernel(
+        hn, hout = kernel(
             inputs=[h, r, ln.weight, block.gate.weight, ug.weight, ug.scales,
-                    ug.biases, dp.weight, dp.scales, dp.biases, next_w],
+                    ug.biases, dp.weight, dp.scales, dp.biases, next_w,
+                    scratch],
             **kwargs,
         )
     except (RuntimeError, TypeError, ValueError):
