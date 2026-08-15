@@ -21,3 +21,17 @@ Scripts: reuse `lab2026-08-10/{attn_paired_probe, wave_probe,
 trunk_true_gpu, phase_budget}.py` plus an nsys wrapper; the standard
 pod bootstrap (runpod-ssh-pod skill or vast flow in memory) with the
 CUDA-12.9-headers fix applies unchanged.
+
+## Run 1 verdicts (2026-08-15, bare 3090, ~$0.06)
+
+- **Wave hypothesis dead**: 2560 rows ≥ speed of 2048 on clean silicon
+  (54.1/64.2/59.3/59.5µs for 1024/2048/2304/2560). Nothing to rebalance.
+- **nsys tooling miss**: the runpod image carries nsight-COMPUTE only;
+  its bundled nsys writes no CUDA kernel data. Next run: install
+  nsight-systems from NVIDIA's apt repo (or use a devtools image), and
+  keep `ncu --set full` on one megakernel launch as the stall-reason
+  fallback (verify ERR_NVGPUCTRPERM first).
+- Remaining open question is unchanged: WHICH stalls make 140µs/layer
+  out of a ~19µs read floor. Only proper stall attribution decides
+  between warp-specialization, ILP restructuring, or accepting the
+  wall.
