@@ -57,20 +57,21 @@ def run_case(attn, profile, cap, offsets, wrapped, trials, seed0):
             mx.eval(kb, vb, ctr)
             ctr[0], ctr[1], ctr[2] = rows_meta[r]
             mx.eval(ctr)
-            o, _ = prod(
+            pscr = mx.zeros(
+                (16 + (nq + 2 * nkv) * 128 + nq * 128 * 2
+                 + nq * 32 * 130,), mx.float32)
+            mx.eval(pscr)
+            (o,) = prod(
                 inputs=[hns[r].reshape(-1), qkv.weight, qkv.scales,
                         qkv.biases, attn._qk_w, op.weight, op.scales,
-                        op.biases, kb, vb, ctr],
+                        op.biases, kb, vb, ctr, pscr],
                 template=[("T_", hns.dtype), ("KH_", kh), ("NQ_", nq),
                           ("NKV_", nkv), ("CAP_", cap),
                           ("ROPE_", 1 if attn.use_rope else 0),
                           ("RD_", rd), ("THREADS_", 1024), ("GRID_", 64)],
                 grid=(64 * 1024, 1, 1), threadgroup=(1024, 1, 1),
-                output_shapes=[
-                    (1, 1, kh),
-                    (16 + (nq + 2 * nkv) * 128 + nq * 128 * 2
-                     + nq * 32 * 130,)],
-                output_dtypes=[hns.dtype, mx.float32], init_value=0)
+                output_shapes=[(1, 1, kh)],
+                output_dtypes=[hns.dtype])
             mx.eval(o)
             souts.append(o.reshape(1, kh))
             skbs.append(kb); svbs.append(vb); sctrs.append(ctr)

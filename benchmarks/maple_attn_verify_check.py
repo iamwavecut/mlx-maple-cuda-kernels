@@ -63,10 +63,17 @@ for lname, lidx in (("rope_sliding", 0), ("nope_full", 3)):
                 mx.eval(ctr)
                 outs = []
                 for r in range(L):
-                    o, _ = prod(
+                    pscr = mx.zeros(
+                        (16 + (attn.num_attention_heads
+                               + 2 * attn.num_key_value_heads) * 128
+                         + attn.num_attention_heads * 128 * 2
+                         + attn.num_attention_heads * 32 * 130,),
+                        mx.float32)
+                    mx.eval(pscr)
+                    (o,) = prod(
                         inputs=[hns[r].reshape(-1), qkv.weight, qkv.scales,
                                 qkv.biases, attn._qk_w, op.weight, op.scales,
-                                op.biases, kb, vb, ctr],
+                                op.biases, kb, vb, ctr, pscr],
                         template=[("T_", hns.dtype), ("KH_", kh),
                                   ("NQ_", attn.num_attention_heads),
                                   ("NKV_", attn.num_key_value_heads),
@@ -75,14 +82,8 @@ for lname, lidx in (("rope_sliding", 0), ("nope_full", 3)):
                                   ("RD_", rd), ("THREADS_", 1024),
                                   ("GRID_", 64)],
                         grid=(64 * 1024, 1, 1), threadgroup=(1024, 1, 1),
-                        output_shapes=[
-                            (1, 1, kh),
-                            (16 + (attn.num_attention_heads
-                                   + 2 * attn.num_key_value_heads) * 128
-                             + attn.num_attention_heads * 128 * 2
-                             + attn.num_attention_heads * 32 * 130,)],
-                        output_dtypes=[hns.dtype, mx.float32],
-                        init_value=0)
+                        output_shapes=[(1, 1, kh)],
+                        output_dtypes=[hns.dtype])
                     outs.append(o.reshape(1, kh))
                     mx.eval(o)
                 return mx.concatenate(outs, axis=0), kb, vb, ctr
@@ -98,7 +99,8 @@ for lname, lidx in (("rope_sliding", 0), ("nope_full", 3)):
                 tmpl = [("T_", hns.dtype), ("KH_", kh),
                         ("NQ_", nq), ("NKV_", nkv), ("CAP_", cap),
                         ("ROPE_", 1 if attn.use_rope else 0),
-                        ("RD_", rd), ("ROWS_", L), ("GRID_", 64)]
+                        ("RD_", rd), ("ROWS_", L), ("RAGGED_", 0),
+                        ("BATCH_", 0), ("GRID_", 64)]
                 scr_shape = (16 + L * ((nq + 2 * nkv) * 128
                                        + nq * 128 * 2 + kh),)
                 (scr,) = vab(

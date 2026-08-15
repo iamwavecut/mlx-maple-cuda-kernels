@@ -4386,6 +4386,27 @@ _ATTN_MEGAKERNEL_SOURCE = r"""
         const int nslot = slot + 1;
         live[2] = (nslot == CAP_) ? 0.0f : (float)nslot;
     }
+
+    // Self-clean: every block punches the exit ticket (ctr[6], a free
+    // slot); block 0 waits for all GRID_ tickets -- everyone is past
+    // every spin by then -- and zeroes the counters so the persistent
+    // scratch never needs an init_value fill.  The fence between the
+    // ticket spin and the plain zeroing stores is load-bearing: relaxed
+    // atomics are not a compiler barrier, and without it the stores can
+    // be hoisted above the wait, wiping live tickets (a permanent hang).
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        atomicAdd(&ctr[6], 1u);
+        if (blk == 0) {
+            while (atomicAdd(&ctr[6], 0u) < (unsigned int)GRID_)
+                __nanosleep(48);
+            __threadfence();
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) ctr[i] = 0u;
+            __threadfence();
+        }
+    }
 """
 
 
@@ -4990,9 +5011,11 @@ def _attn_megakernel(profile_name, use_rope, scale, eps, log2b):
             name=f"maple_attn_megakernel_{'rope' if use_rope else 'nope'}"
                  f"_{profile_name}",
             input_names=["hn", "wqkv", "sqkv", "bqkv", "wqk",
-                         "wo", "so_", "bo_", "kcache", "vcache", "scalars"],
-            output_names=["out", "scratch"],
-            source=src,
+                         "wo", "so_", "bo_", "kcache", "vcache", "scalars",
+                         "scratch_in"],
+            output_names=["out"],
+            source="    float* scratch = const_cast<float*>(scratch_in);\n"
+                   + src,
             header=_ATTN_MEGAKERNEL_HEADER,
         )
     return kernel
@@ -5335,11 +5358,22 @@ def _attn_mega_call(layer, hn, c):
     )
     kh = hn.shape[-1]
     grid = _attn_megakernel_grid()
+    scratch_size = (16 + (attn.num_attention_heads
+                          + 2 * attn.num_key_value_heads) * 128
+                    + attn.num_attention_heads * 128 * 2
+                    + attn.num_attention_heads * 32 * (128 + 2))
+    scratch = getattr(attn, "_mega_scratch", None)
+    if scratch is None or scratch.shape[0] != scratch_size:
+        # persistent, zeroed ONCE; the kernel's self-clean tail keeps the
+        # barrier counters at zero between calls
+        scratch = mx.zeros((scratch_size,), mx.float32)
+        mx.eval(scratch)
+        attn._mega_scratch = scratch
     try:
-        out, _ = kernel(
+        (out,) = kernel(
             inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
                     attn._qk_w, op.weight, op.scales, op.biases,
-                    state.kbuf, state.vbuf, state.ctr],
+                    state.kbuf, state.vbuf, state.ctr, scratch],
             template=[
                 ("T_", hn.dtype), ("KH_", kh),
                 ("NQ_", attn.num_attention_heads),
@@ -5349,15 +5383,8 @@ def _attn_mega_call(layer, hn, c):
                 ("THREADS_", 1024), ("GRID_", grid),
             ],
             grid=(grid * 1024, 1, 1), threadgroup=(1024, 1, 1),
-            output_shapes=[
-                (1, 1, kh),
-                (16 + (attn.num_attention_heads
-                       + 2 * attn.num_key_value_heads) * 128
-                 + attn.num_attention_heads * 128 * 2
-                 + attn.num_attention_heads * 32 * (128 + 2),),
-            ],
-            output_dtypes=[hn.dtype, mx.float32],
-            init_value=0,
+            output_shapes=[(1, 1, kh)],
+            output_dtypes=[hn.dtype],
         )
     except (RuntimeError, TypeError, ValueError):
         return None
