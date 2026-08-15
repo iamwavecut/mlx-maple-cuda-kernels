@@ -45,3 +45,11 @@ under CUDA graphs and the profile command lacked
 rental, per the no-looping rule): add that flag AND capture a second
 control profile with `MLX_USE_CUDA_GRAPHS=0`; keep `ncu --set full` on
 one megakernel as the stall fallback.
+
+## Run 3 script READY (2026-08-15, pre-staged)
+
+`run_nsys_campaign.sh` v3 is staged and syntax-checked: graph-aware
+profile (`--cuda-graph-trace=node`), a graphs-off control profile, a
+per-minute ticker in the log, and the ncu stall fallback guarded by an
+ERR_NVGPUCTRPERM grep. Next rental is plug-and-play: pod-up → upload
+podnsys/ → chained setup+campaign → pull kern_sum_{graphs,nograph}.txt.
