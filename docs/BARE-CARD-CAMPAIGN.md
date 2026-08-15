@@ -35,3 +35,13 @@ CUDA-12.9-headers fix applies unchanged.
   out of a ~19µs read floor. Only proper stall attribution decides
   between warp-specialization, ILP restructuring, or accepting the
   wall.
+
+## Run 2 (2026-08-15): tool works, flag missing — exact fix recorded
+
+Real nsight-systems 2026.4.1 installed from the NVIDIA devtools repo and
+ran cleanly — the profile is still kernel-less because the decode runs
+under CUDA graphs and the profile command lacked
+`--cuda-graph-trace=node`. Next run (bundled with the next planned
+rental, per the no-looping rule): add that flag AND capture a second
+control profile with `MLX_USE_CUDA_GRAPHS=0`; keep `ncu --set full` on
+one megakernel as the stall fallback.
