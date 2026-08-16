@@ -2900,6 +2900,7 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     constexpr int OFF_PRB = OFF_LOG + NROUT_;
     constexpr int OFF_UGS = OFF_PRB + NROUT_;
     constexpr int OFF_DST = OFF_UGS + NEXP_ * 2 * KD_;
+    constexpr int OFF_S2 = OFF_DST + NEXP_ * ND_;
     unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
     float* idxf = scratch + OFF_IDX;
     float* scoref = scratch + OFF_SCO;
@@ -2907,6 +2908,7 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     float* probs = scratch + OFF_PRB;
     float* ugstage = scratch + OFF_UGS;
     float* dstage = scratch + OFF_DST;
+    float* s2stage = scratch + OFF_S2;
 
     __shared__ float xs_lin[KH_];
     __shared__ __nv_bfloat16 xbs[KH_];
@@ -3204,23 +3206,17 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     }
     __syncthreads();
     __threadfence();
-    if (blk != 0) {
-        if (tid == 0) atomicAdd(&ctr[6], 1u);
-        return;
-    }
 
-    // ---- phase E: aggregation + residual fold + next norm -----------------
-    // Aggregation is col_reduce_small's linear loop with the multiply
-    // rounded on its own (128/128 bitwise); the tail is the proven exact
-    // fuse.
+    // ---- phase E1: aggregation + residual fold, on ALL blocks -------------
+    // Element-parallel and bit-identical: every element runs the exact
+    // per-element chain of the solo phase E (same fixed e-order, same
+    // roundings); only WHICH block computes it changes.  float(s2) is
+    // staged so block 0 can replay the norm reduction 1:1.
     {
-        constexpr int VEC = KH_ / THREADS_;
-        const int base = tid * VEC;
-        float sb[VEC];
-        float ss = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < VEC; ++i) {
-            const int idx = base + i;
+        constexpr int PER = KH_ / GRID_;
+        const int idx0 = blk * PER;
+        for (int i = tid; i < PER; i += THREADS_) {
+            const int idx = idx0 + i;
             float agg = 0.0f;
             #pragma unroll
             for (int e = 0; e < NEXP_; ++e)
@@ -3231,7 +3227,37 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
                 static_cast<float>(hin[idx]) + static_cast<float>(rin[idx]));
             const T_ s2 = static_cast<T_>(static_cast<float>(s) + aggb);
             hout[idx] = s2;
-            sb[i] = static_cast<float>(s2);
+            s2stage[idx] = static_cast<float>(s2);
+        }
+    }
+
+    // ---- barrier 5 --------------------------------------------------------
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int old = atomicAdd(&ctr[4], 1u);
+        if (old == GRID_ - 1) atomicExch(&ctr[12], 1u);
+        else while (atomicAdd(&ctr[12], 0u) == 0u) __nanosleep(48);
+    }
+    __syncthreads();
+    __threadfence();
+    if (blk != 0) {
+        if (tid == 0) atomicAdd(&ctr[6], 1u);
+        return;
+    }
+
+    // ---- phase E2: the norm reduction replayed 1:1 on block 0 -------------
+    // sb[i] holds the SAME float(s2) values the solo phase produced; the
+    // shuffle tree and the cross-warp fold run in the original order, so
+    // nscale -- and every out element -- is bit-identical.
+    {
+        constexpr int VEC = KH_ / THREADS_;
+        const int base = tid * VEC;
+        float sb[VEC];
+        float ss = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < VEC; ++i) {
+            sb[i] = s2stage[base + i];
             ss += sb[i] * sb[i];
         }
         #pragma unroll
@@ -6023,7 +6049,7 @@ def _moe_exact_megakernel_plan(block, ln, dtype, grid=None, threads=512):
             "output_dtypes": [dtype, dtype],
             "scratch_size": (16 + 8 + 8 + 2 * block.gate.num_experts
                              + block.gate.top_k * 2 * kd
-                             + block.gate.top_k * nd),
+                             + block.gate.top_k * nd + kh),
         },
     )
 
