@@ -499,3 +499,38 @@ re-prove inside the real kernel. And the batch curve exposed the largest
 untouched front: B≥2 falls off every fused lane (236@2 < 289@1 while
 stock scales to 642@8) — the work map for B ≤ 8 megakernels lands in
 `BATCH-MEGAKERNELS.md`, riding the per-row bit pins already proven.
+
+### 21. The ragged lane and the service microbatch pool (2026-08-14/15)
+
+The batch megakernels grew a RAGGED_ mode — per-row (pos, kL, slot)
+counter triples with per-row advance and ring-wrap — so rows at
+different positions decode together, bit-for-bit against their solo
+streams (60/60 across unwrapped/wrapped/straddle/2-pass mixes, E2E
+8/8 rows with aggregate 332 tok/s at B=8 on the 3090). On top of it
+the serving repo gained a sole-worker microbatch pool (temp-0 joinable
+jobs, ghost-row fixed shapes, solo chunked prefill with the stock EOS
+contract, partial-LRU-hit refusal); the cross-request contamination
+incident it surfaced was root-caused to a one-pass rebind cascade and
+fixed with a two-phase incremental composition rebuild (hunt 0/4,
+aggregate 208 tok/s) — live in production as service v0.11.2.
+
+### 22. Self-clean persistent scratch: both megakernels drop init_value (2026-08-15/16)
+
+The latency dissection v2 (4030 µs step map: trunk 3599, lm_head 381,
+argmax 51, embedding 59) plus a finally-successful bare-card nsys run
+exposed ~120 copy fills per step — the init_value zeroing of every
+megakernel's scratch output. Both production megakernels were converted
+to a persistent scratch INPUT (const_cast on entry) with a ticketed
+self-clean tail: every block punches an exit ticket, block 0 waits for
+all of them (everyone is past every spin), fences — the fence is
+load-bearing, relaxed atomics are not a compiler barrier — and zeroes
+the counters. Exact-MoE landed first (420b988, −35 µs), attention
+followed (86f4ad6): full battery green, stream bit-identical, best
+step 3891.3 µs vs 4137.7 at the start of the cycle (−6%). The fused
+lm_head+mask+argmax kernel (200/200) and three pinned dequant recipes
+rode the same cycle; six honest negatives (LUT dequant, phase-scoped
+hfma2, embedding fuse among them) are on the record. A full night was
+also spent disproving a phantom deadlock: probes running without
+CUDA_DEVICE_ORDER=PCI_BUS_ID land on the wrong GPU entirely — the
+incident and the per-kernel nvrtc economics (custom kernels never
+disk-cache; ~1-1.7 s each, every process) are in the evidence log.

@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..90c472b 100644
+index a0673f7..f36dfa7 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,8 @@
@@ -449,7 +449,7 @@ index a0673f7..90c472b 100644
      x = mx.random.normal((1, 1, dim), key=mx.random.key(0)).astype(dtype)
      r = mx.random.normal((1, 1, dim), key=mx.random.key(1)).astype(dtype)
      return _matches(
-@@ -154,6 +504,129 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
+@@ -154,6 +504,233 @@ def _add_rms_norm_ok(dim, dtype, w, eps):
      )
  
  
@@ -502,6 +502,65 @@ index a0673f7..90c472b 100644
 +    }
 +"""
 +
++# The embedding table ships 4-bit gs=64 quantized; the lookup dequant
++# recipe is PINNED as pure bf16 ops (hmul+hadd) -- 5/5 against
++# mx.dequantize on the real table (fp32 forms miss 1/5).
++_EXACT_EMB_RMS_SOURCE = r"""
++    constexpr int VEC = 4;
++    constexpr int WARPS = THREADS_ / 32;
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int base = tid * VEC;
++    const int tok = static_cast<int>(tokid[0]);
++    const unsigned int* wrow =
++        reinterpret_cast<const unsigned int*>(wq)
++        + (long long)tok * (DIM_ >> 3);
++    const __nv_bfloat16* srow =
++        reinterpret_cast<const __nv_bfloat16*>(sc)
++        + (long long)tok * (DIM_ >> 6);
++    const __nv_bfloat16* brow =
++        reinterpret_cast<const __nv_bfloat16*>(bi)
++        + (long long)tok * (DIM_ >> 6);
++
++    float hb[VEC];
++    float ss = 0.0f;
++    #pragma unroll
++    for (int i = 0; i < VEC; ++i) {
++        const int idx = base + i;
++        const unsigned int word = wrow[idx >> 3];
++        const int q = (word >> (4 * (idx & 7))) & 15;
++        const T_ xv = __hadd(
++            __hmul(__nv_bfloat16(float(q)), srow[idx >> 6]),
++            brow[idx >> 6]);
++        const T_ rounded = static_cast<T_>(
++            static_cast<float>(xv) + static_cast<float>(r[base + i]));
++        h_out[base + i] = rounded;
++        hb[i] = static_cast<float>(rounded);
++        ss += hb[i] * hb[i];
++    }
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
++
++    __shared__ float temp[WARPS];
++    if (lane == 0) temp[warp] = ss;
++    __syncthreads();
++    float tot = (lane < WARPS) ? temp[lane] : 0.0f;
++    #pragma unroll
++    for (int o = 16; o > 0; o >>= 1) tot += __shfl_down_sync(0xffffffffu, tot, o);
++    __shared__ float total_s;
++    if (tid == 0) total_s = tot;
++    __syncthreads();
++
++    const float scale = rsqrtf(total_s / static_cast<float>(DIM_) + EPS_);
++    #pragma unroll
++    for (int i = 0; i < VEC; ++i) {
++        hn_out[base + i] = static_cast<T_>(
++            hb[i] * scale * static_cast<float>(w[base + i]));
++    }
++"""
++
++
 +_exact_add_rms_kernels = {}
 +_exact_add_rms_plans = {}
 +
@@ -524,6 +583,51 @@ index a0673f7..90c472b 100644
 +        return False
 +    threads = dim // 4
 +    return dim % 4 == 0 and threads % 32 == 0 and 32 <= threads <= 1024
++
++
++_exact_emb_rms_plans = {}
++
++
++def _exact_emb_rms_kernel(eps):
++    key = ("emb", eps)
++    kernel = _exact_add_rms_kernels.get(key)
++    if kernel is None:
++        kernel = _exact_add_rms_kernels[key] = mx.fast.cuda_kernel(
++            name="maple_exact_emb_rms",
++            input_names=["wq", "sc", "bi", "tokid", "r", "w"],
++            output_names=["h_out", "hn_out"],
++            source=_EXACT_EMB_RMS_SOURCE.replace("EPS_", f"{eps:.10e}f"),
++        )
++    return kernel
++
++
++def _exact_emb_rms_norm(we, tokid, r, w, eps):
++    """Quantized-embedding lookup + (x + r, rmsnorm(x + r) * w) in one
++    dispatch. The in-kernel dequant is the pinned bf16 recipe, so the
++    looked-up row is bit-identical to word_embeddings(tok)."""
++    dim = we.weight.shape[-1] * 8
++    key = (dim, w.dtype, eps)
++    plan = _exact_emb_rms_plans.get(key)
++    if plan is None:
++        threads = dim // 4
++        plan = _exact_emb_rms_plans[key] = (
++            _exact_emb_rms_kernel(eps),
++            {
++                "template": [
++                    ("T_", mx.bfloat16), ("W_", w.dtype), ("DIM_", dim),
++                    ("THREADS_", threads),
++                ],
++                "grid": (threads, 1, 1),
++                "threadgroup": (threads, 1, 1),
++                "output_shapes": [(1, 1, dim), (1, 1, dim)],
++                "output_dtypes": [mx.bfloat16, mx.bfloat16],
++            },
++        )
++    kernel, kwargs = plan
++    return kernel(
++        inputs=[we.weight, we.scales, we.biases,
++                tokid.reshape(-1).astype(mx.uint32), r, w],
++        **kwargs)
 +
 +
 +def _exact_add_rms_norm(h, r, w, eps):
@@ -579,7 +683,7 @@ index a0673f7..90c472b 100644
  # Inlined rather than imported from switch_layers: those helpers are private
  # (underscore-prefixed), and this file must keep loading against whatever
  # mlx-lm a user has installed when it ships inside a checkpoint.
-@@ -226,7 +699,7 @@ def _make_qk_norm_rope_kernel():
+@@ -226,7 +803,7 @@ def _make_qk_norm_rope_kernel():
  
          constexpr int per_lane = HEAD_DIM / 32;
          const device T_* xh = x + head * HEAD_DIM;
@@ -588,7 +692,7 @@ index a0673f7..90c472b 100644
          device T_* oh = out + head * HEAD_DIM;
  
          float ss = 0.0f;
-@@ -263,7 +736,244 @@ def _make_qk_norm_rope_kernel():
+@@ -263,7 +840,244 @@ def _make_qk_norm_rope_kernel():
      )
  
  
@@ -834,7 +938,7 @@ index a0673f7..90c472b 100644
  
  
  class MapleAttention(nn.Module):
-@@ -293,15 +1003,23 @@ class MapleAttention(nn.Module):
+@@ -293,15 +1107,23 @@ class MapleAttention(nn.Module):
              self.k_norm = MapleRMSNorm(self.head_dim, eps=args.rms_norm_eps)
          self._eps = args.rms_norm_eps
          self._rope_base = args.rope_theta
@@ -858,7 +962,7 @@ index a0673f7..90c472b 100644
              self.rope = initialize_rope(
                  rope_dim,
                  args.rope_theta,
-@@ -310,45 +1028,61 @@ class MapleAttention(nn.Module):
+@@ -310,45 +1132,61 @@ class MapleAttention(nn.Module):
                  max_position_embeddings=args.max_position_embeddings,
              )
  
@@ -948,7 +1052,7 @@ index a0673f7..90c472b 100644
  
      def _qk_reference(self, qk, offset):
          """The same result from stock ops: fallback, and the yardstick the
-@@ -369,20 +1103,48 @@ class MapleAttention(nn.Module):
+@@ -369,20 +1207,48 @@ class MapleAttention(nn.Module):
      ) -> mx.array:
          B, L, _ = x.shape
  
@@ -1000,7 +1104,7 @@ index a0673f7..90c472b 100644
              out = (self._qk_fused if self._fused_qk else self._qk_reference)(qk, offset)
              queries = out[:n_q].reshape(1, n_q, 1, self.head_dim)
              keys = out[n_q:].reshape(1, n_kv, 1, self.head_dim)
-@@ -409,6 +1171,9 @@ class MapleAttention(nn.Module):
+@@ -409,6 +1275,9 @@ class MapleAttention(nn.Module):
                  queries = self.rope(queries, offset=offset)
                  keys = self.rope(keys, offset=offset)
  
@@ -1010,7 +1114,7 @@ index a0673f7..90c472b 100644
          if cache is not None:
              keys, values = cache.update_and_fetch(keys, values)
  
-@@ -419,6 +1184,48 @@ class MapleAttention(nn.Module):
+@@ -419,6 +1288,48 @@ class MapleAttention(nn.Module):
          output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
          return self.o_proj(output)
  
@@ -1059,7 +1163,7 @@ index a0673f7..90c472b 100644
  
  class MapleMLP(nn.Module):
      def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-@@ -618,7 +1425,335 @@ def _make_fused_router_kernel():
+@@ -618,7 +1529,335 @@ def _make_fused_router_kernel():
      )
  
  
@@ -1396,7 +1500,7 @@ index a0673f7..90c472b 100644
  
  
  class MapleGate(nn.Module):
-@@ -633,23 +1768,84 @@ class MapleGate(nn.Module):
+@@ -633,23 +1872,84 @@ class MapleGate(nn.Module):
          self.weight = mx.zeros((args.num_experts, args.hidden_size))
          self._router_ctr = None
          self._fused = None  # None = unprobed, then True/False
@@ -1495,7 +1599,7 @@ index a0673f7..90c472b 100644
          shape = x.shape[:-1] + (self.top_k,)
          return inds.reshape(shape), scores.reshape(shape)
  
-@@ -659,6 +1855,19 @@ class MapleGate(nn.Module):
+@@ -659,6 +1959,19 @@ class MapleGate(nn.Module):
          gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
          return group_expert_select(gates, self.top_k)
  
@@ -1515,7 +1619,7 @@ index a0673f7..90c472b 100644
      def _probe(self, x):
          # Not _matches(): the two paths may order the selected experts
          # differently, and an exact tie at the top-k boundary may legitimately
-@@ -670,13 +1879,34 @@ class MapleGate(nn.Module):
+@@ -670,13 +1983,34 @@ class MapleGate(nn.Module):
              mx.eval(inds, scores, ref_inds, ref_scores)
          except Exception:
              return False
@@ -1553,23 +1657,15 @@ index a0673f7..90c472b 100644
          if self._fused is not False and x.size == self.hidden_size:
              if self._fused is None:
                  self._fused = self._probe(x)
-@@ -695,36 +1925,4002 @@ def aggregate_expert_outputs(expert_outputs, scores):
+@@ -695,18 +2029,225 @@ def aggregate_expert_outputs(expert_outputs, scores):
      )
  
  
 -class MapleSwitchGLU(nn.Module):
 -    """SwitchGLU with the up and gate projections fused into one gather
 -    matmul; sanitize() concatenates the checkpoint's split tensors."""
--
--    def __init__(self, input_dims, hidden_dims, num_experts, bias=False):
--        super().__init__()
--        self.up_gate_proj = SwitchLinear(
--            input_dims, 2 * hidden_dims, num_experts, bias=bias
--        )
--        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
  
--    def __call__(self, x, indices):
--        x = mx.expand_dims(x, (-2, -3))
+-    def __init__(self, input_dims, hidden_dims, num_experts, bias=False):
 +# Maple Preview's checkpoint stores true ternary expert weights: codes 0/1/2,
 +# one alpha per output row, and affine bias == -alpha.  This decode-only
 +# specialization is deliberately Maple-owned; generic affine W2 layers still
@@ -1609,8 +1705,7 @@ index a0673f7..90c472b 100644
 +            alpha[r] = static_cast<float>(scales[scale_off]);
 +        }
 +    }
- 
--        do_sort = indices.size >= 64
++
 +    for (int col = lane; col < K; col += WARP) {
 +        float xv = static_cast<float>(x[col]);
 +        int word = col >> 4;
@@ -1712,11 +1807,11 @@ index a0673f7..90c472b 100644
 +    matmul; sanitize() concatenates the checkpoint's split tensors."""
 +
 +    def __init__(self, input_dims, hidden_dims, num_experts, bias=False):
-+        super().__init__()
-+        self.up_gate_proj = SwitchLinear(
-+            input_dims, 2 * hidden_dims, num_experts, bias=bias
-+        )
-+        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
+         super().__init__()
+         self.up_gate_proj = SwitchLinear(
+             input_dims, 2 * hidden_dims, num_experts, bias=bias
+         )
+         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
 +        self._ternary_row_alpha = False
 +        self._ternary_up_gate = None  # None = unprobed, then True/False
 +
@@ -1786,14 +1881,13 @@ index a0673f7..90c472b 100644
 +        except (AttributeError, RuntimeError, TypeError, ValueError):
 +            self._ternary_up_gate = False
 +        return stock()
-+
-+    def __call__(self, x, indices):
+ 
+     def __call__(self, x, indices):
 +        single_token = x.size == self.up_gate_proj.input_dims and indices.size == 8
-+        x = mx.expand_dims(x, (-2, -3))
-+
-+        do_sort = indices.size >= 64
-         idx = indices
-         inv_order = None
+         x = mx.expand_dims(x, (-2, -3))
+ 
+         do_sort = indices.size >= 64
+@@ -715,16 +2256,3993 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -2747,7 +2841,10 @@ index a0673f7..90c472b 100644
 +    }
 +    __syncthreads();
 +    __threadfence();
-+    if (blk != 0) return;
++    if (blk != 0) {
++        if (tid == 0) atomicAdd(&ctr[6], 1u);
++        return;
++    }
 +
 +    // ---- phase E: aggregation + residual fold + next norm -----------------
 +    // Aggregation is col_reduce_small's linear loop with the multiply
@@ -2790,6 +2887,18 @@ index a0673f7..90c472b 100644
 +            out[idx] = static_cast<T_>(
 +                sb[i] * nscale * static_cast<float>(nw2[idx]));
 +        }
++    }
++    // Self-clean: reset the barrier counters so persistent scratch
++    // never needs an init_value fill. Non-zero blocks punched the
++    // exit ticket (ctr[6]) after barrier 4; block 0 waits for all
++    // of them to be OUT of their spins before zeroing.
++    __syncthreads();
++    if (tid == 0) {
++        while (atomicAdd(&ctr[6], 0u) < (unsigned int)(GRID_ - 1))
++            __nanosleep(48);
++        #pragma unroll
++        for (int i = 0; i < 16; ++i) ctr[i] = 0u;
++        __threadfence();
 +    }
 +"""
 +
@@ -3150,7 +3259,10 @@ index a0673f7..90c472b 100644
 +    }
 +    __syncthreads();
 +    __threadfence();
-+    if (blk >= ROWS_) return;
++    if (blk >= ROWS_) {
++        if (tid == 0) atomicAdd(&ctr[6], 1u);
++        return;
++    }
 +
 +    // ---- phase E: aggregation + residual + next norm, row r on block r ----
 +    {
@@ -3198,7 +3310,173 @@ index a0673f7..90c472b 100644
 +                sb[i] * nscale * static_cast<float>(nw2[idx]));
 +        }
 +    }
++    // Self-clean (batch): rows 1..ROWS_-1 punch the exit ticket
++    // after phase E; only block 0 waits for GRID_-1 tickets and
++    // zeroes the counters.
++    __syncthreads();
++    if (tid == 0) {
++        if (blk != 0) {
++            atomicAdd(&ctr[6], 1u);
++        } else {
++            while (atomicAdd(&ctr[6], 0u) < (unsigned int)(GRID_ - 1))
++                __nanosleep(48);
++            #pragma unroll
++            for (int i = 0; i < 16; ++i) ctr[i] = 0u;
++            __threadfence();
++        }
++    }
 +"""
++
++
++# Fused lm_head + materialized-vocabulary mask + argmax: temp-0 serving
++# never needs 151936 materialized logits, only the argmax index. Phase A
++# runs the PINNED stock 4-bit gs=64 qmv recipe (paired bf162
++# accumulators, UNFUSED hmul2+hadd2 dequant, ept=16, fp32 fold, warp
++# reduce -- probe 6/6 on the real head) and reduces 8 rows per block to
++# one (value, min-index) candidate; phase B reduces the block candidates.
++# Ties break to the SMALLEST index, matching mx.argmax's first-maximum.
++_HEAD_ARGMAX_A_SOURCE = r"""
++    const int lane = threadIdx.x & 31;
++    const int wrp = threadIdx.x >> 5;
++    const int gw = blockIdx.x * 8 + wrp;
++    __shared__ float svals[8];
++    __shared__ int sidx[8];
++    float logit = -INFINITY;
++    if (gw < N_) {
++        const unsigned int* wrow =
++            reinterpret_cast<const unsigned int*>(wq)
++            + (long long)gw * (K_ >> 3);
++        const __nv_bfloat16* srow =
++            reinterpret_cast<const __nv_bfloat16*>(sc)
++            + (long long)gw * (K_ >> 6);
++        const __nv_bfloat16* brow =
++            reinterpret_cast<const __nv_bfloat16*>(bi)
++            + (long long)gw * (K_ >> 6);
++        __nv_bfloat162 sums2[8];
++        #pragma unroll
++        for (int i = 0; i < 8; ++i)
++            sums2[i] = __halves2bfloat162(__nv_bfloat16(0.0f),
++                                          __nv_bfloat16(0.0f));
++        for (int base = lane * 16; base < K_; base += 512) {
++            const uint2 ww = __ldg(reinterpret_cast<const uint2*>(
++                wrow + (base >> 3)));
++            const unsigned int w0 = ww.x;
++            const unsigned int w1 = ww.y;
++            const __nv_bfloat16 s1 = srow[base >> 6];
++            const __nv_bfloat16 b1 = brow[base >> 6];
++            const __nv_bfloat162 s2 = __halves2bfloat162(s1, s1);
++            const __nv_bfloat162 b2 = __halves2bfloat162(b1, b1);
++            #pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                const unsigned int word = (i < 4) ? w0 : w1;
++                const int j = (i & 3) * 2;
++                const __nv_bfloat162 qv = __halves2bfloat162(
++                    __nv_bfloat16(float((word >> (4 * j)) & 15)),
++                    __nv_bfloat16(float((word >> (4 * (j + 1))) & 15)));
++                const __nv_bfloat162 wdq = __hadd2(__hmul2(qv, s2), b2);
++                const __nv_bfloat162 xv =
++                    *reinterpret_cast<const __nv_bfloat162*>(
++                        x + base + 2 * i);
++                sums2[i] = __hfma2(xv, wdq, sums2[i]);
++            }
++        }
++        float sum = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            sum += __bfloat162float(__low2bfloat16(sums2[i]));
++            sum += __bfloat162float(__high2bfloat16(sums2[i]));
++        }
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1)
++            sum += __shfl_xor_sync(0xffffffffu, sum, o);
++        // bf16 logit exactly as the stock head emits, then the mask
++        logit = mask[gw]
++            ? __bfloat162float(__nv_bfloat16(sum)) : -INFINITY;
++    }
++    if (lane == 0) {
++        svals[wrp] = logit;
++        sidx[wrp] = gw;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        float best = svals[0];
++        int bi_ = sidx[0];
++        #pragma unroll
++        for (int i = 1; i < 8; ++i) {
++            if (svals[i] > best) { best = svals[i]; bi_ = sidx[i]; }
++        }
++        cand[blockIdx.x * 2] = best;
++        cand[blockIdx.x * 2 + 1] = __int_as_float(bi_);
++    }
++"""
++
++_HEAD_ARGMAX_B_SOURCE = r"""
++    __shared__ float svals[THREADS_];
++    __shared__ int sidx[THREADS_];
++    float best = -INFINITY;
++    int bi_ = 2147483647;
++    for (int i = threadIdx.x; i < NB_; i += THREADS_) {
++        const float v = cand[i * 2];
++        const int ix = __float_as_int(cand[i * 2 + 1]);
++        if (v > best || (v == best && ix < bi_)) { best = v; bi_ = ix; }
++    }
++    svals[threadIdx.x] = best;
++    sidx[threadIdx.x] = bi_;
++    __syncthreads();
++    for (int o = THREADS_ / 2; o > 0; o >>= 1) {
++        if (threadIdx.x < o) {
++            const float ov = svals[threadIdx.x + o];
++            const int oi = sidx[threadIdx.x + o];
++            if (ov > svals[threadIdx.x]
++                || (ov == svals[threadIdx.x] && oi < sidx[threadIdx.x])) {
++                svals[threadIdx.x] = ov;
++                sidx[threadIdx.x] = oi;
++            }
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) out[0] = (unsigned int)sidx[0];
++"""
++
++
++_head_argmax_cache = {}
++
++
++def _head_argmax_kernels():
++    kernels = _head_argmax_cache.get("k")
++    if kernels is None:
++        a = mx.fast.cuda_kernel(
++            name="maple_head_argmax_a",
++            input_names=["x", "wq", "sc", "bi", "mask"],
++            output_names=["cand"], source=_HEAD_ARGMAX_A_SOURCE)
++        b = mx.fast.cuda_kernel(
++            name="maple_head_argmax_b", input_names=["cand"],
++            output_names=["out"], source=_HEAD_ARGMAX_B_SOURCE)
++        kernels = _head_argmax_cache["k"] = (a, b)
++    return kernels
++
++
++def head_argmax(hn, head, mask):
++    """Temp-0 pick: argmax over the masked lm_head WITHOUT materializing
++    the logits. hn is the final-normed hidden (..., K); mask is the bool
++    materialized-vocabulary mask (N,). Returns a uint32 scalar array.
++    Bit contract: each logit is the pinned stock recipe's bf16 value;
++    ties take the smallest index, matching mx.argmax."""
++    a, b = _head_argmax_kernels()
++    n, k = head.weight.shape[0], hn.shape[-1]
++    nb = (n + 7) // 8
++    (cand,) = a(
++        inputs=[hn.reshape(-1).astype(mx.bfloat16), head.weight,
++                head.scales, head.biases, mask],
++        template=[("N_", n), ("K_", k), ("THREADS_", 256)],
++        grid=(nb * 256, 1, 1), threadgroup=(256, 1, 1),
++        output_shapes=[(nb * 2,)], output_dtypes=[mx.float32])
++    (out,) = b(
++        inputs=[cand],
++        template=[("NB_", nb), ("THREADS_", 1024)],
++        grid=(1024, 1, 1), threadgroup=(1024, 1, 1),
++        output_shapes=[(1,)], output_dtypes=[mx.uint32])
++    return out
 +
 +
 +_moe_batch_megakernel_cache = {}
@@ -3744,6 +4022,27 @@ index a0673f7..90c472b 100644
 +        live[1] = (kL < CAP_) ? (float)(kL + 1) : (float)CAP_;
 +        const int nslot = slot + 1;
 +        live[2] = (nslot == CAP_) ? 0.0f : (float)nslot;
++    }
++
++    // Self-clean: every block punches the exit ticket (ctr[6], a free
++    // slot); block 0 waits for all GRID_ tickets -- everyone is past
++    // every spin by then -- and zeroes the counters so the persistent
++    // scratch never needs an init_value fill.  The fence between the
++    // ticket spin and the plain zeroing stores is load-bearing: relaxed
++    // atomics are not a compiler barrier, and without it the stores can
++    // be hoisted above the wait, wiping live tickets (a permanent hang).
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        atomicAdd(&ctr[6], 1u);
++        if (blk == 0) {
++            while (atomicAdd(&ctr[6], 0u) < (unsigned int)GRID_)
++                __nanosleep(48);
++            __threadfence();
++            #pragma unroll
++            for (int i = 0; i < 16; ++i) ctr[i] = 0u;
++            __threadfence();
++        }
 +    }
 +"""
 +
@@ -4349,9 +4648,11 @@ index a0673f7..90c472b 100644
 +            name=f"maple_attn_megakernel_{'rope' if use_rope else 'nope'}"
 +                 f"_{profile_name}",
 +            input_names=["hn", "wqkv", "sqkv", "bqkv", "wqk",
-+                         "wo", "so_", "bo_", "kcache", "vcache", "scalars"],
-+            output_names=["out", "scratch"],
-+            source=src,
++                         "wo", "so_", "bo_", "kcache", "vcache", "scalars",
++                         "scratch_in"],
++            output_names=["out"],
++            source="    float* scratch = const_cast<float*>(scratch_in);\n"
++                   + src,
 +            header=_ATTN_MEGAKERNEL_HEADER,
 +        )
 +    return kernel
@@ -4694,11 +4995,22 @@ index a0673f7..90c472b 100644
 +    )
 +    kh = hn.shape[-1]
 +    grid = _attn_megakernel_grid()
++    scratch_size = (16 + (attn.num_attention_heads
++                          + 2 * attn.num_key_value_heads) * 128
++                    + attn.num_attention_heads * 128 * 2
++                    + attn.num_attention_heads * 32 * (128 + 2))
++    scratch = getattr(attn, "_mega_scratch", None)
++    if scratch is None or scratch.shape[0] != scratch_size:
++        # persistent, zeroed ONCE; the kernel's self-clean tail keeps the
++        # barrier counters at zero between calls
++        scratch = mx.zeros((scratch_size,), mx.float32)
++        mx.eval(scratch)
++        attn._mega_scratch = scratch
 +    try:
-+        out, _ = kernel(
++        (out,) = kernel(
 +            inputs=[hn.reshape(-1), qkv.weight, qkv.scales, qkv.biases,
 +                    attn._qk_w, op.weight, op.scales, op.biases,
-+                    state.kbuf, state.vbuf, state.ctr],
++                    state.kbuf, state.vbuf, state.ctr, scratch],
 +            template=[
 +                ("T_", hn.dtype), ("KH_", kh),
 +                ("NQ_", attn.num_attention_heads),
@@ -4708,15 +5020,8 @@ index a0673f7..90c472b 100644
 +                ("THREADS_", 1024), ("GRID_", grid),
 +            ],
 +            grid=(grid * 1024, 1, 1), threadgroup=(1024, 1, 1),
-+            output_shapes=[
-+                (1, 1, kh),
-+                (16 + (attn.num_attention_heads
-+                       + 2 * attn.num_key_value_heads) * 128
-+                 + attn.num_attention_heads * 128 * 2
-+                 + attn.num_attention_heads * 32 * (128 + 2),),
-+            ],
-+            output_dtypes=[hn.dtype, mx.float32],
-+            init_value=0,
++            output_shapes=[(1, 1, kh)],
++            output_dtypes=[hn.dtype],
 +        )
 +    except (RuntimeError, TypeError, ValueError):
 +        return None
@@ -5295,9 +5600,10 @@ index a0673f7..90c472b 100644
 +        kernel = _moe_exact_megakernel_cache[eps] = mx.fast.cuda_kernel(
 +            name="maple_moe_exact_megakernel",
 +            input_names=["hin", "rin", "nw", "rw", "ugw", "ugs", "ugb",
-+                         "dnw", "dns", "dnb", "nw2"],
-+            output_names=["out", "hout", "scratch"],
-+            source=_MOE_EXACT_MEGAKERNEL_SOURCE.replace(
++                         "dnw", "dns", "dnb", "nw2", "scratch_in"],
++            output_names=["out", "hout"],
++            source="    float* scratch = const_cast<float*>(scratch_in);\n"
++            + _MOE_EXACT_MEGAKERNEL_SOURCE.replace(
 +                "EPS_", f"{eps:.10e}f"),
 +            header=_MOE_EXACT_MEGAKERNEL_HEADER,
 +        )
@@ -5350,13 +5656,11 @@ index a0673f7..90c472b 100644
 +            ],
 +            "grid": (grid * threads, 1, 1),
 +            "threadgroup": (threads, 1, 1),
-+            "output_shapes": [
-+                (1, 1, nd), (1, 1, kh),
-+                (16 + 8 + 8 + 2 * block.gate.num_experts
-+                 + block.gate.top_k * 2 * kd + block.gate.top_k * nd,),
-+            ],
-+            "output_dtypes": [dtype, dtype, mx.float32],
-+            "init_value": 0,
++            "output_shapes": [(1, 1, nd), (1, 1, kh)],
++            "output_dtypes": [dtype, dtype],
++            "scratch_size": (16 + 8 + 8 + 2 * block.gate.num_experts
++                             + block.gate.top_k * 2 * kd
++                             + block.gate.top_k * nd),
 +        },
 +    )
 +
@@ -5374,12 +5678,20 @@ index a0673f7..90c472b 100644
 +    if plan is False:
 +        return None
 +    kernel, kwargs = plan
++    kwargs = dict(kwargs)
++    scratch_size = kwargs.pop("scratch_size")
++    scratch = getattr(block, "_exact_scratch", None)
++    if scratch is None or scratch.shape[0] != scratch_size:
++        scratch = mx.zeros((scratch_size,), mx.float32)
++        mx.eval(scratch)
++        block._exact_scratch = scratch
 +    mlp = block.switch_mlp
 +    ug, dp = mlp.up_gate_proj, mlp.down_proj
 +    try:
-+        hn, hout, _ = kernel(
++        hn, hout = kernel(
 +            inputs=[h, r, ln.weight, block.gate.weight, ug.weight, ug.scales,
-+                    ug.biases, dp.weight, dp.scales, dp.biases, next_w],
++                    ug.biases, dp.weight, dp.scales, dp.biases, next_w,
++                    scratch],
 +            **kwargs,
 +        )
 +    except (RuntimeError, TypeError, ValueError):
@@ -5571,7 +5883,7 @@ index a0673f7..90c472b 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +5988,133 @@ class MapleModel(nn.Module):
+@@ -792,29 +6310,139 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -5649,7 +5961,7 @@ index a0673f7..90c472b 100644
 +            return hn
 +        return bfuse(h, r, self.norm.weight, self.norm.eps)[1]
 +
-+    def _decode_fused(self, h, cache, full_mask, swa_mask, fuse):
++    def _decode_fused(self, h, cache, full_mask, swa_mask, fuse, tok=None):
          """Decode loop with residual adds folded into the norms.
  
          Carries (h, r) instead of adding r back each step, so every
@@ -5668,6 +5980,12 @@ index a0673f7..90c472b 100644
          r = self._zero  # x + 0 is exact in bf16
 -        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
 +        hn = None
++        # NOTE: an embedding+fuse merge was built and measured bit-exact
++        # (48-step E2E equal), but the merged single-block kernel runs
++        # ~190us/step SLOWER than the stock gather + fuse pair -- the
++        # lookup is already overlapped in the stream. Kept as
++        # _exact_emb_rms_norm for reference; not wired.
++        del tok
 +        mega_next = (
 +            self._megakernel_next_norms()
 +            if (_use_moe_megakernel or _use_moe_megakernel_exact)
@@ -5713,7 +6031,7 @@ index a0673f7..90c472b 100644
  
      def __call__(
          self,
-@@ -835,13 +6135,48 @@ class MapleModel(nn.Module):
+@@ -835,13 +6463,49 @@ class MapleModel(nn.Module):
                  h, cache[self.swa_idx], window_size=self.window_size
              )
  
@@ -5746,7 +6064,8 @@ index a0673f7..90c472b 100644
 +                    )
 +                if self._exact_add_norm:
 +                    return self._decode_fused(
-+                        h, cache, full_mask, swa_mask, _exact_add_rms_norm
++                        h, cache, full_mask, swa_mask, _exact_add_rms_norm,
++                        tok=inputs,
 +                    )
 +            # Historical approximate carrier: its thread mapping differs from
 +            # mx.fast.rms_norm, so it stays an explicit semantic lane.
@@ -5764,7 +6083,7 @@ index a0673f7..90c472b 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -987,6 +6322,18 @@ class Model(nn.Module):
+@@ -987,6 +6651,18 @@ class Model(nn.Module):
              and getattr(self.lm_head, "mode", "affine") == "affine"
          ):
              return self.lm_head_flash(out, self.lm_head)
@@ -5783,7 +6102,7 @@ index a0673f7..90c472b 100644
          return self.lm_head(out)
  
      def sanitize(self, weights):
-@@ -1021,6 +6368,32 @@ class Model(nn.Module):
+@@ -1021,6 +6697,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -5816,7 +6135,7 @@ index a0673f7..90c472b 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +6412,8 @@ class Model(nn.Module):
+@@ -1039,8 +6741,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
