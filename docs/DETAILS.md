@@ -560,3 +560,30 @@ faster-or-tied on every pair (best local step 3735.5 µs, −9.7% in one
 day). Two vast.ai hosts also fell to the new pre-flight gates — one
 rented with 24 GB of foreign allocations aboard, one with functionally
 dead UVM behind a present /dev/nvidia-uvm.
+
+### 24. Where the wall is: the campaign closes (2026-08-16)
+
+The final sweep hunted the last two open fronts. The inter-kernel "gap"
+dissolved under a per-node dissection: median inter-node gaps are 0.22 µs
+— the ~1 ms/step hole belonged to the synchronous measurement harness,
+and `mlx_lm.stream_generate` (the path the service actually serves
+through) has overlapped host and GPU all along. An async-overlap harness
+confirms it: 2748 vs 3754 µs/step with bit-identical streams, so
+production has been decoding at ~364 tok/s on the 3090 the whole time and
+every kernel improvement of the campaign transferred to it in full. The
+head front closed as a negative: the pinned recipe at 512 threads
+(387.6 µs) and the stock head (~410–475 µs) both sit near 450 GB/s, and
+wider loads with prefetch are 2× worse — the ~200 µs bandwidth-floor
+head is out of this kernel class's reach.
+
+The walls that remain are honest ones. The trunk runs 92 µs/layer of
+pure kernel time against a ~19 µs bandwidth floor and is compute-bound
+in the dequant chain — cp.async, hfma2, LUTs, register prefetch, warp
+specialization and kernel fusion have all been measured and closed as
+negatives; the head is bandwidth-bound at half the theoretical rate.
+Breaking either needs a new idea (weight re-layout for linear streaming
+is the standing candidate), not another iteration. The campaign ends at
+v0.11.4: two dispatches per layer, self-cleaning persistent scratch,
+parallel solo phases, bit-for-bit against stock on sm86/sm89/sm120/B200,
+×2.7–2.9 over portable MLX — with every negative on the record priced
+and explained.
