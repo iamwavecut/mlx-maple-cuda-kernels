@@ -534,3 +534,29 @@ also spent disproving a phantom deadlock: probes running without
 CUDA_DEVICE_ORDER=PCI_BUS_ID land on the wrong GPU entirely — the
 incident and the per-kernel nvrtc economics (custom kernels never
 disk-cache; ~1-1.7 s each, every process) are in the evidence log.
+
+### 23. Solo phases dismantled; the grid bug the 4090 caught (2026-08-16)
+
+A globaltimer phase map of the exact-MoE kernel (54.3 µs total, matching
+nsys) showed 25% of its life on block 0 alone: softmax 7.2 µs,
+aggregation 5.1, cleanup 1.0, with 63 blocks parked. Two bit-neutral
+cuts landed. Phase E went element-parallel across all blocks with the
+norm reduction replayed 1:1 on block 0 (−66 µs/step median, 3/3
+interleaved pairs). The top-8 selection then moved its probability
+reads to a shared mirror — same values, same comparison order, same
+tie-breaks — killing ~2k latent global reads per step on one warp
+(−142 µs/step median, and the spread collapsed 354→42 µs: the phase
+stopped feeling neighbour traffic). Warp-specialization itself closed
+as a negative: an explicit register double-buffer in the tile loop is
+neutral-to-worse; the scheduler already hides those loads.
+
+The first foreign-arch run then earned its keep: the parallel-E layout
+assumed KH divides by the grid — true at grid 64 (sm86), false at 96
+(sm89/sm120) and 192 (B200) — so the 4090 saw 32 elements silently
+dropped (moe_batch 54/162, routing intact). One grid-agnostic stride
+later, the whole campaign is green: 3090, 4090, 5090 and B200 all
+reproduce their v0.11.3 streams bit for bit with the new kernels
+faster-or-tied on every pair (best local step 3735.5 µs, −9.7% in one
+day). Two vast.ai hosts also fell to the new pre-flight gates — one
+rented with 24 GB of foreign allocations aboard, one with functionally
+dead UVM behind a present /dev/nvidia-uvm.

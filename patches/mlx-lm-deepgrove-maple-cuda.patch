@@ -1,5 +1,5 @@
 diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
-index a0673f7..f36dfa7 100644
+index a0673f7..41438b9 100644
 --- a/mlx_lm/models/maple.py
 +++ b/mlx_lm/models/maple.py
 @@ -1,5 +1,8 @@
@@ -1887,7 +1887,7 @@ index a0673f7..f36dfa7 100644
          x = mx.expand_dims(x, (-2, -3))
  
          do_sort = indices.size >= 64
-@@ -715,16 +2256,3993 @@ class MapleSwitchGLU(nn.Module):
+@@ -715,16 +2256,4022 @@ class MapleSwitchGLU(nn.Module):
          if do_sort:
              x, idx, inv_order = _gather_sort(x, indices)
  
@@ -2537,6 +2537,7 @@ index a0673f7..f36dfa7 100644
 +    constexpr int OFF_PRB = OFF_LOG + NROUT_;
 +    constexpr int OFF_UGS = OFF_PRB + NROUT_;
 +    constexpr int OFF_DST = OFF_UGS + NEXP_ * 2 * KD_;
++    constexpr int OFF_S2 = OFF_DST + NEXP_ * ND_;
 +    unsigned int* ctr = reinterpret_cast<unsigned int*>(scratch);
 +    float* idxf = scratch + OFF_IDX;
 +    float* scoref = scratch + OFF_SCO;
@@ -2544,6 +2545,7 @@ index a0673f7..f36dfa7 100644
 +    float* probs = scratch + OFF_PRB;
 +    float* ugstage = scratch + OFF_UGS;
 +    float* dstage = scratch + OFF_DST;
++    float* s2stage = scratch + OFF_S2;
 +
 +    __shared__ float xs_lin[KH_];
 +    __shared__ __nv_bfloat16 xbs[KH_];
@@ -2628,6 +2630,7 @@ index a0673f7..f36dfa7 100644
 +    // same __syncthreads() calls.
 +    __shared__ float local_max[2];
 +    __shared__ float local_norm[2];
++    __shared__ float probs_s[NROUT_];
 +    if (blk == 0) {
 +        constexpr int N_READS = 4;
 +        constexpr int SWARPS = 2;  // 64 active threads
@@ -2676,9 +2679,11 @@ index a0673f7..f36dfa7 100644
 +                normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
 +            normalizer = 1.0f / normalizer;
 +            #pragma unroll
-+            for (int i = 0; i < N_READS; ++i)
-+                probs[tid * N_READS + i] =
-+                    __expf(vals[i] - maxval) * normalizer;
++            for (int i = 0; i < N_READS; ++i) {
++                const float p = __expf(vals[i] - maxval) * normalizer;
++                probs[tid * N_READS + i] = p;
++                probs_s[tid * N_READS + i] = p;
++            }
 +        }
 +        __syncthreads();
 +
@@ -2697,7 +2702,7 @@ index a0673f7..f36dfa7 100644
 +                    for (int t = 0; t < NEXP_; ++t)
 +                        if (t < k && chosen[t] == i) taken = true;
 +                    if (taken) continue;
-+                    const float v = probs[i];
++                    const float v = probs_s[i];
 +                    if (v > bestv || (v == bestv && i > besti)) {
 +                        bestv = v;
 +                        besti = i;
@@ -2721,7 +2726,7 @@ index a0673f7..f36dfa7 100644
 +            for (int e = 0; e < NEXP_; ++e) {
 +                const int src = NEXP_ - 1 - e;
 +                idxf[e] = static_cast<float>(chosen[src]);
-+                scoref[e] = probs[chosen[src]];
++                scoref[e] = probs_s[chosen[src]];
 +            }
 +            // The stock sum(axis=-1) over (1,1,8) dispatches to
 +            // row_reduce_simple with N_READS=4: two four-term sequential
@@ -2841,23 +2846,17 @@ index a0673f7..f36dfa7 100644
 +    }
 +    __syncthreads();
 +    __threadfence();
-+    if (blk != 0) {
-+        if (tid == 0) atomicAdd(&ctr[6], 1u);
-+        return;
-+    }
 +
-+    // ---- phase E: aggregation + residual fold + next norm -----------------
-+    // Aggregation is col_reduce_small's linear loop with the multiply
-+    // rounded on its own (128/128 bitwise); the tail is the proven exact
-+    // fuse.
++    // ---- phase E1: aggregation + residual fold, on ALL blocks -------------
++    // Element-parallel and bit-identical: every element runs the exact
++    // per-element chain of the solo phase E (same fixed e-order, same
++    // roundings); only WHICH block computes it changes.  float(s2) is
++    // staged so block 0 can replay the norm reduction 1:1.
 +    {
-+        constexpr int VEC = KH_ / THREADS_;
-+        const int base = tid * VEC;
-+        float sb[VEC];
-+        float ss = 0.0f;
-+        #pragma unroll
-+        for (int i = 0; i < VEC; ++i) {
-+            const int idx = base + i;
++        // Global stride: correct for ANY grid (96 on sm89, 192 on B200 --
++        // KH_ need not divide by GRID_); the per-element chain is intact.
++        for (int idx = blk * THREADS_ + tid; idx < KH_;
++             idx += GRID_ * THREADS_) {
 +            float agg = 0.0f;
 +            #pragma unroll
 +            for (int e = 0; e < NEXP_; ++e)
@@ -2868,7 +2867,37 @@ index a0673f7..f36dfa7 100644
 +                static_cast<float>(hin[idx]) + static_cast<float>(rin[idx]));
 +            const T_ s2 = static_cast<T_>(static_cast<float>(s) + aggb);
 +            hout[idx] = s2;
-+            sb[i] = static_cast<float>(s2);
++            s2stage[idx] = static_cast<float>(s2);
++        }
++    }
++
++    // ---- barrier 5 --------------------------------------------------------
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const unsigned int old = atomicAdd(&ctr[4], 1u);
++        if (old == GRID_ - 1) atomicExch(&ctr[12], 1u);
++        else while (atomicAdd(&ctr[12], 0u) == 0u) __nanosleep(48);
++    }
++    __syncthreads();
++    __threadfence();
++    if (blk != 0) {
++        if (tid == 0) atomicAdd(&ctr[6], 1u);
++        return;
++    }
++
++    // ---- phase E2: the norm reduction replayed 1:1 on block 0 -------------
++    // sb[i] holds the SAME float(s2) values the solo phase produced; the
++    // shuffle tree and the cross-warp fold run in the original order, so
++    // nscale -- and every out element -- is bit-identical.
++    {
++        constexpr int VEC = KH_ / THREADS_;
++        const int base = tid * VEC;
++        float sb[VEC];
++        float ss = 0.0f;
++        #pragma unroll
++        for (int i = 0; i < VEC; ++i) {
++            sb[i] = s2stage[base + i];
 +            ss += sb[i] * sb[i];
 +        }
 +        #pragma unroll
@@ -5660,7 +5689,7 @@ index a0673f7..f36dfa7 100644
 +            "output_dtypes": [dtype, dtype],
 +            "scratch_size": (16 + 8 + 8 + 2 * block.gate.num_experts
 +                             + block.gate.top_k * 2 * kd
-+                             + block.gate.top_k * nd),
++                             + block.gate.top_k * nd + kh),
 +        },
 +    )
 +
@@ -5883,7 +5912,7 @@ index a0673f7..f36dfa7 100644
  
  class MapleSparseMoeBlock(nn.Module):
      def __init__(self, args: ModelArgs):
-@@ -792,29 +6310,139 @@ class MapleModel(nn.Module):
+@@ -792,29 +6339,139 @@ class MapleModel(nn.Module):
              else None
          )
          self._fused_add_norm = None  # None = unprobed, then True/False
@@ -6031,7 +6060,7 @@ index a0673f7..f36dfa7 100644
  
      def __call__(
          self,
-@@ -835,13 +6463,49 @@ class MapleModel(nn.Module):
+@@ -835,13 +6492,49 @@ class MapleModel(nn.Module):
                  h, cache[self.swa_idx], window_size=self.window_size
              )
  
@@ -6083,7 +6112,7 @@ index a0673f7..f36dfa7 100644
  
          for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
              mask = full_mask if layer_type == "full_attention" else swa_mask
-@@ -987,6 +6651,18 @@ class Model(nn.Module):
+@@ -987,6 +6680,18 @@ class Model(nn.Module):
              and getattr(self.lm_head, "mode", "affine") == "affine"
          ):
              return self.lm_head_flash(out, self.lm_head)
@@ -6102,7 +6131,7 @@ index a0673f7..f36dfa7 100644
          return self.lm_head(out)
  
      def sanitize(self, weights):
-@@ -1021,6 +6697,32 @@ class Model(nn.Module):
+@@ -1021,6 +6726,32 @@ class Model(nn.Module):
          # quantized kernels — sees the per-group layout. Checkpoints written
          # with `--group-scales` have no row_alpha and pass straight through.
          row_alpha_keys = [k for k in weights if k.endswith(".row_alpha")]
@@ -6135,7 +6164,7 @@ index a0673f7..f36dfa7 100644
          if row_alpha_keys:
              group_size = (self.args.quantization or {}).get("group_size", 128)
              for key in row_alpha_keys:
-@@ -1039,8 +6741,8 @@ class Model(nn.Module):
+@@ -1039,8 +6770,8 @@ class Model(nn.Module):
  
          # Stack per-expert weights from the Hugging Face layout into the
          # SwitchGLU layout. Already-converted checkpoints pass through.
