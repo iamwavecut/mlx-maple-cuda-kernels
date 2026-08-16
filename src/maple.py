@@ -3216,10 +3216,10 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     // roundings); only WHICH block computes it changes.  float(s2) is
     // staged so block 0 can replay the norm reduction 1:1.
     {
-        constexpr int PER = KH_ / GRID_;
-        const int idx0 = blk * PER;
-        for (int i = tid; i < PER; i += THREADS_) {
-            const int idx = idx0 + i;
+        // Global stride: correct for ANY grid (96 on sm89, 192 on B200 --
+        // KH_ need not divide by GRID_); the per-element chain is intact.
+        for (int idx = blk * THREADS_ + tid; idx < KH_;
+             idx += GRID_ * THREADS_) {
             float agg = 0.0f;
             #pragma unroll
             for (int e = 0; e < NEXP_; ++e)
