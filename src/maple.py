@@ -2993,6 +2993,7 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
     // same __syncthreads() calls.
     __shared__ float local_max[2];
     __shared__ float local_norm[2];
+    __shared__ float probs_s[NROUT_];
     if (blk == 0) {
         constexpr int N_READS = 4;
         constexpr int SWARPS = 2;  // 64 active threads
@@ -3041,9 +3042,11 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
                 normalizer = normalizer + __shfl_xor_sync(0xffffffffu, normalizer, o);
             normalizer = 1.0f / normalizer;
             #pragma unroll
-            for (int i = 0; i < N_READS; ++i)
-                probs[tid * N_READS + i] =
-                    __expf(vals[i] - maxval) * normalizer;
+            for (int i = 0; i < N_READS; ++i) {
+                const float p = __expf(vals[i] - maxval) * normalizer;
+                probs[tid * N_READS + i] = p;
+                probs_s[tid * N_READS + i] = p;
+            }
         }
         __syncthreads();
 
@@ -3062,7 +3065,7 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
                     for (int t = 0; t < NEXP_; ++t)
                         if (t < k && chosen[t] == i) taken = true;
                     if (taken) continue;
-                    const float v = probs[i];
+                    const float v = probs_s[i];
                     if (v > bestv || (v == bestv && i > besti)) {
                         bestv = v;
                         besti = i;
@@ -3086,7 +3089,7 @@ _MOE_EXACT_MEGAKERNEL_SOURCE = r"""
             for (int e = 0; e < NEXP_; ++e) {
                 const int src = NEXP_ - 1 - e;
                 idxf[e] = static_cast<float>(chosen[src]);
-                scoref[e] = probs[chosen[src]];
+                scoref[e] = probs_s[chosen[src]];
             }
             // The stock sum(axis=-1) over (1,1,8) dispatches to
             // row_reduce_simple with N_READS=4: two four-term sequential
